@@ -7,9 +7,9 @@ a synthetic order book / candle source. No network access, no credentials.
 from __future__ import annotations
 
 import pytest
+from conftest import FakeMarket
 
 from nautilus_gateio.paper import PaperExecution
-from tests.conftest import FakeMarket
 
 
 def test_market_buy_walks_two_levels_with_fees_and_balances():
