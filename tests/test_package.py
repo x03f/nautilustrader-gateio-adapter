@@ -209,6 +209,53 @@ class TestSourceCleanliness:
         assert (PACKAGE_DIR / "py.typed").is_file()
 
 
+class TestVersionControlCoverage:
+    """Every source file must reach a fresh clone.
+
+    Regression for `.gitignore` carrying a bare `credentials*` secrets rule,
+    which silently excluded `nautilus_gateio/common/credentials.py`. The module
+    existed on disk, so imports, tests and even the locally built wheel were all
+    green; only a clean checkout was missing it, and it failed there at import
+    time. Building the wheel from the working tree cannot catch this class of
+    defect, because the working tree is exactly what is misleading.
+    """
+
+    def tracked_paths(self) -> set[Path] | None:
+        """Paths git would hand a fresh clone, or None outside a git checkout."""
+        root = find_repo_root()
+        if not (root / ".git").exists() or shutil.which("git") is None:
+            return None
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--", str(PACKAGE_DIR.relative_to(root))],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return {root / name for name in result.stdout.split("\0") if name}
+
+    def test_every_source_module_is_tracked(self):
+        tracked = self.tracked_paths()
+        if tracked is None:
+            pytest.skip("not a git checkout")
+        untracked = sorted(str(path) for path in source_files() if path not in tracked)
+        assert not untracked, f"source files missing from version control: {untracked}"
+
+    def test_no_ignore_rule_matches_a_source_module(self):
+        """Fail loudly even before a file is added, naming the rule at fault."""
+        root = find_repo_root()
+        if not (root / ".git").exists() or shutil.which("git") is None:
+            pytest.skip("not a git checkout")
+        result = subprocess.run(
+            ["git", "check-ignore", "-v", "--no-index", "--", *map(str, source_files())],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+        # Exit code 1 means nothing matched, which is the outcome we want.
+        assert result.returncode == 1, f"ignore rules match source files:\n{result.stdout}"
+
+
 # -- packaging regression ------------------------------------------------------
 #
 # The v0.2.0 sub-package split broke the wheel once already: an explicit,

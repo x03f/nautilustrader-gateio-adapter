@@ -83,7 +83,9 @@ def sanitize_client_order_id(value: str) -> str:
     cleaned = _TEXT_CHARSET.sub("", value)
     if not cleaned.startswith(CLIENT_ORDER_ID_PREFIX):
         cleaned = CLIENT_ORDER_ID_PREFIX + cleaned
-    return CLIENT_ORDER_ID_PREFIX + cleaned[len(CLIENT_ORDER_ID_PREFIX) :][:CLIENT_ORDER_ID_MAX_BODY]
+    return (
+        CLIENT_ORDER_ID_PREFIX + cleaned[len(CLIENT_ORDER_ID_PREFIX) :][:CLIENT_ORDER_ID_MAX_BODY]
+    )
 
 
 def sign_ws_request(channel: str, event: str, timestamp: int, api_secret: str) -> str:
@@ -97,7 +99,9 @@ def sign_ws_request(channel: str, event: str, timestamp: int, api_secret: str) -
     return hmac.new(api_secret.encode(), message.encode(), hashlib.sha512).hexdigest()
 
 
-def ws_auth_payload(channel: str, event: str, timestamp: int, api_key: str, api_secret: str) -> dict:
+def ws_auth_payload(
+    channel: str, event: str, timestamp: int, api_key: str, api_secret: str
+) -> dict:
     """Build the ``auth`` object for a private WebSocket subscription."""
     return {
         "method": "api_key",

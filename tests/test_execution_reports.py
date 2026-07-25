@@ -516,9 +516,7 @@ def test_fill_reports_are_sorted_for_replay(perp_env):
     ]
     rows[0]["id"] = "T-late"
     rows[1]["id"] = "T-early"
-    env.perp.responses["my_trades"] = lambda **kwargs: (
-        rows if kwargs.get("offset", 0) == 0 else []
-    )
+    env.perp.responses["my_trades"] = lambda **kwargs: rows if kwargs.get("offset", 0) == 0 else []
 
     reports = env.run(env.client.generate_fill_reports(_fill_reports_command()))
 

@@ -1,9 +1,26 @@
-# Credentials and local configuration — never commit
+# Credentials and local configuration — never commit.
+#
+# These patterns match credential *files* someone might drop into a working
+# copy. They deliberately do not match source modules: a bare `credentials*`
+# rule once swallowed `nautilus_gateio/common/credentials.py`, which imports
+# fine locally and fails only in a clean checkout. Match secret-shaped
+# suffixes, not bare names; tests/test_packaging.py enforces the difference.
 .env
 .env.*
 *.env
-credentials*
-secrets*
+credentials.json
+credentials.yaml
+credentials.yml
+credentials.ini
+credentials.txt
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.ini
+secrets.txt
+*.pem
+*.key
+*.p12
 
 # Python
 __pycache__/
