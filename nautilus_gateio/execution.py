@@ -3462,9 +3462,7 @@ class GateioExecutionClient(LiveExecutionClient):
         # short of its own report, never closes it, and synthesises a fill.
         fee = self._base_currency_fee(payload, instrument)
         if fee > 0:
-            fully_filled = filled > 0 and (
-                to_decimal(payload.get("left")) <= 0 or filled >= amount
-            )
+            fully_filled = filled > 0 and (to_decimal(payload.get("left")) <= 0 or filled >= amount)
             filled = max(Decimal(0), filled - fee)
             if fully_filled:
                 # A fully filled order can never report a quantity its own fills

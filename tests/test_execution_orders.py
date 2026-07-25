@@ -543,8 +543,7 @@ class TestSpotMarketBuyQuoteSemantics:
     def test_unfilled_market_buy_reports_no_quantity(self, harness):
         payload = dict(self.PAYLOAD, filled_amount="0")
         assert (
-            harness.client._payload_quantity(SPOT_BTC_USDT, payload, harness.instruments[0])
-            is None
+            harness.client._payload_quantity(SPOT_BTC_USDT, payload, harness.instruments[0]) is None
         )
 
     def test_order_status_report_never_states_the_quote_amount(self, harness):
