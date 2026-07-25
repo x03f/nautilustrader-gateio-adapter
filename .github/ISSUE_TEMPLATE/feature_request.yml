@@ -1,0 +1,47 @@
+name: Feature request
+description: Suggest an improvement or new capability for the adapter
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are you trying to solve? What is currently not possible or awkward?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How would you like this to work? Sketch the API or behavior if you can.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature-matrix area
+      description: Which part of the adapter does this touch?
+      options:
+        - Market data (WebSocket / REST)
+        - Execution / order types
+        - Instrument provider
+        - Reconciliation
+        - Futures (experimental)
+        - Paper simulator
+        - HTTP / WebSocket infrastructure (signing, rate limiting, retries)
+        - Configuration
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: willing-to-pr
+    attributes:
+      label: Are you willing to open a pull request for this?
+      options:
+        - Yes, I can implement it
+        - Yes, with some guidance
+        - No
+    validations:
+      required: true

@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nautilustrader-gateio-adapter"
+version = "0.1.0"
+description = "Community-maintained Gate.io adapter for NautilusTrader: spot market data and execution over REST and WebSocket"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "x03f" }]
+keywords = [
+    "nautilustrader",
+    "nautilus-trader",
+    "gateio",
+    "gate.io",
+    "exchange-adapter",
+    "algorithmic-trading",
+    "crypto",
+    "trading",
+    "websocket",
+    "market-data",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "nautilus_trader>=1.230.0,<2",
+    "httpx>=0.27",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/x03f/nautilustrader-gateio-adapter"
+Repository = "https://github.com/x03f/nautilustrader-gateio-adapter"
+Issues = "https://github.com/x03f/nautilustrader-gateio-adapter/issues"
+Changelog = "https://github.com/x03f/nautilustrader-gateio-adapter/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = ["nautilus_gateio"]
+
+[tool.setuptools.package-data]
+nautilus_gateio = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # long lines in docstrings/URLs are acceptable
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: tests requiring Gate.io credentials (deselected by default)",
+]
+addopts = "-m 'not integration'"

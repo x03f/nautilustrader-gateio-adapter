@@ -1,0 +1,90 @@
+name: Bug report
+description: Report a problem with the Gate.io adapter
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much
+        detail as you can — it makes issues much faster to diagnose.
+
+        **Do not report security vulnerabilities here.** Use
+        [private vulnerability reporting](../../security/advisories/new) instead.
+  - type: input
+    id: adapter-version
+    attributes:
+      label: Adapter version
+      description: Output of `python -c "import nautilus_gateio; print(nautilus_gateio.__version__)"`
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: nautilus-version
+    attributes:
+      label: nautilus_trader version
+      description: Output of `python -c "import nautilus_trader; print(nautilus_trader.__version__)"`
+      placeholder: "1.230.0"
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.13.1"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "Ubuntu 24.04 / macOS 15 / Windows 11"
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      description: Which Gate.io environment were you using when the problem occurred?
+      options:
+        - Mainnet market data (public endpoints)
+        - Testnet trading
+        - Mainnet trading (live orders enabled)
+        - Paper simulator (no exchange)
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: Describe the observed behavior and the behavior you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: >
+        The smallest code snippet or configuration that reproduces the problem.
+        Use placeholder credentials only.
+      render: python
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or traceback
+      description: >
+        Paste relevant log output or a traceback. **Redact API keys, secrets,
+        account IDs, and order IDs before posting.**
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Redaction check
+      options:
+        - label: I have removed all API keys, secrets, and account identifiers from this report.
+          required: true

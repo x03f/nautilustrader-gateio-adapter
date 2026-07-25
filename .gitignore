@@ -1,0 +1,39 @@
+# Credentials and local configuration — never commit
+.env
+.env.*
+*.env
+credentials*
+secrets*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+.venv/
+venv/
+env/
+
+# Testing / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local data / logs
+*.log
+*.sqlite
+*.db
+data/
+logs/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
