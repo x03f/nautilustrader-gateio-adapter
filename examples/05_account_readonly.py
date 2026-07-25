@@ -1,18 +1,25 @@
-"""Authenticated READ-ONLY account access against the Gate.io testnet.
+"""Authenticated READ-ONLY account inspection.
 
-Signs in with testnet credentials and prints spot balances and open orders —
-and nothing else. The client is constructed with ``live_orders=False`` (the
-default), which makes every order-mutating call impossible: the adapter
-raises ``LiveOrdersDisabledError`` before any network request is made, even
-though valid credentials are present. This script demonstrates that guarantee
-by attempting a (blocked) order placement at the end.
+Reads the account's fee tier, the balances of each product wallet, and any
+resting spot orders. Nothing here mutates state: every call is a GET.
 
-Credentials: REQUIRED (testnet). Set these environment variables:
-    GATE_TESTNET_API_KEY
-    GATE_TESTNET_API_SECRET
+Two things this example makes concrete:
 
-The script exits with a clear message if they are missing. It never places,
-modifies, or cancels orders.
+* Gate.io keeps a **separate wallet per product**, and the derivative wallets do
+  not exist until the first internal transfer into them. The venue reports a
+  missing wallet as an ordinary error, which the adapter turns into
+  ``WalletNotProvisionedError`` — a configuration state, not a failure.
+* ``environment`` defaults to ``"mainnet"``. This script asks for the
+  environment explicitly through ``GATEIO_ENVIRONMENT`` and defaults it to
+  ``testnet``, because an example that reads a live account should say which
+  account it means.
+
+Credentials: REQUIRED.
+
+    export GATEIO_ENVIRONMENT=testnet             # or "mainnet"
+    export GATE_TESTNET_API_KEY=...               # testnet credentials
+    export GATE_TESTNET_API_SECRET=...
+    # for mainnet: GATE_API_KEY / GATE_API_SECRET
 
 Run:
     python examples/05_account_readonly.py
@@ -20,72 +27,98 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
 from nautilus_gateio import (
-    GATEIO_HTTP_TESTNET,
+    GateioFuturesHttpAPI,
     GateioHttpClient,
-    LiveOrdersDisabledError,
+    GateioOptionsHttpAPI,
+    GateioSpotHttpAPI,
+    GateioWalletHttpAPI,
+    WalletNotProvisionedError,
+    resolve_credentials,
 )
+from nautilus_gateio.config import resolve_http_url
+from nautilus_gateio.http.margin import require_wallet
+
+ENVIRONMENT = os.environ.get("GATEIO_ENVIRONMENT", "testnet").strip().lower()
 
 
-def main() -> None:
-    api_key = os.getenv("GATE_TESTNET_API_KEY", "").strip()
-    api_secret = os.getenv("GATE_TESTNET_API_SECRET", "").strip()
+async def show_fees(wallet: GateioWalletHttpAPI) -> None:
+    fees = await wallet.fee()
+    print("\nfee tier (GET /wallet/fee)")
+    print(f"  user id             : {fees.get('user_id')}")
+    print(f"  spot maker / taker  : {fees.get('maker_fee')} / {fees.get('taker_fee')}")
+    print(
+        f"  perp maker / taker  : {fees.get('futures_maker_fee')} / {fees.get('futures_taker_fee')}"
+    )
+
+
+async def show_spot(spot: GateioSpotHttpAPI) -> None:
+    accounts = await spot.accounts()
+    funded = [row for row in accounts if float(row.get("available", 0) or 0) > 0]
+    print("\nspot wallet (GET /spot/accounts)")
+    if not funded:
+        print("  no non-zero balances")
+    for row in funded[:10]:
+        print(f"  {row['currency']:<8} available={row['available']} locked={row['locked']}")
+
+    grouped = await spot.open_orders()
+    total = sum(int(group.get("total", 0) or 0) for group in grouped)
+    print(f"\nresting spot orders : {total}")
+    for group in grouped:
+        for order in group.get("orders", [])[:5]:
+            print(
+                f"  {group['currency_pair']:<12} id={order['id']} {order['side']}"
+                f" {order['amount']} @ {order.get('price')} left={order.get('left')}"
+            )
+
+
+async def show_wallet(name: str, coroutine: object) -> None:
+    """Report one derivative wallet, tolerating one that does not exist yet."""
+    try:
+        account = await require_wallet(coroutine, f"the {name} wallet")  # type: ignore[arg-type]
+    except WalletNotProvisionedError as exc:
+        print(f"\n{name} wallet: {exc}")
+        return
+    if isinstance(account, dict):
+        print(f"\n{name} wallet: total={account.get('total')} available={account.get('available')}")
+
+
+async def main() -> int:
+    api_key, api_secret = resolve_credentials(None, None, testnet=ENVIRONMENT == "testnet")
     if not api_key or not api_secret:
         print(
-            "Missing testnet credentials.\n"
-            "Set GATE_TESTNET_API_KEY and GATE_TESTNET_API_SECRET to run this "
-            "example (a Gate.io testnet account API key pair).\n"
-            "Nothing was queried; exiting."
+            "No credentials found. Set GATE_TESTNET_API_KEY / GATE_TESTNET_API_SECRET "
+            "(or GATE_API_KEY / GATE_API_SECRET for mainnet) and try again.",
+            file=sys.stderr,
         )
-        sys.exit(0)
+        return 1
 
-    # live_orders=False (the default) is a hard switch: with it, order
-    # placement/cancellation is impossible regardless of credentials.
-    client = GateioHttpClient(
-        api_key=api_key,
-        api_secret=api_secret,
-        live_orders=False,
-        base_url=GATEIO_HTTP_TESTNET,
-    )
-    with client:
-        client.sync_time()  # align signature timestamps with the exchange clock
+    base_url = resolve_http_url(ENVIRONMENT)
+    print(f"environment: {ENVIRONMENT}  ->  {base_url}")
 
-        print("spot balances (non-zero):")
-        balances = client.balances()
-        shown = 0
-        for currency, amounts in sorted(balances.items()):
-            if amounts["available"] or amounts["locked"]:
-                print(
-                    f"  {currency:8s} available={amounts['available']} locked={amounts['locked']}"
-                )
-                shown += 1
-        if not shown:
-            print("  (none)")
+    async with GateioHttpClient(api_key, api_secret, base_url=base_url) as client:
+        # Align the signature timestamp with the venue clock before signing.
+        await client.sync_time()
 
-        print("\nopen orders:")
-        orders = client.open_orders()
-        for order in orders:
-            print(
-                f"  {order['pair']} {order['side']} {order['amount']} @ {order['price']} "
-                f"(id={order['id']}, status={order['status']})"
-            )
-        if not orders:
-            print("  (none)")
+        await show_fees(GateioWalletHttpAPI(client))
+        await show_spot(GateioSpotHttpAPI(client))
+        await show_wallet(
+            "perpetual",
+            GateioFuturesHttpAPI(client, settle="usdt").accounts(),
+        )
+        await show_wallet(
+            "delivery",
+            GateioFuturesHttpAPI(client, settle="usdt", delivery=True).accounts(),
+        )
+        await show_wallet("options", GateioOptionsHttpAPI(client).account())
 
-        # Demonstrate the read-only guarantee: even with valid credentials,
-        # order placement is rejected locally because live_orders=False.
-        print("\nattempting an order placement to demonstrate the guard ...")
-        try:
-            client.place_order("BTC_USDT", "buy", amount="0.001", price="1.0")
-            print("ERROR: order was accepted - this should be impossible")
-            sys.exit(1)
-        except LiveOrdersDisabledError as exc:
-            print(f"blocked as expected: {exc}")
-            print("(no request was sent to the exchange)")
+    print("\nRead-only: this script issued no mutating request.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(asyncio.run(main()))

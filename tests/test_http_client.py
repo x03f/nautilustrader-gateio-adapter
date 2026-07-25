@@ -1,13 +1,16 @@
-"""Unit tests for :class:`nautilus_gateio.http.GateioHttpClient`.
+"""Unit tests for :class:`nautilus_gateio.http.client.GateioHttpClient`.
 
-All HTTP traffic is served by ``httpx.MockTransport`` — no network access and
-no credentials are involved. Placeholder key/secret strings are used only to
-exercise the signing code path.
+All HTTP traffic is served by ``httpx.MockTransport`` — no network access and no
+credentials are involved. Placeholder key/secret strings exercise the signing
+code path only.
+
+The retry-safety tests are the regression cover for the finding that mutating
+requests (order submission, wallet transfer, margin borrow) were transparently
+replayed on 5xx and on network timeouts, which can execute an order twice.
 """
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Callable
 from typing import Any
@@ -15,447 +18,705 @@ from typing import Any
 import httpx
 import pytest
 
-from nautilus_gateio.constants import GATEIO_API_PREFIX, GATEIO_HTTP_MAINNET
-from nautilus_gateio.errors import (
+from nautilus_gateio.common.constants import GATEIO_API_PREFIX, GATEIO_HTTP_MAINNET
+from nautilus_gateio.common.errors import (
     GateioClientError,
     GateioError,
     GateioServerError,
-    LiveOrdersDisabledError,
-    OrderValidationError,
 )
-from nautilus_gateio.http import GateioHttpClient
-from nautilus_gateio.signing import sign_request
+from nautilus_gateio.common.signing import sign_request
+from nautilus_gateio.http.client import (
+    EXPIRY_HEADER,
+    IDEMPOTENT_METHODS,
+    GateioAmbiguousServerError,
+    GateioHttpClient,
+    GateioRequestAmbiguousError,
+    RateLimiter,
+)
 
 API = GATEIO_API_PREFIX
 
+Handler = Callable[[httpx.Request], httpx.Response]
 
-class _NoWaitLimiter:
-    """Rate limiter stub so tests never sleep."""
 
-    def wait(self) -> None:
-        pass
+class _RecordingLimiter:
+    """Rate limiter stub that records pacing decisions without ever sleeping."""
 
-    def on_429(self) -> None:
-        pass
+    def __init__(self) -> None:
+        self.acquired = 0
+        self.rate_limited = 0
+        self.successes = 0
+        self.backoff = 0.0
 
-    def on_ok(self) -> None:
-        pass
+    async def acquire(self) -> None:
+        self.acquired += 1
+
+    def on_rate_limited(self) -> None:
+        self.rate_limited += 1
+        self.backoff = min(self.backoff * 2 + 0.5, 10.0)
+
+    def on_success(self) -> None:
+        self.successes += 1
+        self.backoff *= 0.5
 
 
 def make_client(
-    handler: Callable[[httpx.Request], httpx.Response],
+    handler: Handler,
     api_key: str = "",
     api_secret: str = "",
-    live_orders: bool = False,
+    max_retries: int = 3,
 ) -> GateioHttpClient:
-    """Build a client whose transport is a MockTransport around ``handler``."""
-    client = GateioHttpClient(api_key=api_key, api_secret=api_secret, live_orders=live_orders)
-    client._client.close()
-    client._client = httpx.Client(
-        transport=httpx.MockTransport(handler), base_url=GATEIO_HTTP_MAINNET
+    """Build a client whose transport is a ``MockTransport`` around ``handler``.
+
+    Both the rate limiter and the retry backoff are replaced with recorders so
+    the tests neither sleep nor hide how often the client backed off.
+    """
+    client = GateioHttpClient(
+        api_key=api_key,
+        api_secret=api_secret,
+        max_retries=max_retries,
     )
-    client._limiter = _NoWaitLimiter()
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=GATEIO_HTTP_MAINNET,
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+    )
+    client._limiter = _RecordingLimiter()  # type: ignore[assignment]
+    client.backoffs = []  # type: ignore[attr-defined]
+
+    async def _retry_delay(attempt: int) -> None:
+        client.backoffs.append(attempt)  # type: ignore[attr-defined]
+
+    client._retry_delay = _retry_delay  # type: ignore[assignment]
     return client
 
 
-def raw_order(
-    order_id: str = "1001",
-    text: str = "t-test-1",
-    pair: str = "BTC_USDT",
-    side: str = "buy",
-    status: str = "open",
-    amount: str = "1",
-    filled: str = "0",
-    price: str = "100",
-) -> dict[str, Any]:
-    """A synthetic Gate.io spot order payload."""
-    return {
-        "id": order_id,
-        "text": text,
-        "currency_pair": pair,
-        "side": side,
-        "type": "limit",
-        "price": price,
-        "amount": amount,
-        "filled_total": filled,
-        "left": amount,
-        "status": status,
-        "create_time_ms": "1700000000000",
-        "time_in_force": "gtc",
-    }
-
-
-BALANCES_JSON = [
-    {"currency": "USDT", "available": "100.5", "locked": "2"},
-    {"currency": "BTC", "available": "0.25", "locked": "0"},
-]
-
-
-# -- public market data -----------------------------------------------------
-
-
-def test_candles_parsed_and_sorted_oldest_first():
-    # Rows deliberately out of order; format: [ts, quote_vol, close, high, low, open, base_vol]
-    rows = [
-        ["1700000120", "1", "101", "102", "99", "100", "5"],
-        ["1700000000", "1", "100", "101", "98", "99", "4"],
-        ["1700000060", "1", "100.5", "101.5", "98.5", "99.5", "4.5"],
-    ]
-    seen: dict[str, Any] = {}
+def counting_handler(
+    responses: list[httpx.Response | Exception],
+    log: list[httpx.Request],
+) -> Handler:
+    """Serve ``responses`` in order, recording every request that was made."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["params"] = dict(request.url.params)
-        return httpx.Response(200, json=rows)
+        log.append(request)
+        item = responses[min(len(log) - 1, len(responses) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
 
-    client = make_client(handler)
-    candles = client.candles("btc_usdt", interval="1m", limit=3)
-
-    assert seen["path"] == f"{API}/spot/candlesticks"
-    assert seen["params"]["currency_pair"] == "BTC_USDT"
-    assert seen["params"]["interval"] == "1m"
-    assert [c["ts"] for c in candles] == [1700000000000, 1700000060000, 1700000120000]
-    first = candles[0]
-    assert first["open"] == 99.0
-    assert first["high"] == 101.0
-    assert first["low"] == 98.0
-    assert first["close"] == 100.0
-    assert first["volume"] == 4.0
+    return handler
 
 
-def test_currency_pair_endpoint_path_and_parsing():
-    seen: dict[str, Any] = {}
+ORDER_BODY: dict[str, Any] = {
+    "currency_pair": "BTC_USDT",
+    "side": "buy",
+    "amount": "0.001",
+    "price": "50000",
+    "type": "limit",
+    "time_in_force": "gtc",
+    "text": "t-ng-1",
+}
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        return httpx.Response(
-            200,
-            json={
-                "id": "BTC_USDT",
-                "base": "BTC",
-                "quote": "USDT",
-                "amount_precision": 6,
-                "precision": 2,
-                "min_base_amount": "0.00001",
-                "min_quote_amount": "3",
-                "fee": "0.2",
-                "trade_status": "tradable",
-            },
-        )
-
-    client = make_client(handler)
-    spec = client.currency_pair("btc_usdt")
-
-    assert seen["path"] == f"{API}/spot/currency_pairs/BTC_USDT"
-    assert spec["pair"] == "BTC_USDT"
-    assert spec["price_precision"] == 2
-    assert spec["amount_precision"] == 6
-    assert spec["min_quote_amount"] == 3.0
+ACCEPTED_ORDER: dict[str, Any] = {"id": "1001", "text": "t-ng-1", "status": "open"}
 
 
 # -- signing ----------------------------------------------------------------
 
 
-def test_private_request_carries_valid_signature_headers():
+async def test_signed_request_carries_key_timestamp_and_signature_headers():
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["headers"] = request.headers
-        return httpx.Response(200, json=BALANCES_JSON)
+        seen["url"] = request.url
+        return httpx.Response(200, json=[])
 
     client = make_client(handler, api_key="test-key", api_secret="test-secret")
-    client._signed_timestamp = lambda: "1700000000"  # freeze for determinism
-    client.balances()
+    client._timestamp = lambda: "1700000000"  # type: ignore[method-assign]
+    await client.get("/spot/accounts", params={"currency": "USDT"}, signed=True)
 
     expected = sign_request(
-        "GET", f"{API}/spot/accounts", "", "", "test-key", "test-secret", "1700000000"
+        "GET",
+        f"{API}/spot/accounts",
+        "currency=USDT",
+        "",
+        "test-key",
+        "test-secret",
+        "1700000000",
     )
     headers = seen["headers"]
     assert headers["KEY"] == "test-key"
     assert headers["Timestamp"] == "1700000000"
     assert headers["SIGN"] == expected["SIGN"]
+    assert seen["url"].raw_path.decode() == f"{API}/spot/accounts?currency=USDT"
 
 
-# -- retry and error translation --------------------------------------------
-
-
-def test_429_then_200_is_retried_and_succeeds():
-    calls: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
-        if len(calls) == 1:
-            return httpx.Response(429, json={"label": "TOO_MANY_REQUESTS", "message": "slow down"})
-        return httpx.Response(200, json=BALANCES_JSON)
-
-    client = make_client(handler, api_key="k", api_secret="s")
-    balances = client.balances()
-
-    assert len(calls) == 2
-    assert balances["USDT"]["available"] == 100.5
-
-
-def test_persistent_429_raises_after_retries():
-    calls: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
-        return httpx.Response(429, json={"label": "TOO_MANY_REQUESTS", "message": "slow down"})
-
-    client = make_client(handler, api_key="k", api_secret="s")
-    with pytest.raises(GateioError) as excinfo:
-        client.balances()
-
-    assert excinfo.value.status == 429
-    assert excinfo.value.label == "TOO_MANY_REQUESTS"
-    assert len(calls) == 3  # default retries
-
-
-def test_400_with_label_raises_client_error():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"label": "INVALID_CURRENCY", "message": "unknown pair"})
-
-    client = make_client(handler, api_key="k", api_secret="s")
-    with pytest.raises(GateioClientError) as excinfo:
-        client.balances()
-
-    assert excinfo.value.status == 400
-    assert excinfo.value.label == "INVALID_CURRENCY"
-    assert "unknown pair" in str(excinfo.value)
-
-
-def test_500_raises_server_error():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"label": "SERVER_ERROR", "message": "internal"})
-
-    client = make_client(handler, api_key="k", api_secret="s")
-    with pytest.raises(GateioServerError) as excinfo:
-        client.balances()
-
-    assert excinfo.value.status == 500
-
-
-# -- account state ----------------------------------------------------------
-
-
-def test_balances_parsing():
-    client = make_client(lambda r: httpx.Response(200, json=BALANCES_JSON), "k", "s")
-    balances = client.balances()
-
-    assert balances == {
-        "USDT": {"available": 100.5, "locked": 2.0},
-        "BTC": {"available": 0.25, "locked": 0.0},
-    }
-
-
-def test_open_orders_flattens_grouped_response():
-    grouped = [
-        {
-            "currency_pair": "BTC_USDT",
-            "orders": [raw_order("1", "t-a"), raw_order("2", "t-b")],
-        },
-        {"currency_pair": "ETH_USDT", "orders": [raw_order("3", "t-c", pair="ETH_USDT")]},
-    ]
-    client = make_client(lambda r: httpx.Response(200, json=grouped), "k", "s")
-    orders = client.open_orders()
-
-    assert [o["id"] for o in orders] == ["1", "2", "3"]
-    assert orders[0]["client_id"] == "t-a"
-    assert orders[2]["pair"] == "ETH_USDT"
-
-
-def test_open_orders_plain_list_flattened():
-    # A plain (ungrouped) list of order objects is parsed the same way as
-    # the grouped [{currency_pair, orders: [...]}] response shape.
-    plain = [raw_order("7", "t-plain")]
-    client = make_client(lambda r: httpx.Response(200, json=plain), "k", "s")
-    orders = client.open_orders("BTC_USDT")
-
-    assert len(orders) == 1
-    assert orders[0]["id"] == "7"
-    assert orders[0]["client_id"] == "t-plain"
-
-
-def test_find_by_client_id():
-    grouped = [
-        {
-            "currency_pair": "BTC_USDT",
-            "orders": [raw_order("1", "t-a"), raw_order("2", "t-target")],
-        }
-    ]
+async def test_public_request_is_not_signed():
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["query"] = str(request.url.query, "ascii")
-        return httpx.Response(200, json=grouped)
+        seen["headers"] = request.headers
+        return httpx.Response(200, json={"server_time": 1})
 
-    client = make_client(handler, "k", "s")
+    client = make_client(handler, api_key="k", api_secret="s")
+    await client.get("/spot/time")
 
-    found = client.find_by_client_id("BTC_USDT", "t-target")
-    assert found is not None
-    assert found["id"] == "2"
-    assert "currency_pair=BTC_USDT" in seen["query"]
-
-    assert client.find_by_client_id("BTC_USDT", "t-missing") is None
+    assert "KEY" not in seen["headers"]
+    assert "SIGN" not in seen["headers"]
 
 
-# -- live-orders safety switch ----------------------------------------------
+async def test_signed_request_without_credentials_never_reaches_the_transport():
+    log: list[httpx.Request] = []
+    client = make_client(counting_handler([httpx.Response(200, json=[])], log))
+
+    with pytest.raises(GateioError) as excinfo:
+        await client.get("/spot/accounts", signed=True)
+
+    assert excinfo.value.status == 401
+    assert excinfo.value.label == "MISSING_CREDENTIALS"
+    assert log == []
 
 
-def test_mutating_calls_raise_when_live_orders_disabled():
-    calls: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
-        return httpx.Response(200, json={})
-
-    client = make_client(handler, api_key="k", api_secret="s", live_orders=False)
-
-    with pytest.raises(LiveOrdersDisabledError):
-        client.place_order("BTC_USDT", "buy", 0.01, price=100.0)
-    with pytest.raises(LiveOrdersDisabledError):
-        client.cancel_order("1", "BTC_USDT")
-    with pytest.raises(LiveOrdersDisabledError):
-        client.cancel_all("BTC_USDT")
-    assert calls == []  # nothing ever reached the transport
-
-
-def test_emergency_stop_is_safe_to_call_while_disabled():
-    # emergency_stop is deliberately callable in any state: with live orders
-    # already disabled it performs no HTTP calls and reports the disabled state.
-    calls: list[str] = []
+async def test_signature_covers_the_literal_json_body():
+    seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
+        seen["headers"] = request.headers
+        seen["content"] = request.content
+        return httpx.Response(200, json=ACCEPTED_ORDER)
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    client._timestamp = lambda: "1700000000"  # type: ignore[method-assign]
+    await client.post("/spot/orders", body={"a": 1, "b": "x"})
+
+    payload = seen["content"].decode()
+    assert payload == '{"a":1,"b":"x"}'
+    expected = sign_request("POST", f"{API}/spot/orders", "", payload, "k", "s", "1700000000")
+    assert seen["headers"]["SIGN"] == expected["SIGN"]
+
+
+# -- retry safety: mutating requests are not replayed ------------------------
+
+
+async def test_500_on_post_spot_orders_is_not_retried():
+    """Regression: a 5xx on order submission must not resubmit the order."""
+    log: list[httpx.Request] = []
+    handler = counting_handler(
+        [httpx.Response(500, json={"label": "SERVER_ERROR", "message": "internal"})],
+        log,
+    )
+    client = make_client(handler, api_key="k", api_secret="s")
+
+    with pytest.raises(GateioServerError) as excinfo:
+        await client.post("/spot/orders", body=ORDER_BODY)
+
+    assert len(log) == 1, "the order POST was replayed after a 5xx"
+    assert client.backoffs == []  # type: ignore[attr-defined]
+    # The outcome is unknown, and the error says so without hiding the 5xx.
+    assert isinstance(excinfo.value, GateioAmbiguousServerError)
+    assert isinstance(excinfo.value, GateioRequestAmbiguousError)
+    assert excinfo.value.status == 500
+    assert excinfo.value.label == "SERVER_ERROR"
+
+
+async def test_read_timeout_on_post_spot_orders_is_not_retried():
+    """Regression: a timeout after the request was sent must not resubmit it."""
+    log: list[httpx.Request] = []
+    handler = counting_handler([httpx.ReadTimeout("timed out")], log)
+    client = make_client(handler, api_key="k", api_secret="s")
+
+    with pytest.raises(GateioRequestAmbiguousError) as excinfo:
+        await client.post("/spot/orders", body=ORDER_BODY)
+
+    assert len(log) == 1, "the order POST was replayed after a read timeout"
+    assert excinfo.value.label == "REQUEST_AMBIGUOUS"
+    assert "reconcile" in excinfo.value.message
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("POST", "/spot/orders", ORDER_BODY),
+        ("POST", "/futures/usdt/orders", {"contract": "BTC_USDT", "size": 1}),
+        ("POST", "/options/orders", {"contract": "BTC_USDT-20260101-70000-C", "size": 1}),
+        ("POST", "/wallet/transfers", {"currency": "USDT", "from": "spot", "to": "futures"}),
+        ("POST", "/margin/uni/loans", {"currency": "USDT", "amount": "10"}),
+        ("PUT", "/futures/usdt/orders/1", {"size": 2}),
+        ("PATCH", "/spot/orders/1", {"amount": "2"}),
+    ],
+)
+async def test_no_mutating_request_is_replayed_on_5xx(method: str, path: str, body: dict):
+    """Every fund- or order-moving call follows the same non-retry rule."""
+    log: list[httpx.Request] = []
+    handler = counting_handler(
+        [httpx.Response(502, json={"label": "SERVER_ERROR", "message": "bad gateway"})],
+        log,
+    )
+    client = make_client(handler, api_key="k", api_secret="s")
+
+    with pytest.raises(GateioRequestAmbiguousError):
+        await client.request(method, path, body=body, signed=True)
+
+    assert len(log) == 1
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("POST", "/wallet/transfers", {"currency": "USDT", "from": "spot", "to": "futures"}),
+        ("POST", "/margin/uni/loans", {"currency": "USDT", "amount": "10"}),
+    ],
+)
+async def test_transfer_and_borrow_are_not_replayed_on_timeout(method: str, path: str, body: dict):
+    log: list[httpx.Request] = []
+    handler = counting_handler([httpx.ReadTimeout("timed out")], log)
+    client = make_client(handler, api_key="k", api_secret="s")
+
+    with pytest.raises(GateioRequestAmbiguousError):
+        await client.request(method, path, body=body, signed=True)
+
+    assert len(log) == 1
+
+
+async def test_4xx_on_a_mutating_request_is_a_plain_client_error():
+    """A deterministic rejection is not ambiguous and must not be flagged as such."""
+    log: list[httpx.Request] = []
+    handler = counting_handler(
+        [httpx.Response(400, json={"label": "INVALID_PARAM_VALUE", "message": "bad amount"})],
+        log,
+    )
+    client = make_client(handler, api_key="k", api_secret="s")
+
+    with pytest.raises(GateioClientError) as excinfo:
+        await client.post("/spot/orders", body=ORDER_BODY)
+
+    assert not isinstance(excinfo.value, GateioRequestAmbiguousError)
+    assert excinfo.value.label == "INVALID_PARAM_VALUE"
+    assert len(log) == 1
+
+
+async def test_connect_error_on_a_post_is_replayed_because_nothing_was_sent():
+    """A failure to establish the connection proves the venue never saw it."""
+    log: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(request)
+        if len(log) == 1:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json=ACCEPTED_ORDER)
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    result = await client.post("/spot/orders", body=ORDER_BODY)
+
+    assert result == ACCEPTED_ORDER
+    assert len(log) == 2
+    assert client.backoffs == [1]  # type: ignore[attr-defined]
+
+
+async def test_request_expired_label_on_a_post_is_replayed():
+    """REQUEST_EXPIRED proves the venue rejected the request before processing."""
+    log: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(request)
+        if len(log) == 1:
+            return httpx.Response(
+                400, json={"label": "REQUEST_EXPIRED", "message": "deadline passed"}
+            )
+        return httpx.Response(200, json=ACCEPTED_ORDER)
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    result = await client.post("/spot/orders", body=ORDER_BODY)
+
+    assert result == ACCEPTED_ORDER
+    assert len(log) == 2
+
+
+# -- retry safety: idempotent requests are still replayed --------------------
+
+
+async def test_get_is_retried_on_5xx():
+    log: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(request)
+        if len(log) == 1:
+            return httpx.Response(503, json={"label": "SERVER_ERROR", "message": "busy"})
+        return httpx.Response(200, json=[{"currency": "USDT"}])
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    result = await client.get("/spot/accounts", signed=True)
+
+    assert result == [{"currency": "USDT"}]
+    assert len(log) == 2
+    assert client.backoffs == [1]  # type: ignore[attr-defined]
+
+
+async def test_get_is_retried_on_read_timeout():
+    log: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(request)
+        if len(log) == 1:
+            raise httpx.ReadTimeout("timed out")
+        return httpx.Response(200, json={"server_time": 1700000000000})
+
+    client = make_client(handler)
+    result = await client.get("/spot/time")
+
+    assert result == {"server_time": 1700000000000}
+    assert len(log) == 2
+
+
+async def test_delete_is_retried_on_5xx_because_cancelling_twice_is_harmless():
+    log: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(request)
+        if len(log) == 1:
+            return httpx.Response(500, json={"label": "SERVER_ERROR", "message": "internal"})
+        return httpx.Response(200, json={"id": "1001", "status": "cancelled"})
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    result = await client.delete("/spot/orders/1001", params={"currency_pair": "BTC_USDT"})
+
+    assert result == {"id": "1001", "status": "cancelled"}
+    assert len(log) == 2
+
+
+async def test_persistent_5xx_on_a_get_raises_after_max_retries():
+    log: list[httpx.Request] = []
+    handler = counting_handler(
+        [httpx.Response(500, json={"label": "SERVER_ERROR", "message": "internal"})],
+        log,
+    )
+    client = make_client(handler, api_key="k", api_secret="s", max_retries=3)
+
+    with pytest.raises(GateioServerError):
+        await client.get("/spot/accounts", signed=True)
+
+    assert len(log) == 3
+    assert client.backoffs == [1, 2]  # type: ignore[attr-defined]
+
+
+async def test_idempotent_method_set_is_explicit():
+    assert IDEMPOTENT_METHODS == {"GET", "HEAD", "OPTIONS", "DELETE"}
+
+
+# -- rate limiting -----------------------------------------------------------
+
+
+async def test_429_on_a_get_is_retried_with_backoff():
+    log: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(request)
+        if len(log) == 1:
+            return httpx.Response(429, json={"label": "TOO_MANY_REQUESTS", "message": "slow down"})
         return httpx.Response(200, json=[])
 
-    client = make_client(handler, api_key="k", api_secret="s", live_orders=False)
-    result = client.emergency_stop()
+    client = make_client(handler, api_key="k", api_secret="s")
+    await client.get("/spot/accounts", signed=True)
 
-    assert result == {"cancelled": [], "live_orders_disabled": True}
-    assert client.live_orders is False
-    assert calls == []
-
-
-def test_place_order_without_credentials_raises_value_error():
-    client = make_client(lambda r: httpx.Response(200, json={}), live_orders=True)
-    with pytest.raises(ValueError):
-        client.place_order("BTC_USDT", "buy", 0.01, price=100.0)
+    assert len(log) == 2
+    limiter = client._limiter
+    assert limiter.rate_limited == 1  # type: ignore[attr-defined]
+    assert limiter.backoff > 0.0  # type: ignore[attr-defined]
+    assert limiter.acquired == 2  # type: ignore[attr-defined]
 
 
-# -- validated order placement ----------------------------------------------
-
-
-def test_place_order_validated_rejects_before_any_http_call(btc_spec):
-    calls: list[str] = []
+async def test_429_on_an_order_post_is_retried_because_it_was_never_processed():
+    log: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
+        log.append(request)
+        if len(log) == 1:
+            return httpx.Response(429, json={"label": "TOO_MANY_REQUESTS", "message": "slow down"})
+        return httpx.Response(200, json=ACCEPTED_ORDER)
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    result = await client.post("/spot/orders", body=ORDER_BODY)
+
+    assert result == ACCEPTED_ORDER
+    assert len(log) == 2
+    assert client._limiter.rate_limited == 1  # type: ignore[attr-defined]
+
+
+async def test_persistent_429_raises_after_max_retries():
+    log: list[httpx.Request] = []
+    handler = counting_handler(
+        [httpx.Response(429, json={"label": "TOO_MANY_REQUESTS", "message": "slow down"})],
+        log,
+    )
+    client = make_client(handler, api_key="k", api_secret="s", max_retries=3)
+
+    with pytest.raises(GateioError) as excinfo:
+        await client.get("/spot/accounts", signed=True)
+
+    assert excinfo.value.status == 429
+    assert excinfo.value.label == "TOO_MANY_REQUESTS"
+    assert len(log) == 3
+
+
+async def test_rate_limiter_backoff_grows_and_decays():
+    limiter = RateLimiter(max_per_second=100.0)
+    assert limiter.backoff == 0.0
+
+    limiter.on_rate_limited()
+    assert limiter.backoff == pytest.approx(0.5)
+    limiter.on_rate_limited()
+    assert limiter.backoff == pytest.approx(1.5)
+
+    for _ in range(20):
+        limiter.on_rate_limited()
+    assert limiter.backoff <= 10.0
+
+    limiter.on_success()
+    assert limiter.backoff == pytest.approx(5.0)
+
+
+async def test_rate_limiter_applies_its_backoff_when_acquiring():
+    limiter = RateLimiter(max_per_second=1000.0)
+    limiter.on_rate_limited()  # backoff = 0.5s
+
+    start = time.monotonic()
+    await limiter.acquire()
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 0.45
+
+
+# -- error translation -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "label", "expected"),
+    [
+        (400, "INVALID_PARAM_VALUE", GateioClientError),
+        (401, "INVALID_SIGNATURE", GateioClientError),
+        (404, "ORDER_NOT_FOUND", GateioClientError),
+        (500, "SERVER_ERROR", GateioServerError),
+    ],
+)
+async def test_error_status_maps_to_the_typed_error(status: int, label: str, expected: type):
+    handler = counting_handler(
+        [httpx.Response(status, json={"label": label, "message": "boom"})], []
+    )
+    client = make_client(handler, api_key="k", api_secret="s", max_retries=1)
+
+    with pytest.raises(expected) as excinfo:
+        await client.get("/spot/accounts", signed=True)
+
+    assert excinfo.value.status == status
+    assert excinfo.value.label == label
+    assert excinfo.value.message == "boom"
+    assert f"Gate.io {status} {label}: boom" == str(excinfo.value)
+
+
+async def test_error_label_is_preserved_verbatim():
+    """Labels drive caller branching, so they must never be rewritten."""
+    handler = counting_handler(
+        [httpx.Response(400, json={"label": "REPEATED_CREATION", "message": "duplicate text"})],
+        [],
+    )
+    client = make_client(handler, api_key="k", api_secret="s")
+
+    with pytest.raises(GateioClientError) as excinfo:
+        await client.post("/spot/orders", body=ORDER_BODY)
+
+    assert excinfo.value.label == "REPEATED_CREATION"
+    assert excinfo.value.message == "duplicate text"
+
+
+async def test_non_json_error_body_is_translated_without_crashing():
+    handler = counting_handler([httpx.Response(503, text="<html>gateway error</html>")], [])
+    client = make_client(handler, max_retries=1)
+
+    with pytest.raises(GateioServerError) as excinfo:
+        await client.get("/spot/time")
+
+    assert excinfo.value.label == "HTTP_ERROR"
+    assert "gateway error" in excinfo.value.message
+
+
+async def test_error_body_using_detail_instead_of_message():
+    handler = counting_handler(
+        [httpx.Response(400, json={"label": "BAD_REQUEST", "detail": "malformed"})], []
+    )
+    client = make_client(handler, max_retries=1)
+
+    with pytest.raises(GateioClientError) as excinfo:
+        await client.get("/spot/time")
+
+    assert excinfo.value.message == "malformed"
+
+
+# -- request encoding --------------------------------------------------------
+
+
+async def test_query_encoding_drops_none_and_lowercases_booleans():
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["raw_path"] = request.url.raw_path.decode()
         return httpx.Response(200, json={})
 
-    client = make_client(handler, api_key="k", api_secret="s", live_orders=True)
-
-    # Notional 0.001 is far below min_quote_amount=3.0 in the spec.
-    with pytest.raises(OrderValidationError):
-        client.place_order_validated("BTC_USDT", "buy", amount=0.00001, price=100.0, spec=btc_spec)
-
-    assert calls == []  # validation failed before any request was made
-
-
-def test_place_order_validated_idempotent_on_existing_client_id(btc_spec):
-    grouped = [{"currency_pair": "BTC_USDT", "orders": [raw_order("55", "t-dup")]}]
-    posts: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST":
-            posts.append(request.url.path)
-            return httpx.Response(200, json=raw_order("99", "t-dup"))
-        return httpx.Response(200, json=grouped)
-
-    client = make_client(handler, api_key="k", api_secret="s", live_orders=True)
-    result = client.place_order_validated(
-        "BTC_USDT", "buy", amount=0.05, price=100.0, client_id="t-dup", spec=btc_spec
+    client = make_client(handler)
+    await client.get(
+        "/spot/order_book",
+        params={"currency_pair": "BTC_USDT", "interval": None, "with_id": True, "limit": 10},
     )
 
-    assert result["idempotent"] is True
-    assert result["id"] == "55"
-    assert posts == []  # no duplicate submission
+    assert seen["raw_path"] == f"{API}/spot/order_book?currency_pair=BTC_USDT&with_id=true&limit=10"
 
 
-# -- emergency stop ---------------------------------------------------------
+async def test_empty_response_body_returns_none():
+    client = make_client(lambda r: httpx.Response(204), api_key="k", api_secret="s")
+    assert await client.post("/margin/uni/loans", body={"currency": "USDT"}) is None
 
 
-def test_emergency_stop_cancels_then_hard_disables():
-    grouped = [{"currency_pair": "BTC_USDT", "orders": [raw_order("42", "t-open")]}]
-    deletes: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "DELETE":
-            deletes.append(request.url.path)
-            return httpx.Response(200, json=raw_order("42", "t-open", status="cancelled"))
-        return httpx.Response(200, json=grouped)
-
-    client = make_client(handler, api_key="k", api_secret="s", live_orders=True)
-    result = client.emergency_stop("BTC_USDT")
-
-    assert result["live_orders_disabled"] is True
-    assert len(result["cancelled"]) == 1
-    assert result["cancelled"][0]["id"] == "42"
-    assert deletes == [f"{API}/spot/orders/42"]
-    assert client.live_orders is False
-    with pytest.raises(LiveOrdersDisabledError):
-        client.place_order("BTC_USDT", "buy", 0.01, price=100.0)
+# -- submission deadline (x-gate-exptime) ------------------------------------
 
 
-# -- request body defaults --------------------------------------------------
-
-
-def test_market_order_defaults_to_ioc():
-    bodies: list[dict[str, Any]] = []
+async def test_expiry_header_is_withheld_until_the_clock_is_synced():
+    seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        bodies.append(json.loads(request.content))
-        return httpx.Response(200, json=raw_order())
+        seen["headers"] = request.headers
+        return httpx.Response(200, json=ACCEPTED_ORDER)
 
-    client = make_client(handler, api_key="k", api_secret="s", live_orders=True)
-    client.place_order("BTC_USDT", "buy", "10", order_type="market")
+    client = make_client(handler, api_key="k", api_secret="s")
+    assert client.clock_synced is False
+    await client.post("/spot/orders", body=ORDER_BODY, expiring=True)
 
-    body = bodies[0]
-    assert body["type"] == "market"
-    assert body["time_in_force"] == "ioc"
-    assert "price" not in body
-    assert body["amount"] == "10"
-    assert body["text"].startswith("t-")
+    assert EXPIRY_HEADER not in seen["headers"]
 
 
-def test_limit_order_defaults_to_gtc():
-    bodies: list[dict[str, Any]] = []
+async def test_expiry_header_is_sent_after_sync_time():
+    seen: list[httpx.Headers] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        bodies.append(json.loads(request.content))
-        return httpx.Response(200, json=raw_order())
+        seen.append(request.headers)
+        if request.url.path.endswith("/spot/time"):
+            return httpx.Response(200, json={"server_time": int(time.time() * 1000)})
+        return httpx.Response(200, json=ACCEPTED_ORDER)
 
-    client = make_client(handler, api_key="k", api_secret="s", live_orders=True)
-    client.place_order("BTC_USDT", "buy", 0.01, price=100.0)
+    client = make_client(handler, api_key="k", api_secret="s")
+    await client.sync_time()
+    assert client.clock_synced is True
 
-    body = bodies[0]
-    assert body["type"] == "limit"
-    assert body["time_in_force"] == "gtc"
-    assert body["price"] == "100.0"
+    await client.post("/spot/orders", body=ORDER_BODY, expiring=True)
+
+    expiry = int(seen[-1][EXPIRY_HEADER])
+    now_ms = int(time.time() * 1000)
+    assert now_ms < expiry <= now_ms + client.order_expiry_ms + 2_000
 
 
-# -- time synchronization ---------------------------------------------------
+async def test_expiry_header_is_absent_on_non_expiring_requests():
+    seen: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        if request.url.path.endswith("/spot/time"):
+            return httpx.Response(200, json={"server_time": int(time.time() * 1000)})
+        return httpx.Response(200, json=[])
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    await client.sync_time()
+    await client.get("/spot/accounts", signed=True)
+
+    assert EXPIRY_HEADER not in seen[-1]
 
 
-def test_sync_time_offset_applied_to_signed_timestamp():
-    offset_ms = 5_000_000  # pretend the exchange clock is 5000 s ahead
+async def test_expiry_header_can_be_disabled():
+    seen: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        if request.url.path.endswith("/spot/time"):
+            return httpx.Response(200, json={"server_time": int(time.time() * 1000)})
+        return httpx.Response(200, json=ACCEPTED_ORDER)
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    client.order_expiry_ms = 0
+    await client.sync_time()
+    await client.post("/spot/orders", body=ORDER_BODY, expiring=True)
+
+    assert EXPIRY_HEADER not in seen[-1]
+
+
+async def test_sync_time_offset_is_applied_to_the_signed_timestamp():
+    offset_ms = 5_000_000  # pretend the venue clock is 5000 s ahead
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"server_time": int(time.time() * 1000) + offset_ms})
 
     client = make_client(handler)
-    measured = client.sync_time()
+    measured = await client.sync_time()
 
-    assert abs(measured - offset_ms) < 2_000  # allow for handler latency
-    signed = int(client._signed_timestamp())
+    assert abs(measured - offset_ms) < 2_000
+    signed = int(client._timestamp())
     assert abs(signed - (time.time() + offset_ms / 1000)) < 5
+
+
+# -- transport ownership and shutdown ---------------------------------------
+
+
+async def test_close_is_reference_counted_across_owners():
+    client = make_client(lambda r: httpx.Response(200, json={}))
+
+    client.acquire()  # data client
+    client.acquire()  # execution client
+    assert client.owner_count == 2
+
+    await client.close()
+    assert client.is_closed is False, "the transport closed while an owner still held it"
+    assert client._client.is_closed is False
+
+    await client.close()
+    assert client.is_closed is True
+    assert client._client.is_closed is True
+
+
+async def test_close_is_idempotent_without_any_owner():
+    client = make_client(lambda r: httpx.Response(200, json={}))
+
+    await client.close()
+    await client.close()
+
+    assert client.is_closed is True
+    assert client.owner_count == 0
+
+
+async def test_requests_after_close_fail_with_a_clear_error():
+    log: list[httpx.Request] = []
+    client = make_client(counting_handler([httpx.Response(200, json={})], log))
+    await client.close()
+
+    with pytest.raises(GateioError) as excinfo:
+        await client.get("/spot/time")
+
+    assert excinfo.value.label == "CLIENT_CLOSED"
+    assert log == []
+
+
+async def test_acquire_after_close_is_refused():
+    client = make_client(lambda r: httpx.Response(200, json={}))
+    await client.close()
+
+    with pytest.raises(GateioError) as excinfo:
+        client.acquire()
+
+    assert excinfo.value.label == "CLIENT_CLOSED"
+
+
+async def test_async_context_manager_acquires_and_closes():
+    client = make_client(lambda r: httpx.Response(200, json={"server_time": 1}))
+
+    async with client as acquired:
+        assert acquired is client
+        assert client.owner_count == 1
+        assert await client.get("/spot/time") == {"server_time": 1}
+
+    assert client.is_closed is True
+    assert client._client.is_closed is True

@@ -1,109 +1,193 @@
 # Configuration
 
-All configuration classes live in `nautilus_gateio.config`. They are frozen
-(immutable) Nautilus config classes and can be embedded directly in a
-`TradingNodeConfig`.
+Every configuration class lives in `nautilus_gateio.config`. They are frozen
+`msgspec` structs extending the standard NautilusTrader live-client configs, so
+they can be embedded directly in a `TradingNodeConfig`.
 
-## GateioDataClientConfig
+The tables below are the complete field lists, taken from the class definitions
+in `nautilus_gateio/config.py`. Fields inherited from `LiveDataClientConfig` /
+`LiveExecClientConfig` (such as `instrument_provider`, `handle_revised_bars`,
+`reconciliation` and `routing`) behave exactly as they do for any other
+NautilusTrader adapter and are documented upstream.
 
-Extends `nautilus_trader.live.config.LiveDataClientConfig` (so the standard
-fields such as `instrument_provider` are also available).
+## Environments
+
+```python
+from nautilus_gateio.config import MAINNET, TESTNET
+
+MAINNET  # "mainnet"
+TESTNET  # "testnet"
+```
+
+`environment` selects the REST host and the WebSocket hosts:
+
+| `environment` | REST base URL |
+|---|---|
+| `"mainnet"` (default, both clients) | `https://api.gateio.ws` |
+| `"testnet"` | `https://api-testnet.gateapi.io` |
+
+**Execution defaults to `"mainnet"`.** This is deliberate, and it changed in
+0.2.0: an execution client that silently pointed at a different exchange
+environment than the operator believed would be more dangerous than one that
+requires the venue to be stated. There is no local order kill switch — see
+[Safety model](#safety-model).
+
+Gate.io publishes testnet endpoints for **spot and USDT perpetual futures
+only**. Configuring `INVERSE`, `FUT` or `OPT` together with
+`environment="testnet"` raises `ValueError` from the client constructor, before
+any network activity.
+
+## `GateioDataClientConfig`
+
+Extends `nautilus_trader.live.config.LiveDataClientConfig`.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `venue` | `str` | `"GATEIO"` | Venue string used in instrument ids (`BTC_USDT.GATEIO`) |
-| `base_url_http` | `str` | `"https://api.gateio.ws"` | REST endpoint for market data. Public data is always served from mainnet — Gate.io has no public spot testnet market-data feed |
-| `base_url_ws` | `str` | `"wss://api.gateio.ws/ws/v4/"` | WebSocket endpoint for market data |
-| `use_websocket` | `bool` | `True` | WebSocket is the primary transport; `False` forces REST polling only |
-| `poll_interval_secs` | `float` | `5.0` | REST polling cadence for the fallback transport |
-| `emit_synthetic_quotes` | `bool` | `True` | Emit a synthetic `QuoteTick` around each closed bar (close +/- 0.5 bp, unit sizes). Exists for quote-driven fill simulations; **not** real quotes — see [market-data.md](market-data.md) |
+| `api_key` | `str \| None` | `None` | API key. `None` reads the environment; public market data needs no credentials |
+| `api_secret` | `str \| None` | `None` | API secret. `None` reads the environment |
+| `environment` | `str` | `"mainnet"` | `"mainnet"` or `"testnet"` |
+| `products` | `tuple[GateioProductType, ...]` | `(GateioProductType.SPOT,)` | Products to load instruments for and open public WebSocket streams on. One client multiplexes every configured product |
+| `options_underlyings` | `tuple[str, ...] \| None` | `None` | Restricts option instrument loading to these underlyings, e.g. `("BTC_USDT",)`. Ignored unless `OPT` is configured |
+| `base_url_http` | `str \| None` | `None` | Overrides the REST base URL derived from `environment` |
+| `base_url_ws` | `str \| None` | `None` | Overrides the WebSocket URL for **every** configured product. Intended for single-product setups or a local aggregating proxy |
+| `update_instruments_interval_mins` | `int \| None` | `60` | Interval of the instrument reload task. `None` disables reloading |
+| `http_timeout_secs` | `float` | `20.0` | Per-request REST timeout |
+| `max_retries` | `int` | `3` | REST attempts for rate-limited or transient server errors |
+| `order_book_snapshot_limit` | `int` | `100` | Depth of the REST snapshot seeding each local book. Must be one of `1, 5, 10, 20, 50, 100`. Also the level requested on the WebSocket where the product allows one to be named |
+| `order_book_update_interval_ms` | `int` | `100` | Push interval of the incremental depth stream. One of `20`, `100`, `1000`; `20` implies a 20-level stream, and delivery/options accept `100` and `1000` only |
+| `bars_timestamp_on_close` | `bool` | `True` | Timestamp bars at the close of their interval (the Nautilus convention). `False` timestamps at the open, matching Gate.io's `t` field |
 
-## GateioExecClientConfig
+Helpers on the class:
+
+* `is_testnet` (property) — whether `environment` selects the testnet.
+* `resolve_http_url()` — the REST base URL, honouring `base_url_http`.
+* `resolve_ws_url(product)` — the WebSocket URL for one product, honouring
+  `base_url_ws`.
+
+## `GateioExecClientConfig`
 
 Extends `nautilus_trader.live.config.LiveExecClientConfig`.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `api_key` | `str \| None` | `None` | API key; `None` reads environment variables (see below) |
-| `api_secret` | `str \| None` | `None` | API secret; `None` reads environment variables |
-| `environment` | `str` | `"testnet"` | `"testnet"` or `"mainnet"`. Anything other than `"mainnet"` (case-insensitive) is treated as testnet |
-| `base_url_http` | `str \| None` | `None` | Explicit REST endpoint override; when `None` it derives from `environment` via `resolve_base_url()` |
-| `venue` | `str` | `"GATEIO"` | Venue string |
-| `account_poll_interval_secs` | `float` | `5.0` | Cadence of the fill/balance polling loop (no private WebSocket yet — fills are detected via REST polling) |
+| `api_key` | `str \| None` | `None` | API key. `None` reads the environment; trading always needs credentials |
+| `api_secret` | `str \| None` | `None` | API secret. `None` reads the environment |
+| `environment` | `str` | `"mainnet"` | `"mainnet"` or `"testnet"`. **Defaults to mainnet** |
+| `products` | `tuple[GateioProductType, ...]` | `(GateioProductType.SPOT,)` | Products this client trades. Gate.io keeps a separate wallet per product, so enabling several aggregates several wallets into one Nautilus account |
+| `options_underlyings` | `tuple[str, ...] \| None` | `None` | Restricts option instrument loading, as for the data client |
+| `base_url_http` | `str \| None` | `None` | Overrides the REST base URL derived from `environment` |
+| `base_url_ws` | `str \| None` | `None` | Overrides the private WebSocket URL for every configured product |
+| `spot_account_mode` | `GateioSpotAccountMode` | `GateioSpotAccountMode.SPOT` | Ledger spot orders trade against: `SPOT`, `MARGIN` (isolated), `CROSS_MARGIN` or `UNIFIED`. The margin modes require the corresponding account type to be provisioned on Gate.io |
 | `client_order_id_tag` | `str` | `"ng"` | Short tag embedded in generated Gate.io `text` client order ids |
+| `account_polling_interval_secs` | `float` | `30.0` | Interval of the account state poll backing up the private WebSocket balance stream |
+| `max_retries` | `int` | `3` | REST attempts for rate-limited or transient server errors |
+| `http_timeout_secs` | `float` | `20.0` | Per-request REST timeout |
 
-Helpers on the class:
+Helpers on the class: `is_testnet`, `resolve_http_url()`,
+`resolve_ws_url(product)` — identical to the data client's.
 
-* `is_testnet` (property) — `True` unless `environment.lower() == "mainnet"`.
-* `resolve_base_url()` — returns `base_url_http` if set, otherwise the
-  testnet or mainnet host based on `environment`.
+## Validation helpers
 
-## GateioPaperConfig
+Both structs are frozen, which rules out custom validation in `__post_init__`
+without giving up immutability. Cross-field validation therefore runs in the
+client constructors and raises `ValueError` with an explicit message before any
+network activity. The same functions are public, so a configuration can be
+checked up front:
 
-Configuration for the local paper-fill simulator (`PaperExecution`). No
-exchange orders are ever placed.
+```python
+from nautilus_gateio.config import (
+    validate_book_interval_ms,
+    validate_products,
+    validate_snapshot_limit,
+)
 
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `starting_balances` | `dict[str, float] \| None` | `None` | Virtual starting balances (`None` means `{"USDT": 10_000.0}`) |
-| `taker_fee` | `float` | `0.0016` | Simulated taker fee rate |
-| `maker_fee` | `float` | `0.00075` | Simulated maker fee rate |
+validate_products(config.products, config.environment)  # -> de-duplicated tuple
+validate_book_interval_ms(config.order_book_update_interval_ms)
+validate_snapshot_limit(config.order_book_snapshot_limit)
+```
 
-## Environment variables
+Module-level constants worth knowing:
 
-| Variable | Used for |
+| Constant | Value |
 |---|---|
-| `GATE_API_KEY` | Mainnet API key (also the fallback for testnet) |
-| `GATE_API_SECRET` | Mainnet API secret (also the fallback for testnet) |
-| `GATE_TESTNET_API_KEY` | Testnet API key |
-| `GATE_TESTNET_API_SECRET` | Testnet API secret |
+| `config.TESTNET_PRODUCTS` | `(GateioProductType.SPOT, GateioProductType.PERP)` |
+| `config.ORDER_BOOK_UPDATE_INTERVALS_MS` | `(20, 100, 1000)` |
+| `common.constants.ORDER_BOOK_SNAPSHOT_LIMITS` | `(1, 5, 10, 20, 50, 100)` |
 
-## Credential resolution order
+## Credentials and environment variables
 
-Credentials are resolved by `resolve_credentials(api_key, api_secret, testnet)`
-at client-creation time:
+`api_key` / `api_secret` default to `None`, in which case they are resolved from
+the environment when the client is created
+(`nautilus_gateio.common.credentials.resolve_credentials`):
 
-1. Explicit `api_key` / `api_secret` config values, when not `None`.
-2. Otherwise, from the environment:
-   * testnet: `GATE_TESTNET_API_KEY` / `GATE_TESTNET_API_SECRET`, falling
-     back to `GATE_API_KEY` / `GATE_API_SECRET` if unset;
-   * mainnet: `GATE_API_KEY` / `GATE_API_SECRET`.
-3. Missing values resolve to empty strings — public market data still works
-   without credentials; private calls raise a clear error.
+| Variable | Used when |
+|---|---|
+| `GATE_API_KEY` / `GATE_API_SECRET` | `environment="mainnet"`, and as the fallback on testnet |
+| `GATE_TESTNET_API_KEY` / `GATE_TESTNET_API_SECRET` | `environment="testnet"`, falling back to the mainnet variables |
 
-All resolved values are stripped of surrounding whitespace, so keys pasted
-with trailing newlines do not break request signing.
+Resolution order: explicit config values first, then the environment, then empty
+strings. Values are stripped of surrounding whitespace, because a key pasted
+with a trailing newline otherwise produces signatures the venue silently
+rejects. Empty values mean "no credentials", which is a valid state for public
+market data. Credentials are never logged; `credentials.mask()` renders a safe
+fingerprint for diagnostics.
 
-## Endpoints: testnet vs. mainnet
+## Safety model
 
-| Purpose | Mainnet | Testnet |
-|---|---|---|
-| REST | `https://api.gateio.ws` | `https://api-testnet.gateapi.io` |
-| WebSocket (spot market data) | `wss://api.gateio.ws/ws/v4/` | — (no public spot testnet market data) |
+Be explicit about what the adapter does and does not do:
 
-Notes:
+* `environment` defaults to `"mainnet"` on **both** clients. Set
+  `environment="testnet"` if you want the testnet.
+* There is **no local order kill switch**. Version 0.1.0 had a switch on the
+  HTTP client that refused order-mutating calls; it is gone. A flag inside the
+  process is not a security boundary — the process holds the key either way,
+  and the flag encouraged treating "the code will stop me" as a guarantee.
+* The intended controls are, in order of strength:
+  1. **API key permissions** on the Gate.io side — create a key with only the
+     permissions the strategy needs, and never grant withdrawal permission to a
+     trading key.
+  2. **IP allow-listing** on the key.
+  3. `environment="testnet"` for rehearsal (spot and USDT perpetuals only).
+  4. NautilusTrader's own sandbox and backtest execution for simulation.
+* The adapter never silently alters an order's meaning. Anything Gate.io cannot
+  express is denied or rejected with a stated reason — see
+  [execution.md](execution.md).
+* The adapter never changes a venue-side account setting: hedge (dual) position
+  mode is detected and refused, not switched, and a unified account mode is
+  never upgraded automatically.
 
-* Public spot market data (bars, tickers, order books) is only available on
-  mainnet. The data client therefore defaults to mainnet endpoints even when
-  execution targets testnet — this is the intended pairing.
-* The testnet host serves authenticated spot endpoints for Gate.io testnet
-  accounts, and the (fully public) futures testnet.
+## Worked example
 
-## Safety defaults
+```python
+from nautilus_trader.common.config import InstrumentProviderConfig
+from nautilus_trader.config import TradingNodeConfig
 
-The adapter uses a layered opt-in model — each layer must be crossed
-explicitly, and credentials alone never enable order flow:
+from nautilus_gateio import (
+    GATEIO,
+    GateioDataClientConfig,
+    GateioExecClientConfig,
+    GateioProductType,
+    GateioSpotAccountMode,
+)
 
-1. **Execution defaults to testnet.** `GateioExecClientConfig` targets the
-   Gate.io testnet host unless you set `environment="mainnet"`.
-2. **The `live_orders` switch.** `GateioHttpClient` refuses order-mutating
-   calls (`place_order`, `cancel_order`, ...) unless constructed with
-   `live_orders=True`; otherwise they raise `LiveOrdersDisabledError`. The
-   execution client sets this flag itself, because wiring it into a
-   `TradingNode` *is* the explicit opt-in — but any `GateioHttpClient` you
-   construct directly is read-only by default.
-3. **Examples are gated.** The order-placing example
-   (`examples/06_testnet_orders.py`) refuses to run unless
-   `GATEIO_ALLOW_ORDERS=YES` is set, hard-codes the testnet host (not
-   overridable by environment), requires testnet credentials, and caps the
-   order notional.
+config = TradingNodeConfig(
+    trader_id="EXAMPLE-001",
+    data_clients={
+        GATEIO: GateioDataClientConfig(
+            products=(GateioProductType.SPOT, GateioProductType.PERP),
+            instrument_provider=InstrumentProviderConfig(
+                load_ids=frozenset(["BTC_USDT.GATE_IO", "BTC_USDT-PERP.GATE_IO"]),
+            ),
+            order_book_update_interval_ms=100,
+            order_book_snapshot_limit=100,
+        ),
+    },
+    exec_clients={
+        GATEIO: GateioExecClientConfig(
+            environment="testnet",  # explicit: the default is mainnet
+            products=(GateioProductType.SPOT,),
+            spot_account_mode=GateioSpotAccountMode.SPOT,
+        ),
+    },
+)
+```

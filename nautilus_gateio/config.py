@@ -1,55 +1,147 @@
-"""Configuration classes for the Gate.io adapter.
+"""Configuration for the Gate.io data and execution clients.
 
-Credentials resolution follows the NautilusTrader adapter convention: if
-``api_key`` / ``api_secret`` are ``None`` they are read from environment
-variables at client-creation time:
+Credentials
+-----------
+``api_key`` / ``api_secret`` default to ``None``, in which case they are read
+from the environment when the client is created (see
+:mod:`nautilus_gateio.common.credentials`):
 
 * mainnet: ``GATE_API_KEY`` / ``GATE_API_SECRET``
-* testnet: ``GATE_TESTNET_API_KEY`` / ``GATE_TESTNET_API_SECRET``
-  (falling back to the mainnet variables if unset)
+* testnet: ``GATE_TESTNET_API_KEY`` / ``GATE_TESTNET_API_SECRET``, falling back
+  to the mainnet variables.
 
-Safety defaults: the execution client targets the Gate.io *testnet* host by
-default. Trading against mainnet requires explicitly setting
-``environment="mainnet"`` in :class:`GateioExecClientConfig`.
+Public market data does not need credentials at all.
+
+Environments
+------------
+``environment`` is ``"mainnet"`` (default) or ``"testnet"``. Gate.io's testnet
+serves spot and USDT perpetual futures; there is no testnet endpoint for
+BTC-settled perpetuals, delivery futures or options, so configuring those
+products together with ``environment="testnet"`` is rejected by the client.
+
+Validation
+----------
+Both configuration classes are frozen ``msgspec`` structs, which cannot run
+custom validation in ``__post_init__`` without giving up immutability. All
+cross-field validation therefore happens in the client constructors
+(:class:`~nautilus_gateio.data.GateioDataClient` and the execution client),
+which raise ``ValueError`` with an explicit message before any network
+activity. The helper functions in this module (:func:`validate_products`,
+:func:`validate_book_interval_ms`, :func:`validate_snapshot_limit`) are what
+those constructors call, and they are public so that users can check a
+configuration up front.
 """
 
 from __future__ import annotations
 
-import os
-
-from nautilus_trader.config import NautilusConfig
 from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 
-from nautilus_gateio.constants import (
-    GATEIO,
+from nautilus_gateio.common.constants import (
+    DEFAULT_HTTP_TIMEOUT_SECS,
     GATEIO_HTTP_MAINNET,
     GATEIO_HTTP_TESTNET,
-    GATEIO_WS_MAINNET,
+    ORDER_BOOK_SNAPSHOT_LIMITS,
+    ws_url,
+)
+from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
+
+#: Environment strings accepted by the ``environment`` field.
+MAINNET = "mainnet"
+TESTNET = "testnet"
+
+#: Products for which Gate.io publishes a testnet WebSocket endpoint.
+TESTNET_PRODUCTS: tuple[GateioProductType, ...] = (
+    GateioProductType.SPOT,
+    GateioProductType.PERP,
 )
 
+#: Order book update intervals (milliseconds) Gate.io accepts. Verified live:
+#: spot and perpetual futures accept all three; delivery and options accept
+#: ``100`` and ``1000`` only.
+ORDER_BOOK_UPDATE_INTERVALS_MS: tuple[int, ...] = (20, 100, 1000)
 
-def resolve_credentials(
-    api_key: str | None,
-    api_secret: str | None,
-    testnet: bool,
-) -> tuple[str, str]:
-    """Resolve credentials from explicit values or environment variables.
 
-    Returns ``(api_key, api_secret)``; empty strings mean "no credentials"
-    (public data still works). Values are stripped of surrounding whitespace
-    so keys pasted with trailing newlines do not break request signing.
+def is_testnet(environment: str) -> bool:
+    """Return whether ``environment`` selects the Gate.io testnet."""
+    return environment.strip().lower() == TESTNET
+
+
+def resolve_http_url(environment: str, override: str | None = None) -> str:
+    """Return the REST base URL for ``environment``, honouring an override."""
+    if override:
+        return override
+    return GATEIO_HTTP_TESTNET if is_testnet(environment) else GATEIO_HTTP_MAINNET
+
+
+def resolve_ws_url(
+    product: GateioProductType,
+    environment: str,
+    override: str | None = None,
+) -> str:
+    """Return the WebSocket URL for ``product``, honouring an override.
+
+    Raises
+    ------
+    ValueError
+        If ``environment`` is the testnet and Gate.io publishes no testnet
+        endpoint for ``product``.
+
     """
-    if api_key is None:
-        if testnet:
-            api_key = os.getenv("GATE_TESTNET_API_KEY") or os.getenv("GATE_API_KEY", "")
-        else:
-            api_key = os.getenv("GATE_API_KEY", "")
-    if api_secret is None:
-        if testnet:
-            api_secret = os.getenv("GATE_TESTNET_API_SECRET") or os.getenv("GATE_API_SECRET", "")
-        else:
-            api_secret = os.getenv("GATE_API_SECRET", "")
-    return (api_key or "").strip(), (api_secret or "").strip()
+    if override:
+        return override
+    return ws_url(product, testnet=is_testnet(environment))
+
+
+def validate_products(
+    products: tuple[GateioProductType, ...],
+    environment: str,
+) -> tuple[GateioProductType, ...]:
+    """Validate a configured product tuple and return it de-duplicated.
+
+    Raises
+    ------
+    ValueError
+        If the tuple is empty, contains a non-product, or names a product that
+        Gate.io does not serve on the configured environment.
+
+    """
+    if not products:
+        raise ValueError("`products` must name at least one Gate.io product")
+    seen: list[GateioProductType] = []
+    for product in products:
+        if not isinstance(product, GateioProductType):
+            raise ValueError(
+                f"`products` must contain GateioProductType members, was {product!r}",
+            )
+        if product not in seen:
+            seen.append(product)
+    if is_testnet(environment):
+        unsupported = [p.value for p in seen if p not in TESTNET_PRODUCTS]
+        if unsupported:
+            raise ValueError(
+                f"Gate.io has no testnet endpoint for {', '.join(unsupported)}; "
+                f"testnet supports {', '.join(p.value for p in TESTNET_PRODUCTS)}",
+            )
+    return tuple(seen)
+
+
+def validate_book_interval_ms(interval_ms: int) -> int:
+    """Validate the configured order book update interval."""
+    if interval_ms not in ORDER_BOOK_UPDATE_INTERVALS_MS:
+        raise ValueError(
+            f"`order_book_update_interval_ms` must be one of "
+            f"{ORDER_BOOK_UPDATE_INTERVALS_MS}, was {interval_ms}",
+        )
+    return interval_ms
+
+
+def validate_snapshot_limit(limit: int) -> int:
+    """Validate the configured REST order book snapshot depth."""
+    if limit not in ORDER_BOOK_SNAPSHOT_LIMITS:
+        raise ValueError(
+            f"`order_book_snapshot_limit` must be one of {ORDER_BOOK_SNAPSHOT_LIMITS}, was {limit}",
+        )
+    return limit
 
 
 class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
@@ -57,77 +149,152 @@ class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
 
     Parameters
     ----------
-    venue : str
-        Venue string used in instrument ids (default ``GATEIO``).
-    base_url_http : str
-        REST endpoint for market data (public; mainnet by default — Gate.io
-        has no public spot testnet market data).
-    base_url_ws : str
-        WebSocket endpoint for market data.
-    use_websocket : bool
-        WebSocket is the primary transport; when ``False`` the client uses
-        REST polling only.
-    poll_interval_secs : float
-        REST polling cadence for the fallback transport.
-    emit_synthetic_quotes : bool
-        When ``True`` (default) the client synthesizes a ``QuoteTick`` around
-        each closed bar (close +/- 0.5 bp, unit sizes). This exists so
-        sandbox/backtest-style execution clients that fill on quotes receive
-        top-of-book updates. These are NOT real quotes — disable if your
-        strategy consumes quote ticks as market truth.
-    """
-
-    venue: str = GATEIO
-    base_url_http: str = GATEIO_HTTP_MAINNET
-    base_url_ws: str = GATEIO_WS_MAINNET
-    use_websocket: bool = True
-    poll_interval_secs: float = 5.0
-    emit_synthetic_quotes: bool = True
-
-
-class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
-    """Configuration for :class:`~nautilus_gateio.execution.GateioExecutionClient`.
-
-    Parameters
-    ----------
-    api_key, api_secret : str, optional
-        Credentials; ``None`` reads environment variables (see module docs).
-    environment : str
-        ``"testnet"`` (default) or ``"mainnet"``. The default deliberately
-        targets Gate.io's testnet host; mainnet must be opted into explicitly.
+    api_key : str, optional
+        Gate.io API key. ``None`` reads the environment (public data does not
+        need credentials).
+    api_secret : str, optional
+        Gate.io API secret. ``None`` reads the environment.
+    environment : str, default "mainnet"
+        ``"mainnet"`` or ``"testnet"``.
+    products : tuple[GateioProductType, ...], default ``(SPOT,)``
+        Products to load instruments for and open public WebSocket streams on.
+        One client multiplexes every configured product.
+    options_underlyings : tuple[str, ...], optional
+        Restricts option instrument loading to these underlyings (for example
+        ``("BTC_USDT",)``). Gate.io lists thousands of option contracts, so
+        loading them all is slow and rarely wanted. Ignored unless
+        ``GateioProductType.OPT`` is configured.
     base_url_http : str, optional
-        Override the REST endpoint; when ``None`` it derives from
-        ``environment``.
-    venue : str
-        Venue string (default ``GATEIO``).
-    account_poll_interval_secs : float
-        Cadence of the order-fill/balance polling loop (the adapter has no
-        private WebSocket yet; fills are detected via REST polling).
-    client_order_id_tag : str
-        Short tag embedded in generated Gate.io ``text`` client order ids.
+        Overrides the REST base URL derived from ``environment``.
+    base_url_ws : str, optional
+        Overrides the WebSocket URL for **every** configured product. Intended
+        for single-product setups or a local aggregating proxy.
+    update_instruments_interval_mins : int, optional, default 60
+        Interval of the instrument reload task. ``None`` disables reloading.
+    http_timeout_secs : float, default 20.0
+        Per-request REST timeout.
+    max_retries : int, default 3
+        REST attempts for rate-limited or transient server errors.
+    order_book_snapshot_limit : int, default 100
+        Depth of the REST order book snapshot that seeds each local book. Gate
+        requires the snapshot depth to match the subscribed stream level, so
+        this is also the level requested on the WebSocket where the product
+        allows one to be named.
+    order_book_update_interval_ms : int, default 100
+        Push interval of the incremental order book stream. Gate.io accepts
+        ``20``, ``100`` and ``1000``; ``20`` implies a 20-level stream and
+        delivery/options accept ``100`` and ``1000`` only.
+    bars_timestamp_on_close : bool, default True
+        If bars are timestamped at the close of their interval (the Nautilus
+        convention). ``False`` timestamps them at the open, matching the ``t``
+        field Gate.io sends.
+
+    Notes
+    -----
+    The struct is frozen; cross-field validation runs in the client
+    constructor. Call :func:`validate_products`, :func:`validate_book_interval_ms`
+    and :func:`validate_snapshot_limit` directly to check a configuration
+    without building a client.
+
     """
 
     api_key: str | None = None
     api_secret: str | None = None
-    environment: str = "testnet"
+    environment: str = MAINNET
+    products: tuple[GateioProductType, ...] = (GateioProductType.SPOT,)
+    options_underlyings: tuple[str, ...] | None = None
     base_url_http: str | None = None
-    venue: str = GATEIO
-    account_poll_interval_secs: float = 5.0
-    client_order_id_tag: str = "ng"
+    base_url_ws: str | None = None
+    update_instruments_interval_mins: int | None = 60
+    http_timeout_secs: float = DEFAULT_HTTP_TIMEOUT_SECS
+    max_retries: int = 3
+    order_book_snapshot_limit: int = 100
+    order_book_update_interval_ms: int = 100
+    bars_timestamp_on_close: bool = True
 
     @property
     def is_testnet(self) -> bool:
-        return self.environment.lower() != "mainnet"
+        """Return whether this configuration targets the Gate.io testnet."""
+        return is_testnet(self.environment)
 
-    def resolve_base_url(self) -> str:
-        if self.base_url_http:
-            return self.base_url_http
-        return GATEIO_HTTP_TESTNET if self.is_testnet else GATEIO_HTTP_MAINNET
+    def resolve_http_url(self) -> str:
+        """Return the REST base URL for this configuration."""
+        return resolve_http_url(self.environment, self.base_url_http)
+
+    def resolve_ws_url(self, product: GateioProductType) -> str:
+        """Return the WebSocket URL for ``product`` under this configuration."""
+        return resolve_ws_url(product, self.environment, self.base_url_ws)
 
 
-class GateioPaperConfig(NautilusConfig, frozen=True):
-    """Configuration for the local paper-fill simulator (no exchange orders)."""
+class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
+    """Configuration for the Gate.io execution client.
 
-    starting_balances: dict[str, float] | None = None
-    taker_fee: float = 0.0016
-    maker_fee: float = 0.00075
+    Parameters
+    ----------
+    api_key : str, optional
+        Gate.io API key. ``None`` reads the environment; trading always needs
+        credentials.
+    api_secret : str, optional
+        Gate.io API secret. ``None`` reads the environment.
+    environment : str, default "mainnet"
+        ``"mainnet"`` or ``"testnet"``. Note this defaults to **mainnet**: an
+        execution client that silently pointed at a different exchange
+        environment would be more dangerous than one that requires the
+        operator to state which venue they mean.
+    products : tuple[GateioProductType, ...], default ``(SPOT,)``
+        Products this client trades. Gate.io keeps a separate wallet per
+        product, so enabling several products aggregates several wallets into
+        one Nautilus account.
+    options_underlyings : tuple[str, ...], optional
+        Restricts option instrument loading, as for the data client.
+    base_url_http : str, optional
+        Overrides the REST base URL derived from ``environment``.
+    base_url_ws : str, optional
+        Overrides the private WebSocket URL for every configured product.
+    spot_account_mode : GateioSpotAccountMode, default ``SPOT``
+        Ledger spot orders trade against: plain spot, isolated margin, cross
+        margin or the unified account. The margin modes require the
+        corresponding account type to be provisioned on Gate.io.
+    client_order_id_tag : str, default "ng"
+        Short tag embedded in generated Gate.io ``text`` client order ids.
+    account_polling_interval_secs : float, default 30.0
+        Interval of the account state poll that backs up the private
+        WebSocket balance stream.
+    max_retries : int, default 3
+        REST attempts for rate-limited or transient server errors.
+    http_timeout_secs : float, default 20.0
+        Per-request REST timeout.
+
+    Notes
+    -----
+    The struct is frozen; cross-field validation (products versus environment,
+    spot account mode versus configured products) runs in the client
+    constructor.
+
+    """
+
+    api_key: str | None = None
+    api_secret: str | None = None
+    environment: str = MAINNET
+    products: tuple[GateioProductType, ...] = (GateioProductType.SPOT,)
+    options_underlyings: tuple[str, ...] | None = None
+    base_url_http: str | None = None
+    base_url_ws: str | None = None
+    spot_account_mode: GateioSpotAccountMode = GateioSpotAccountMode.SPOT
+    client_order_id_tag: str = "ng"
+    account_polling_interval_secs: float = 30.0
+    max_retries: int = 3
+    http_timeout_secs: float = DEFAULT_HTTP_TIMEOUT_SECS
+
+    @property
+    def is_testnet(self) -> bool:
+        """Return whether this configuration targets the Gate.io testnet."""
+        return is_testnet(self.environment)
+
+    def resolve_http_url(self) -> str:
+        """Return the REST base URL for this configuration."""
+        return resolve_http_url(self.environment, self.base_url_http)
+
+    def resolve_ws_url(self, product: GateioProductType) -> str:
+        """Return the WebSocket URL for ``product`` under this configuration."""
+        return resolve_ws_url(product, self.environment, self.base_url_ws)

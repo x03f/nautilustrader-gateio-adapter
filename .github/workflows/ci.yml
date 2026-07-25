@@ -37,7 +37,14 @@ jobs:
         run: pytest -q
 
       - name: Import smoke test
-        run: python -c "import nautilus_gateio; print(nautilus_gateio.__version__)"
+        run: |
+          python -c "
+          import nautilus_gateio
+          from nautilus_gateio.common.symbols import instrument_id_to_gateio
+          from nautilus_gateio.http.spot import GateioSpotHttpAPI
+          from nautilus_gateio.websocket.public import GateioPublicWebSocket
+          print(nautilus_gateio.__version__, instrument_id_to_gateio('BTC_USDT-PERP.GATE_IO'))
+          "
 
   build:
     name: Build distribution
@@ -50,6 +57,12 @@ jobs:
         with:
           python-version: "3.13"
 
+      # A previous build's artefacts must never survive into a release upload:
+      # `python -m build` does not clear `dist/`, so a stale wheel from an older
+      # version would still be there for `twine upload` to pick up.
+      - name: Clean previous build artefacts
+        run: rm -rf dist/ build/ *.egg-info
+
       - name: Build sdist and wheel
         run: |
           python -m pip install --upgrade pip build twine
@@ -58,7 +71,129 @@ jobs:
       - name: Validate package metadata
         run: twine check dist/*
 
-      - name: Verify wheel installs and imports
+      - name: Check dist holds exactly this version
         run: |
-          pip install dist/*.whl
-          python -c "import nautilus_gateio; print(nautilus_gateio.__version__)"
+          python - <<'PY'
+          import pathlib
+          import tomllib
+
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          files = sorted(p.name for p in pathlib.Path("dist").iterdir())
+          expected = [
+              f"nautilustrader_gateio_adapter-{version}-py3-none-any.whl",
+              f"nautilustrader_gateio_adapter-{version}.tar.gz",
+          ]
+          assert files == sorted(expected), f"dist/ holds {files}, expected {sorted(expected)}"
+          print("dist/ is clean:", files)
+          PY
+
+      # Installing into a clean environment OUTSIDE the source tree is the point
+      # of this step: with the checkout on sys.path, every import below would
+      # succeed even from a wheel that shipped no sub-packages at all.
+      - name: Verify the installed wheel exposes every sub-package
+        run: |
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install --upgrade pip
+          /tmp/wheelcheck/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/wheelcheck/bin/python - <<'PY'
+          import importlib
+
+          import nautilus_gateio
+
+          # Every sub-package must be present in the distribution.
+          for name in (
+              "nautilus_gateio.common",
+              "nautilus_gateio.common.constants",
+              "nautilus_gateio.common.credentials",
+              "nautilus_gateio.common.enums",
+              "nautilus_gateio.common.errors",
+              "nautilus_gateio.common.parsing",
+              "nautilus_gateio.common.signing",
+              "nautilus_gateio.common.symbols",
+              "nautilus_gateio.http",
+              "nautilus_gateio.http.client",
+              "nautilus_gateio.http.futures",
+              "nautilus_gateio.http.margin",
+              "nautilus_gateio.http.options",
+              "nautilus_gateio.http.spot",
+              "nautilus_gateio.http.wallet",
+              "nautilus_gateio.websocket",
+              "nautilus_gateio.websocket.client",
+              "nautilus_gateio.websocket.private",
+              "nautilus_gateio.websocket.public",
+              "nautilus_gateio.books",
+              "nautilus_gateio.config",
+              "nautilus_gateio.data",
+              "nautilus_gateio.execution",
+              "nautilus_gateio.factories",
+              "nautilus_gateio.instruments",
+              "nautilus_gateio.providers",
+          ):
+              importlib.import_module(name)
+
+          # Every name the README and docs tell users to import must resolve.
+          from nautilus_gateio import (
+              GATEIO,
+              GateioDataClient,
+              GateioDataClientConfig,
+              GateioExecClientConfig,
+              GateioExecutionClient,
+              GateioFuturesHttpAPI,
+              GateioHttpClient,
+              GateioInstrumentProvider,
+              GateioLiveDataClientFactory,
+              GateioLiveExecClientFactory,
+              GateioMarginHttpAPI,
+              GateioOptionsHttpAPI,
+              GateioProductType,
+              GateioPublicWebSocket,
+              GateioSpotAccountMode,
+              GateioSpotHttpAPI,
+              GateioWalletHttpAPI,
+              instrument_id_to_gateio,
+              product_of,
+          )
+
+          assert GATEIO == "GATE_IO", GATEIO
+          assert instrument_id_to_gateio("BTC_USDT-PERP.GATE_IO") == (
+              GateioProductType.PERP,
+              "BTC_USDT",
+          )
+          assert GateioExecClientConfig().environment == "mainnet"
+          print("wheel verified:", nautilus_gateio.__version__, nautilus_gateio.__file__)
+          PY
+
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      # Importing each example proves it still matches the package API. The
+      # examples are not executed here: they need the venue, so running them is
+      # a release-checklist step (docs/releasing.md).
+      - name: Byte-compile and import every example
+        run: |
+          python -m compileall -q examples
+          python - <<'PY'
+          import importlib.util
+          import pathlib
+
+          for path in sorted(pathlib.Path("examples").glob("*.py")):
+              spec = importlib.util.spec_from_file_location(path.stem, path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              assert hasattr(module, "main"), f"{path} defines no main()"
+              print("ok:", path)
+          PY
