@@ -1,113 +1,165 @@
 # Troubleshooting
 
-Real failure modes seen with this adapter, and how to fix them.
+Real failure modes, and what to do about them.
 
-## `INVALID_SIGNATURE` on private requests
+## `INVALID_SIGNATURE` or HTTP 401 on private requests
 
-Gate.io rejects the request signature. The two usual causes:
+Two usual causes:
 
-* **Clock drift.** The signature includes a Unix-second timestamp; if your
-  local clock is off, signatures are rejected. Call
-  `GateioHttpClient.sync_time()` once after constructing the client — it
-  measures the offset against the exchange's `/spot/time` and applies it to
-  all subsequent signed requests. Also consider enabling NTP on the host.
-* **Whitespace in keys.** A key or secret pasted with a trailing newline or
-  spaces produces a wrong HMAC. `resolve_credentials()` strips surrounding
-  whitespace from environment-sourced values, but explicit config values are
-  used as-is — check for stray whitespace if you pass keys directly.
+* **Clock drift.** The signature carries a Unix-second timestamp. Call
+  `await client.sync_time()` once after constructing `GateioHttpClient`; it
+  measures the offset against the venue clock and applies it to every subsequent
+  signed request. Enabling NTP on the host is the durable fix.
+* **Whitespace in the key or secret.** A value pasted with a trailing newline
+  produces a wrong HMAC. `resolve_credentials()` strips whitespace from
+  environment-sourced values, but values passed explicitly are used as given.
 
-Also verify you are using the key pair for the right environment: testnet
-keys are not valid on mainnet and vice versa.
+Also confirm the key pair matches the environment: testnet keys are not valid on
+mainnet and vice versa.
+
+## The client is pointing at the wrong exchange environment
+
+`environment` defaults to **`"mainnet"`** on both the data and the execution
+client. Version 0.1.0 defaulted execution to testnet, so a configuration carried
+over from 0.1.0 that relied on the default now targets mainnet. Set
+`environment="testnet"` explicitly if that is what you want.
+
+Symptom: balances come back empty, or orders reference instruments the account
+has never traded. Testnet balances exist only on `https://api-testnet.gateapi.io`
+and mainnet balances only on `https://api.gateio.ws`.
+
+## `ValueError: Gate.io has no testnet endpoint for ...`
+
+Raised by the client constructor before any network activity. Gate.io publishes
+testnet endpoints for spot and USDT perpetual futures only. Remove `INVERSE`,
+`FUT` and `OPT` from `products`, or use `environment="mainnet"`.
+
+## `USER_NOT_FOUND` / `WalletNotProvisionedError`
+
+Gate.io creates the futures, delivery and options wallets on the **first
+internal transfer into them**, and answers `USER_NOT_FOUND` until then. Move a
+small amount in:
+
+```python
+await exec_client.transfer(currency="USDT", from_="spot", to="futures", amount="10", settle="usdt")
+```
+
+The adapter treats this as a configuration state, not a failure: it logs a
+warning and skips that product rather than refusing to start.
+
+## `INVALID_UNIFIED_ACCOUNT` / "Please open the Unified Account"
+
+The account is not a unified account, or is not in the mode the endpoint needs.
+Cross margin and the unified endpoints require the account to be upgraded out of
+classic mode, which only the account owner can do. The adapter never changes an
+account's mode. Note also the venue's own minimum balances for the richer
+unified modes: `multi_currency` needs more than 500 USDT and `portfolio` more
+than 1000 USDT — see [products.md](products.md#unified-account-modes-and-their-venue-side-minimum-balances).
+
+## `FORBIDDEN`
+
+The API key lacks the permission that ledger or endpoint needs. Grant it in the
+key's permission settings — and grant nothing beyond what the strategy uses.
+Never give a trading key withdrawal permission.
 
 ## `TOO_MANY_REQUESTS` (HTTP 429)
 
-You are hitting Gate.io rate limits. The built-in `RateLimiter` paces
-requests (default 8 requests/second) and backs off exponentially on 429; the
-private request path retries up to 3 times before raising
-`GateioError(429, "TOO_MANY_REQUESTS", ...)`. If you still see this:
+The built-in rate limiter paces requests and backs off on 429, retrying only
+requests whose replay is provably safe. If you still see it:
 
-* lower `max_per_sec` when constructing `GateioHttpClient`;
-* increase `account_poll_interval_secs` (each cycle polls every pending
-  order plus balances);
-* reduce the number of concurrent clients sharing one API key — the limiter
-  is per-client-instance, not global.
+* lower `max_requests_per_second` when constructing `GateioHttpClient`;
+* raise `account_polling_interval_secs`;
+* reduce the number of clients sharing one API key — the limiter is
+  per-instance, not global. The factories already share one transport between
+  the data and execution clients of the same configuration.
 
-## Balances come back empty
+## `INVALID_CURRENCY_PAIR`, or an instrument that will not load
 
-`balances()` returns `{}` (or the node shows no account state) even though
-the account is funded. Almost always a host mismatch: you are asking the
-**testnet** host with a mainnet-funded account, or the **mainnet** host with
-testnet credentials. Check `GateioExecClientConfig.environment` (default is
-`"testnet"`!) and which key pair the environment variables hold. Testnet
-balances exist only on `https://api-testnet.gateapi.io` and mainnet balances
-only on `https://api.gateio.ws`.
+The symbol form is wrong. Use the canonical instrument ids:
 
-## `label: INVALID_CURRENCY_PAIR`
+| Product | Correct form |
+|---|---|
+| Spot | `BTC_USDT.GATE_IO` |
+| Perpetual | `BTC_USDT-PERP.GATE_IO` |
+| Delivery | `BTC_USDT_20260807.GATE_IO` |
+| Option | `BTC_USDT-20260729-70000-C.GATE_IO` |
 
-The symbol form is wrong. Gate.io pairs use an underscore: `BTC_USDT`, not
-`BTCUSDT` or `BTC/USDT`. In Nautilus terms, use the canonical instrument id
-`BTC_USDT.GATEIO`. The compatibility form `BTCUSDT.GATEIO` is accepted by
-`instrument_id_to_gate_pair()` for known quote suffixes (USDT, USDC, BTC,
-ETH) but the underscore form is recommended — it is lossless and is what
-`GateioInstrumentProvider` produces. Also confirm the pair is actually
-listed and tradable (`GateioHttpClient.currency_pair("BTC_USDT")`,
-`trade_status == "tradable"`).
+Common mistakes: the venue string is `GATE_IO`, **not** `GATEIO` (it changed in
+0.2.0); Gate.io pairs use an underscore (`BTC_USDT`, not `BTCUSDT`); and a
+perpetual without `-PERP` resolves to the *spot* pair of the same name, which is
+a different instrument. See [symbology.md](symbology.md).
 
-## WebSocket connects but no bars arrive
+## The WebSocket connects but no bars arrive
 
-Not a bug — the adapter emits **closed bars only**. After subscribing, the
-first bar arrives when the current interval *closes*: up to 1 minute for a
-`1-MINUTE` spec, up to a full day for `1-DAY`. If you need fast feedback
-while wiring things up, subscribe to a `1-MINUTE` bar type first — it is the
-fastest supported interval. To verify liveness at the transport level, check
-`GateioDataClient.metrics()["last_event_ms"]` or the WebSocket client's
-`messages` counter, which counts every received message including
-in-progress candle updates that are filtered out.
+Not a bug: only **closed** bars are emitted. The first bar of a subscription
+arrives when the interval it covers ends — up to a minute for `1-MINUTE`, up to
+a day for `1-DAY`. Use a short interval while wiring things up. Delivery and
+options publish no window-close flag, so their bars are additionally held until
+the next bucket opens plus a short grace period.
 
-## MARKET order rejected: below minimum notional
+## The order book keeps resynchronising
 
-Gate.io enforces a minimum order value per pair (`min_quote_amount`, e.g.
-around 1-3 USDT on major pairs) plus a minimum base amount and precision
-constraints. An order below the minimum is rejected by the exchange and
-surfaced as `OrderRejected`. Check the instrument's constraints via
-`GateioHttpClient.currency_pair(pair)` and size orders above
-`min_quote_amount` at the current price. For direct REST usage,
-`place_order_validated()` checks minimums and precision locally
-(raising `OrderValidationError`) before the request leaves the process.
+A gap in the incremental stream forces a REST re-snapshot. Occasional gaps are
+normal; a constant stream of them usually means the snapshot depth and the
+stream depth disagree. `order_book_snapshot_limit` must match what the stream
+serves for the configured `order_book_update_interval_ms`
+(`GateioPublicWebSocket.effective_depth()` reports it), and delivery and options
+accept `100` and `1000` ms only.
 
-## Orders rejected with `LiveOrdersDisabledError`
+## An order was rejected instead of being adjusted
 
-The `live_orders` safety switch is off — the deliberate default for any
-directly constructed `GateioHttpClient`. Credentials alone never enable
-order flow. Construct the client with `live_orders=True` to allow mutating
-calls. (The Nautilus execution client sets this itself; wiring it into a
-`TradingNode` is the opt-in.) Note that `emergency_stop()` flips the switch
-back off permanently for that client instance.
+That is deliberate. Anything Gate.io cannot express without changing the order's
+meaning is rejected with the reason on the event, never silently altered. The
+full list of rejection cases is in
+[execution.md](execution.md#nothing-is-silently-altered). The most common ones:
 
-## `instrument not found` when submitting orders or subscribing
+* `reduce_only` on a spot order — reduce-only is a derivatives concept;
+* `quote_quantity=True` anywhere but a spot market buy;
+* a fractional quantity on a contract product — contracts are whole;
+* FOK on an options order;
+* a price-triggered order on options, or on a cross-margin spot ledger.
 
-The instrument is not in the cache because the provider never loaded it.
-`GateioInstrumentProvider` loads on demand — configure your node's
-instrument provider with the ids you trade, or load them explicitly:
+## `OrderDenied: ... is not supported by Gate.io`
+
+The order type is outside `SUPPORTED_ORDER_TYPES` (MARKET, LIMIT, STOP_MARKET,
+STOP_LIMIT, MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED). Trailing stops and other types
+have no Gate.io equivalent; implement them at the strategy level.
+
+## "instrument not found" when subscribing or submitting
+
+The instrument was never loaded. Configure the node's instrument provider with
+the ids you trade:
 
 ```python
-await provider.load_ids_async([InstrumentId.from_str("BTC_USDT.GATEIO")])
+InstrumentProviderConfig(load_ids=frozenset(["BTC_USDT-PERP.GATE_IO"]))
 ```
 
-Prefer `load_ids_async` with an explicit list over `load_all_async`, which
-fetches thousands of pairs.
+Prefer explicit ids over loading everything — Gate.io lists thousands of spot
+pairs and option contracts. For options, restrict with `options_underlyings`.
 
-## Installation fails: Python or NautilusTrader version mismatch
+## An instrument is missing from a load that otherwise succeeded
 
-The package requires **Python >= 3.12** (and < 3.15) and
-**`nautilus_trader >= 1.230.0, < 2`**. On older Pythons, `pip` either
-refuses to install or resolves an ancient version; with an out-of-range
-NautilusTrader, imports can fail on moved modules (e.g. the live client base
-classes). Check with:
+Instruments that cannot be traded normally are not published: spot pairs the
+venue reports as untradable or one-sided, delisting or inactive contracts,
+expired delivery contracts, and options outside an active expiration.
+
+A pair whose price scale the running NautilusTrader build cannot represent is
+also rejected, with a warning naming it. Standard builds carry 9 decimal places;
+a handful of Gate.io pairs quote up to 14. Publishing them anyway would mean
+publishing zeroes as if they were venue prices.
+
+## An import that used to work now fails
+
+Version 0.2.0 removed several 0.1.0 modules and renamed the venue. See the
+[migration guide](migration-0.1-to-0.2.md) for the complete list.
+
+## Installation fails on version constraints
+
+The package needs Python >= 3.12, < 3.15 and `nautilus_trader >= 1.230.0, < 2`:
 
 ```bash
 python --version
 python -c "import nautilus_trader; print(nautilus_trader.__version__)"
 ```
 
-and upgrade inside a fresh virtual environment if either is out of range.
+Install into a fresh virtual environment if either is out of range.

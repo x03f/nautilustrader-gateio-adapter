@@ -1,6 +1,6 @@
 # Testing
 
-## Running the unit tests
+## Running the suite
 
 ```bash
 pip install -e '.[dev]'
@@ -9,62 +9,89 @@ pytest
 
 The default run executes the unit suite only: `pyproject.toml` sets
 `addopts = "-m 'not integration'"`, so anything marked `integration` is
-deselected automatically. Unit tests use no network access and no
-credentials — all exchange payloads are synthetic fixtures (see
-`tests/conftest.py`: the `FakeMarket` data source and the `btc_spec` pair
-specification).
+deselected automatically.
 
-Requirements: Python >= 3.12 and the pinned `nautilus_trader` range from
+Unit tests **use no network and no credentials**. Every exchange payload is a
+recorded or synthetic fixture, and every transport is stubbed. A test that needs
+the network belongs behind the `integration` marker.
+
+Requirements: Python >= 3.12, < 3.15, and the `nautilus_trader` range pinned in
 `pyproject.toml` (`>=1.230.0,<2`).
 
 ## What is covered
 
-| Test module | Covers |
+| Area | What the tests assert |
 |---|---|
-| `test_config.py` | Config defaults, credential resolution order, testnet/mainnet URL derivation |
-| `test_errors.py` | Error hierarchy, `error_from_response` mapping, `should_retry` classification |
-| `test_factories.py` | Data/exec client factory construction |
-| `test_http_client.py` | REST client behavior against mocked transports: signing headers, error translation, `live_orders` gating, order validation |
-| `test_paper.py` | Paper simulator: book-walking fills, slippage, fees, minimum checks, balance accounting |
-| `test_providers.py` | Instrument building from pair specs, currency fallback, static provider |
-| `test_ratelimit.py` | Rate-limiter pacing and 429 backoff behavior |
-| `test_schemas.py` | Payload parsers (orders, candles, balances, fills, futures contracts) and `validate_order` |
-| `test_signing.py` | HMAC-SHA512 signature vectors, client-order-id generation and sanitization |
-| `test_symbols.py` | Instrument-id/pair conversion, underscore and compatibility forms, error cases |
-| `test_websocket.py` | WS message handling: closed-bar filter, dedup, out-of-order drop, gap detection, backoff schedule |
+| Symbology | Instrument id to Gate.io symbol and back, per product, including the `-PERP` rule and every malformed-input error path |
+| Enums and status mapping | Order side, time in force, and the `status`/`finish_as`/filled-amount combinations that determine a Nautilus `OrderStatus` |
+| Signing | HMAC-SHA512 REST and WebSocket signature vectors, client order id generation and sanitisation against the venue's charset and length limits |
+| Errors | Typed hierarchy, label-to-error mapping, retry classification, and the capability-gating translation into `WalletNotProvisionedError` |
+| REST transport | Header construction, query encoding, error translation, pacing, retry safety (mutating requests are never replayed), ambiguity reporting |
+| REST namespaces | Path and parameter construction per product, including the `/futures` versus `/delivery` split and the endpoints that refuse to exist on a delivery namespace |
+| WebSocket transport | Subscribe and unsubscribe acknowledgement handling, replay after reconnect, backoff schedule, heartbeat and receive-timeout recycling |
+| Order books | The full synchronisation algorithm: buffering, straddle detection, stale-snapshot rejection, gap detection and resync, zero-size deletions, both payload shapes |
+| Instruments | Payload to instrument per product, precision guards, contract multipliers, fee conventions, and the rejection of unrepresentable price scales |
+| Instrument provider | Multi-product loading, filtering of untradable and expired instruments, per-product degradation on an unprovisioned wallet |
+| Data client | Subscription and request paths, closed-bar filtering, tick construction, mark/index/funding fan-out and reference counting |
+| Execution client | Order translation per product and order type, **every rejection path**, cancellation, amendment, trigger-order id handling, fill application and deduplication, balance aggregation, all four report generators |
+| Configuration | Defaults (including the mainnet default), URL derivation, product/environment validation, credential resolution order |
+| Documentation and packaging | The documented configuration defaults match the code, documented imports resolve, no removed-feature vocabulary survives in the docs, and CI verifies the built wheel |
 
 ## Integration tests
 
-Policy: tests that talk to the real exchange are marked
-`@pytest.mark.integration` and are **skipped by default**. They only run
-when explicitly selected:
+Tests that talk to the real exchange are marked `@pytest.mark.integration` and
+are **deselected by default**. Run them explicitly:
 
 ```bash
-export GATE_TESTNET_API_KEY=...      # testnet credentials only
-export GATE_TESTNET_API_SECRET=...
 pytest -m integration
 ```
 
-An integration test must skip itself cleanly (not fail) when the required
-credentials are absent, so CI without secrets stays green.
+An integration test must skip itself cleanly — not fail — when credentials or
+the network are unavailable, so a CI run without secrets stays green.
 
-## Safety rules for credentialed tests
+## Rules for credentialed tests
 
-Any test that authenticates against the exchange must follow all of these:
+Credentialed tests never run in CI. Any test that authenticates must follow all
+of these:
 
-1. **Never mainnet.** Credentialed tests target the testnet host only
-   (`GATE_TESTNET_API_KEY` / `GATE_TESTNET_API_SECRET` against
-   `https://api-testnet.gateapi.io`). Mainnet credentials must never appear
-   in a test environment.
-2. **Tiny notionals.** Any order placed by a test uses the smallest size the
-   instrument allows (just above the exchange minimum notional), priced far
-   from the market when the order is not meant to fill.
-3. **Cancel in teardown.** Every test that places orders cancels them in a
-   `finally` block or fixture teardown — including on assertion failure —
-   so no state leaks between runs. `GateioHttpClient.cancel_all` exists for
-   exactly this.
-4. **Explicit order-flow opt-in.** Order-placing code paths still require
-   the `live_orders=True` switch; tests must not work around it.
-5. **No credentials in code or fixtures.** Credentials come from the
-   environment only; recorded payloads and fixtures must be synthetic or
-   scrubbed.
+1. **Credentials from the environment only.** Never in code, never in a fixture,
+   never in a recorded payload.
+2. **Explicit opt-in.** A test that can place an order requires an explicit
+   environment flag set for that run, in addition to credentials. Keys sitting
+   in the environment must not be sufficient.
+3. **Smallest possible size.** Just above the instrument's minimum, and priced
+   far from the market when the order is not meant to fill.
+4. **Clean up in teardown.** Cancel every order in a `finally` block or fixture
+   teardown, including on assertion failure, so nothing leaks between runs.
+5. **State the environment.** `environment` defaults to mainnet; a test that
+   wants the testnet must say so, and a test that intends mainnet must be
+   deliberate about it.
+
+## Adding a test
+
+* Put pure-function tests next to the module they cover; they should need
+  nothing but the standard library and the package.
+* Prefer a recorded venue payload over a hand-written dict for anything that
+  parses exchange data — the shapes are documented in the WebSocket and HTTP
+  module docstrings.
+* For a new rejection path in the execution client, assert both that the order
+  is denied or rejected **and** that the reason names the constraint. A silent
+  substitution is the bug class these tests exist to catch.
+
+## Continuous integration
+
+The workflow in `.github/workflows/ci.yml` runs three jobs:
+
+1. **Test** on Python 3.12 and 3.13 — `ruff check`, `ruff format --check`,
+   `pytest`, and an import smoke test that exercises the sub-packages.
+2. **Build** — cleans `dist/`, `build/` and `*.egg-info`, builds the sdist and
+   wheel, runs `twine check`, then installs the wheel into a clean virtual
+   environment **outside the source tree** and verifies that every sub-package
+   and every documented import resolves from the installed distribution. This
+   is what makes a broken `packages.find` configuration fail CI instead of
+   reaching PyPI.
+3. **Examples** — byte-compiles and imports every example against the installed
+   package without touching the network, so an example that no longer matches
+   the API fails the build. Actually executing them requires the venue, which
+   is why that step is a release check rather than a CI job (see
+   [releasing.md](releasing.md)).

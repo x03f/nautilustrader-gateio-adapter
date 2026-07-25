@@ -1,70 +1,73 @@
-"""Shared test fixtures. All data is synthetic — no network, no credentials."""
+"""Shared test fixtures.
+
+The whole suite runs offline: no test opens a socket, and no test reads or
+needs Gate.io credentials. Two autouse fixtures enforce that:
+
+* :func:`_isolate_credential_env` removes the Gate.io credential variables from
+  the environment, so a developer machine that exports real keys produces the
+  same results as CI.
+* :func:`_clear_factory_caches` resets the ``lru_cache`` on the client
+  factories, so a cached HTTP client or instrument provider never leaks from
+  one test into the next.
+
+:func:`block_network` is opt-in and raises on any attempt to open a TCP
+connection; it is used by tests that assert construction is network-free.
+"""
 
 from __future__ import annotations
 
+import socket
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
 
+from nautilus_gateio import factories
+from nautilus_gateio.common.credentials import (
+    ENV_API_KEY,
+    ENV_API_SECRET,
+    ENV_TESTNET_API_KEY,
+    ENV_TESTNET_API_SECRET,
+)
 
-class FakeMarket:
-    """Synthetic market-data source for PaperExecution and validation tests.
+#: Environment variables the adapter reads credentials from.
+CREDENTIAL_ENV_VARS: tuple[str, ...] = (
+    ENV_API_KEY,
+    ENV_API_SECRET,
+    ENV_TESTNET_API_KEY,
+    ENV_TESTNET_API_SECRET,
+)
 
-    Mimics the subset of ``GateioHttpClient`` the simulator needs:
-    ``order_book`` / ``candles`` / ``currency_pair``. Depth levels and
-    precision are configurable per test.
-    """
 
-    def __init__(
-        self,
-        mid: float = 100.0,
-        depth: list[tuple[float, ...]] | None = None,
-        precision: tuple[int, int] = (2, 4),
-        mins: tuple[float, float] = (0.0, 0.0),
-    ) -> None:
-        self.mid = mid
-        self.depth = depth or [(0.5,), (1.0,), (5.0,)]  # quantity per level
-        self.price_precision, self.amount_precision = precision
-        self.min_quote, self.min_base = mins
+@pytest.fixture(autouse=True)
+def _isolate_credential_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove ambient Gate.io credentials so tests never depend on the machine."""
+    for name in CREDENTIAL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
-    def set_mid(self, mid: float) -> None:
-        self.mid = mid
 
-    def order_book(self, pair: str, limit: int = 20) -> dict[str, Any]:
-        asks = [[self.mid * (1 + 0.001 * (i + 1)), q[0]] for i, q in enumerate(self.depth)]
-        bids = [[self.mid * (1 - 0.001 * (i + 1)), q[0]] for i, q in enumerate(self.depth)]
-        return {"asks": asks, "bids": bids}
+@pytest.fixture(autouse=True)
+def _clear_factory_caches() -> Iterator[None]:
+    """Reset the factory caches around every test."""
+    factories.get_cached_gateio_http_client.cache_clear()
+    factories.get_cached_gateio_instrument_provider.cache_clear()
+    yield
+    factories.get_cached_gateio_http_client.cache_clear()
+    factories.get_cached_gateio_instrument_provider.cache_clear()
 
-    def candles(self, pair: str, interval: str = "1m", limit: int = 1) -> list[dict[str, Any]]:
-        return [{"close": self.mid}]
 
-    def currency_pair(self, pair: str) -> dict[str, Any]:
-        return {
-            "pair": pair,
-            "price_precision": self.price_precision,
-            "amount_precision": self.amount_precision,
-            "min_quote_amount": self.min_quote,
-            "min_base_amount": self.min_base,
-            "trade_status": "tradable",
-        }
+class NetworkAccessError(AssertionError):
+    """Raised when a test tries to open a network connection."""
 
 
 @pytest.fixture
-def fake_market() -> FakeMarket:
-    return FakeMarket()
+def block_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make any outbound TCP connection attempt fail loudly."""
 
+    def _blocked(*args: Any, **kwargs: Any) -> Any:
+        raise NetworkAccessError("the test attempted to open a network connection")
 
-@pytest.fixture
-def btc_spec() -> dict[str, Any]:
-    """A realistic BTC_USDT spec (synthetic values, shaped like the real API)."""
-    return {
-        "pair": "BTC_USDT",
-        "base": "BTC",
-        "quote": "USDT",
-        "amount_precision": 6,
-        "price_precision": 2,
-        "min_base_amount": 0.00001,
-        "min_quote_amount": 3.0,
-        "fee": 0.002,
-        "trade_status": "tradable",
-    }
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", _blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", _blocked)

@@ -27,28 +27,46 @@ class GateioServerError(GateioError):
     """A 5xx error: Gate.io reported an internal failure; usually retryable."""
 
 
-class LiveOrdersDisabledError(Exception):
-    """Raised when a mutating call is attempted while live orders are disabled.
+class WalletNotProvisionedError(Exception):
+    """The requested Gate.io wallet does not exist yet for this account.
 
-    The HTTP client requires an explicit ``live_orders=True`` switch before any
-    order-mutating endpoint can be called. The presence of API credentials alone
-    is never sufficient to place or cancel orders.
+    Gate.io creates the futures, delivery and options wallets on the first
+    internal transfer into them, and reports ``USER_NOT_FOUND`` until then. The
+    adapter treats this as a recoverable configuration state rather than a
+    failure, so that an account trading only spot can still start cleanly.
     """
 
 
 class OrderValidationError(Exception):
     """The order violates exchange constraints (min amount, min notional, precision,
-    or the pair is not currently tradable)."""
+    or the instrument is not currently tradable)."""
 
 
-# Gate.io labels that indicate a transient condition worth retrying.
+class UnsupportedOrderError(Exception):
+    """The order cannot be represented on Gate.io without changing its meaning.
+
+    Raised instead of silently substituting a different order type, time in
+    force or flag; the execution client turns it into an explicit rejection.
+    """
+
+
+#: Gate.io labels that indicate a transient condition worth retrying.
 _RETRYABLE_LABELS = frozenset(
     {
         "TOO_MANY_REQUESTS",
         "SERVER_ERROR",
         "INTERNAL",
         "TIMEOUT",
+        "REQUEST_EXPIRED",
     }
+)
+
+#: Labels meaning "this wallet has not been created for the account yet".
+WALLET_NOT_PROVISIONED_LABELS = frozenset({"USER_NOT_FOUND"})
+
+#: Labels meaning "the account is not in the mode this endpoint needs".
+ACCOUNT_MODE_LABELS = frozenset(
+    {"INVALID_UNIFIED_ACCOUNT", "UNIFIED_ACCOUNT_NOT_ACTIVATED", "FORBIDDEN"}
 )
 
 

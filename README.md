@@ -5,99 +5,157 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![NautilusTrader 1.230+](https://img.shields.io/badge/nautilus__trader-1.230%2B-orange)](https://github.com/nautechsystems/nautilus_trader)
 
-A community-maintained, **unofficial** exchange adapter that connects [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) to [Gate.io](https://www.gate.io/): spot market data and order execution over the Gate.io API v4 (REST and WebSocket). This project is not affiliated with, maintained by, or endorsed by Gate.io or Nautech Systems. Current maturity is **alpha (v0.1.0)**, tested against nautilus_trader 1.230.0 on Python 3.13 with Gate.io API v4.
+A community-maintained, **unofficial** exchange adapter connecting
+[NautilusTrader](https://github.com/nautechsystems/nautilus_trader) to
+[Gate.io](https://www.gate.io/): market data and order execution across spot,
+margin, perpetual futures (linear and inverse), delivery futures and options,
+over the Gate.io API v4 REST and WebSocket interfaces.
 
-## Overview
+This project is not affiliated with, maintained by, or endorsed by Gate.io or
+Nautech Systems. Current maturity is **alpha (v0.2.0)**, developed against
+`nautilus_trader` 1.230.0 on Python 3.13.
 
-NautilusTrader is a high-performance algorithmic trading platform with a growing set of exchange integrations — but, to our knowledge, no Gate.io adapter existed before this one. This package fills that gap for spot markets:
+Upgrading from 0.1.0? Read the
+[migration guide](docs/migration-0.1-to-0.2.md) first — the venue string, the
+instrument ids and the execution environment default all changed.
 
-- **Market data** — live bars over WebSocket (`spot.candlesticks`) with an automatic REST-polling fallback, plus historical bars, delivered into a live `TradingNode` through the standard `LiveMarketDataClient` interface.
-- **Instruments** — a dynamic `InstrumentProvider` that builds Nautilus `CurrencyPair` instruments (price/size precision, minimum amount, minimum notional) from live Gate.io specifications.
-- **Execution** — a `LiveExecutionClient` for spot trading: limit and (emulated) market orders, cancels, partial-fill tracking, and account balance updates.
-- **Standalone clients** — the underlying REST (`GateioHttpClient`) and WebSocket (`GateioWebSocketClient`) clients are usable on their own, without a Nautilus node.
-- **Safety first** — a layered guard model ensures API credentials alone can never place an order; execution defaults to the Gate.io testnet.
+## What it does
+
+* **Real market data only.** Trades, best bid/offer quotes, sequence-validated
+  order book deltas, closed bars, mark and index prices and funding rates — all
+  from the venue's own streams. Nothing is synthesised or interpolated.
+* **Every tradable product.** One data client and one execution client
+  multiplex spot, USDT perpetuals, BTC-settled perpetuals, USDT delivery futures
+  and USDT-settled options.
+* **Execution that never lies about your order.** Six order types, four
+  time-in-force values, post-only, reduce-only and iceberg. Anything Gate.io
+  cannot express is denied or rejected with a stated reason — never silently
+  converted into a different order.
+* **Real reconciliation.** All four NautilusTrader report generators are
+  implemented against REST, so a restart with resting orders and open positions
+  is a supported path.
+* **Usable standalone.** The async REST transport with its typed per-product
+  namespaces, and the self-healing WebSocket clients, work without a Nautilus
+  node.
 
 ## Status
 
-**Alpha.** The adapter has been exercised extensively against the Gate.io spot **testnet**, including real testnet order flow: submissions, fills, partial fills, cancels, and IOC remainders surfaced back into the Nautilus portfolio. The public-data path runs against mainnet (Gate.io has no public spot testnet market-data feed).
+**Alpha.** The package is complete and unit-tested, but **no mainnet validation
+has been recorded for 0.2.0**. Nothing in the matrix below is marked *Stable*,
+because the project reserves that label for features that have been both
+unit-tested and exercised against the real venue — see
+[docs/validation.md](docs/validation.md), which is where results get recorded.
 
-Interfaces may change between 0.x releases. Correct operation is a goal; economic results are never guaranteed — see the [Disclaimer](#disclaimer).
+Interfaces may change between 0.x releases. Correct operation is the goal;
+economic results are never guaranteed — see the [Disclaimer](#disclaimer).
 
 ## Feature support matrix
 
-Statuses: **Supported** · **Partial** · **Experimental** · **Not supported** · **N/A**
+Status vocabulary:
+
+| Status | Meaning |
+|---|---|
+| **Stable** | Unit-tested **and** exercised on mainnet, with the result recorded in [docs/validation.md](docs/validation.md) |
+| **Experimental** | Implemented; the API or behaviour may still change |
+| **Partial** | Implemented for some cases only, as stated in the row |
+| **Implemented — not mainnet-validated** | Complete and unit-tested, never run against the real venue |
+| **Unsupported** | Not implemented |
+
+No feature currently qualifies as *Stable*. That is a statement about validation
+coverage, not about test coverage.
 
 ### Market data
 
-| Feature | Status | Notes |
-|---|---|---|
-| Live bars (WebSocket primary, REST fallback) | Supported | Closed bars only |
-| Historical bars (`request_bars`) | Supported | REST `spot/candlesticks` |
-| Reconnect / dedup / gap detection | Supported | Exponential backoff, duplicate drop, gap counters |
-| Out-of-order bar drop | Supported | Bars older than the last emitted bar are discarded |
-| Synthetic quotes (derived from bars) | Partial | By design: `QuoteTick`s synthesized around each bar close (±0.5 bp, unit sizes) so quote-driven fill simulations work. **These are NOT real market quotes** — disable with `emit_synthetic_quotes=False` if your strategy treats quotes as market truth |
-| Real quote / trade streams into Nautilus | Not supported | `GateioWebSocketClient` can stream raw public trades, but they are not wired into the Nautilus data engine |
-| Order-book streams | Not supported | REST snapshots only (standalone client) |
-| Funding / open interest | Not supported | See experimental futures module for raw funding data |
+| Feature | Spot | Perpetual | Inverse | Delivery | Options | Status | Notes |
+|---|---|---|---|---|---|---|---|
+| Trade ticks | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | `*.trades`; venue trade id preserved |
+| Quote ticks (real BBO) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | `*.book_ticker`; no synthesised quotes anywhere |
+| Order book deltas | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | REST snapshot + incremental stream, sequence-validated, resync on gap |
+| Order book snapshot request | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | Depth clamped to what the product accepts |
+| Bars (closed only) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | 1s to 7d; delivery and options infer the close |
+| Historical bars / trades | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | Paginated REST, 1000 rows per call |
+| Mark price | n/a | yes | yes | yes | no | Implemented — not mainnet-validated | From `futures.tickers` |
+| Index price | n/a | yes | yes | yes | no | Implemented — not mainnet-validated | From `futures.tickers` |
+| Funding rate | n/a | yes | yes | n/a | n/a | Implemented — not mainnet-validated | From `futures.tickers` |
+| Instrument updates | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | Polled; Gate.io has no instrument channel |
+| Options underlying streams | n/a | n/a | n/a | n/a | yes | Partial | Reachable through the raw WebSocket client, not wired into the data engine |
 
 ### Instruments
 
 | Feature | Status | Notes |
 |---|---|---|
-| Spot discovery and metadata (precision, min amount, min notional) | Supported | From live Gate.io pair specifications |
-| Dynamic instrument provider | Supported | `load_ids_async` / `load_all_async` |
-| Perpetual futures contract specs (REST) | Experimental | Raw client only, not Nautilus-integrated |
-| Delivery futures | Not supported | |
+| Spot `CurrencyPair` | Implemented — not mainnet-validated | Precision, minimums, account fee tier |
+| `CryptoPerpetual` (linear and inverse) | Implemented — not mainnet-validated | Contract-count quantities, `quanto_multiplier` |
+| `CryptoFuture` (delivery) | Implemented — not mainnet-validated | Activation and expiration from the contract |
+| `CryptoOption` | Implemented — not mainnet-validated | Strike and kind from the symbol |
+| Multi-product provider with filters | Implemented — not mainnet-validated | Per-product degradation on an unprovisioned wallet |
+| Rejection of unrepresentable price scales | Implemented — not mainnet-validated | Never publishes a quantised zero as a venue price |
 
-### Execution (spot)
+### Execution
 
-| Feature | Status | Notes |
-|---|---|---|
-| LIMIT GTC | Supported | |
-| MARKET | Supported | With caveat: emulated as an aggressive IOC limit crossing the spread by 1%, because Gate.io spot market-buy orders interpret `amount` as *quote* currency. Mechanics documented in the module docs |
-| Cancel / cancel-all | Supported | |
-| Partial fills | Supported | Detected via REST delta polling |
-| Exchange-side cancel (e.g. unfilled IOC remainder) surfaced | Supported | Emitted as `OrderCanceled` |
-| Client order id propagation | Supported | Via the Gate.io `text` field (28-char limit, `t-` prefix, `[0-9A-Za-z_.-]`); ids that do not fit are mapped in memory |
-| Stop orders / post-only / modify / TIF beyond GTC + IOC | Not supported | `ModifyOrder` logs a warning; cancel and re-submit instead |
-| Private WebSocket | Not supported | Fills and balances are detected by REST polling |
-| Start-up reconciliation | Not supported | `generate_*_reports` return empty (fresh-start semantics); a diagnostic `reconcile()` helper compares local vs. exchange state without mutating anything |
-| Balances → account state | Supported | Pushed on connect, after fills, and on each poll |
-| Positions | N/A | Spot `CASH` account — no positions |
+| Feature | Spot | Perpetual | Inverse | Delivery | Options | Status |
+|---|---|---|---|---|---|---|
+| MARKET | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| LIMIT (GTC / IOC / FOK) | yes | yes | yes | yes | GTC/IOC | Implemented — not mainnet-validated |
+| Post-only (`poc`) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| STOP_MARKET / STOP_LIMIT | yes | yes | yes | yes | no | Implemented — not mainnet-validated |
+| MARKET_IF_TOUCHED / LIMIT_IF_TOUCHED | yes | yes | yes | yes | no | Implemented — not mainnet-validated |
+| Reduce-only | n/a | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| Iceberg (`display_qty`) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| Quote-denominated quantity | market buy | no | no | no | no | Implemented — not mainnet-validated |
+| Cancel / cancel-all / batch cancel | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| Modify (amend) | yes | yes | yes | no | no | Partial (delivery and options reject explicitly) |
+| Private WebSocket lifecycle | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| Order status / fill / position reports | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| Internal wallet transfers | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| Hedge (dual) position mode | n/a | refused | refused | refused | n/a | Unsupported (detected and refused, never switched) |
 
-### Safety
-
-| Feature | Status | Notes |
-|---|---|---|
-| Layered order guards | Supported | `live_orders=True` hard switch on the HTTP client; execution config defaults to testnet; futures private client is testnet-only; order examples require an explicit `GATEIO_ALLOW_ORDERS=YES` opt-in |
-
-### Futures (experimental)
-
-| Feature | Status | Notes |
-|---|---|---|
-| Public data (contracts, tickers, book, candles, funding) | Experimental | Raw REST client |
-| Private REST | Experimental | Testnet hosts only, enforced with `PermissionError`; mutating calls additionally require `live_orders=True` |
-| Nautilus integration | Not supported | No futures instrument provider, data client, or execution client |
-
-### Paper trading
+### Accounts and margin
 
 | Feature | Status | Notes |
 |---|---|---|
-| Local fill simulator on live public data | Experimental | Pure simulation — orders never leave the process; market orders walk the real live order book for realistic slippage and partial fills |
+| Cash account (spot only, plain ledger) | Implemented — not mainnet-validated | |
+| Margin account (any other product combination) | Implemented — not mainnet-validated | One Nautilus account, wallets aggregated per currency |
+| Isolated margin ledger | Implemented — not mainnet-validated | `spot_account_mode=MARGIN` |
+| Cross margin ledger | Implemented — not mainnet-validated | Requires a unified account on the venue |
+| Unified account | Implemented — not mainnet-validated | `single_currency` mode validated by the venue's own minimums; `multi_currency` needs > 500 USDT, `portfolio` > 1000 USDT |
+| Borrow / repay endpoints | Implemented — not mainnet-validated | Exposed because isolated and cross margin need them; every liability-creating method says so |
+| Withdrawals, sub-accounts, Earn, Gate Pay, P2P, Copy Trading, Bots | Unsupported | Out of scope: unrelated to trading, no code exists for them |
 
-## Supported markets
+### Mainnet validation results
 
-- **Spot market data**: mainnet (public, no credentials required; Gate.io has no public spot testnet market-data feed).
-- **Spot trading**: verified against the Gate.io spot **testnet** (`api-testnet.gateapi.io`), including real order round-trips. Mainnet trading is possible via an explicit opt-in (`environment="mainnet"` in `GateioExecClientConfig`) but, to be plain about it, **has not been extensively exercised** — treat it accordingly and start small.
-- **Futures**: experimental raw REST clients only, private side restricted to testnet. Not integrated with Nautilus.
+*Placeholder — nothing recorded yet.* See
+[docs/validation.md](docs/validation.md) for the table that gates the *Stable*
+label and for the paths that cannot be validated without specific account
+states.
+
+## Symbology in one table
+
+The venue string is `GATE_IO`. Gate.io symbols are used verbatim; only
+perpetuals take a suffix, because 527 of them share a symbol with a spot pair.
+
+| Product | Instrument id |
+|---|---|
+| Spot | `BTC_USDT.GATE_IO` |
+| Perpetual (linear) | `BTC_USDT-PERP.GATE_IO` |
+| Perpetual (inverse) | `BTC_USD-PERP.GATE_IO` |
+| Delivery future | `BTC_USDT_20260807.GATE_IO` |
+| Option | `BTC_USDT-20260729-70000-C.GATE_IO` |
+
+Full reasoning, including why delivery and options need no suffix, is in
+[docs/symbology.md](docs/symbology.md).
+
+**Quantity semantics:** on spot a `Quantity` is base-currency amount; on every
+contract product it is a **number of contracts**, with the face value in the
+instrument's `multiplier`.
 
 ## Compatibility
 
 | Adapter | nautilus_trader | Python | Gate.io API |
 |---|---|---|---|
-| 0.1.x | >=1.230.0,<2 | >=3.12,<3.15 | v4 |
+| 0.2.x | >=1.230.0,<2 | >=3.12,<3.15 | v4 |
 
-Tested combination: Python 3.13.5 + nautilus_trader 1.230.0.
+Developed against Python 3.13 and `nautilus_trader` 1.230.0.
 
 ## Installation
 
@@ -107,7 +165,7 @@ Not yet published on PyPI — install from GitHub:
 pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter"
 ```
 
-Or for development:
+For development:
 
 ```bash
 git clone https://github.com/x03f/nautilustrader-gateio-adapter
@@ -117,54 +175,103 @@ pip install -e '.[dev]'
 
 ## Quick start
 
-### 1. Public market data (no credentials)
+### 1. Public REST (no credentials)
 
 ```python
-from nautilus_gateio import GateioHttpClient
+import asyncio
 
-with GateioHttpClient() as client:
-    candles = client.candles("BTC_USDT", interval="1m", limit=5)
-    book = client.order_book("BTC_USDT", limit=5)
-    print(f"last close: {candles[-1]['close']}")
-    print(f"best bid/ask: {book['bids'][0][0]} / {book['asks'][0][0]}")
+from nautilus_gateio import GateioFuturesHttpAPI, GateioHttpClient, GateioSpotHttpAPI
+
+
+async def main() -> None:
+    async with GateioHttpClient() as client:
+        spot = GateioSpotHttpAPI(client)
+        perp = GateioFuturesHttpAPI(client, settle="usdt")
+
+        pair = await spot.currency_pair("BTC_USDT")
+        book = await spot.order_book("BTC_USDT", limit=5)
+        contract = await perp.contract("BTC_USDT")
+
+        print(f"spot precision : {pair['precision']} / {pair['amount_precision']}")
+        print(f"spot top of book: {book['bids'][0][0]} / {book['asks'][0][0]}")
+        print(f"perp multiplier : {contract['quanto_multiplier']}")
+
+
+asyncio.run(main())
 ```
 
-### 2. Nautilus instruments
+### 2. Public WebSocket (no credentials)
+
+```python
+import asyncio
+
+from nautilus_gateio import GateioProductType, GateioPublicWebSocket
+
+
+async def main() -> None:
+    ws = GateioPublicWebSocket(
+        product=GateioProductType.PERP,
+        handler=lambda msg: print(msg["channel"], msg.get("result")),
+    )
+    await ws.connect()
+    await ws.subscribe_book_ticker("BTC_USDT")
+    await asyncio.sleep(10)
+    await ws.disconnect()
+
+
+asyncio.run(main())
+```
+
+### 3. Instruments
 
 ```python
 import asyncio
 
 from nautilus_trader.model.identifiers import InstrumentId
 
-from nautilus_gateio import GateioInstrumentProvider
+from nautilus_gateio import GateioHttpClient, GateioInstrumentProvider, GateioProductType
 
 
 async def main() -> None:
-    instrument_id = InstrumentId.from_str("BTC_USDT.GATEIO")
-    provider = GateioInstrumentProvider()
-    await provider.load_ids_async([instrument_id])
-    instrument = provider.find(instrument_id)
-    print(instrument.id, instrument.price_precision, instrument.min_notional)
+    async with GateioHttpClient() as client:
+        provider = GateioInstrumentProvider(
+            client,
+            products=(GateioProductType.SPOT, GateioProductType.PERP),
+        )
+        ids = [
+            InstrumentId.from_str("BTC_USDT.GATE_IO"),
+            InstrumentId.from_str("BTC_USDT-PERP.GATE_IO"),
+        ]
+        await provider.load_ids_async(ids)
+        for instrument_id in ids:
+            instrument = provider.find(instrument_id)
+            print(instrument.id, type(instrument).__name__, instrument.price_increment)
 
 
 asyncio.run(main())
 ```
 
-### 3. Live TradingNode with Gate.io market data
+### 4. Live `TradingNode` with market data
 
 ```python
 from nautilus_trader.common.config import InstrumentProviderConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 
-from nautilus_gateio import GATEIO, GateioDataClientConfig, GateioLiveDataClientFactory
+from nautilus_gateio import (
+    GATEIO,
+    GateioDataClientConfig,
+    GateioLiveDataClientFactory,
+    GateioProductType,
+)
 
 config = TradingNodeConfig(
     trader_id="EXAMPLE-001",
     data_clients={
         GATEIO: GateioDataClientConfig(
+            products=(GateioProductType.SPOT, GateioProductType.PERP),
             instrument_provider=InstrumentProviderConfig(
-                load_ids=frozenset(["BTC_USDT.GATEIO"]),
+                load_ids=frozenset(["BTC_USDT.GATE_IO", "BTC_USDT-PERP.GATE_IO"]),
             ),
         ),
     },
@@ -172,51 +279,76 @@ config = TradingNodeConfig(
 node = TradingNode(config=config)
 node.add_data_client_factory(GATEIO, GateioLiveDataClientFactory)
 node.build()
-# node.run()  # add a strategy first — see the full runnable example below
+# node.trader.add_strategy(...)  # then node.run()
 ```
 
-See [`examples/04_trading_node_data.py`](examples/04_trading_node_data.py) for the complete runnable version with a bar-logging strategy.
+See [`examples/04_trading_node_data.py`](examples/04_trading_node_data.py) for a
+complete runnable version.
 
-### 4. Authenticated, read-only account access
+### 5. Adding execution
 
 ```python
-import os
+from nautilus_gateio import GateioExecClientConfig, GateioLiveExecClientFactory, GateioProductType
 
-from nautilus_gateio import GATEIO_HTTP_TESTNET, GateioHttpClient
-
-client = GateioHttpClient(
-    api_key=os.environ["GATE_TESTNET_API_KEY"],
-    api_secret=os.environ["GATE_TESTNET_API_SECRET"],
-    live_orders=False,  # default — order calls raise LiveOrdersDisabledError locally
-    base_url=GATEIO_HTTP_TESTNET,
+exec_config = GateioExecClientConfig(
+    environment="testnet",  # the default is "mainnet" — state which you mean
+    products=(GateioProductType.SPOT,),
 )
-with client:
-    client.sync_time()
-    print(client.balances())
-    print(client.open_orders())
+# node_config = TradingNodeConfig(..., exec_clients={GATEIO: exec_config})
+# node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)
 ```
 
-With `live_orders=False` (the default), every order-mutating call raises `LiveOrdersDisabledError` before any network request — valid credentials alone can never place an order.
+## Safety model
 
-### 5. Testnet order flow
+Read this before configuring execution.
 
-Order-placing code is deliberately **not** inlined here. Run [`examples/06_testnet_orders.py`](examples/06_testnet_orders.py), which performs a full place → list → cancel round-trip on the spot testnet behind four safety gates: an explicit `GATEIO_ALLOW_ORDERS=YES` opt-in, a hard-coded testnet host, testnet-only credentials, and a hard notional cap with exchange-constraint validation. The [examples README](examples/README.md) explains the safety model.
+* **`environment` defaults to `"mainnet"` on both clients.** In 0.1.0 execution
+  defaulted to the testnet. It no longer does: an execution client that silently
+  points at a different exchange environment than the operator believes is more
+  dangerous than one that requires the venue to be stated.
+* **There is no local order kill switch.** The 0.1.0 `live_orders` flag is gone.
+  A boolean inside the process is not a security boundary — the process holds
+  the key either way.
+* The controls that do bind, strongest first:
+  1. **API key permissions** on the Gate.io side — grant only what the strategy
+     uses, and never grant withdrawal permission to a trading key;
+  2. **IP allow-listing** on the key;
+  3. `environment="testnet"` for rehearsal (spot and USDT perpetuals only);
+  4. NautilusTrader's own sandbox and backtest execution for simulation.
+* **Nothing is silently altered.** An order Gate.io cannot express is denied or
+  rejected with a reason, never converted into a different order.
+* **No venue-side setting is changed for you.** Hedge mode is refused, not
+  switched; a unified account is never upgraded automatically.
+* **The adapter cannot move funds out of the account.** `transfer()` only
+  addresses the account's own trading wallets; there is no withdrawal code.
 
 ## Environment variables
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `GATE_API_KEY` | mainnet clients | Gate.io API key (also the fallback when testnet variables are unset) |
-| `GATE_API_SECRET` | mainnet clients | Gate.io API secret |
-| `GATE_TESTNET_API_KEY` | testnet clients (execution default) | Gate.io testnet API key |
-| `GATE_TESTNET_API_SECRET` | testnet clients (execution default) | Gate.io testnet API secret |
-| `GATEIO_ALLOW_ORDERS` | example scripts only | Must be `YES` for the order-placing example to run |
+| `GATE_API_KEY` / `GATE_API_SECRET` | `environment="mainnet"`, and as the testnet fallback | Gate.io API credentials |
+| `GATE_TESTNET_API_KEY` / `GATE_TESTNET_API_SECRET` | `environment="testnet"` | Gate.io testnet credentials |
+| `GATEIO_ALLOW_ORDERS` | the order example script only | Must be `YES` for [`examples/06_testnet_orders.py`](examples/06_testnet_orders.py) to place anything. A guard in that script, not an adapter feature |
 
-Credentials are resolved at client-creation time when `api_key` / `api_secret` are not passed explicitly; empty values keep the client in public-data-only mode.
+Credentials are resolved when a client is created; empty values keep the client
+in public-data-only mode. Values are stripped of surrounding whitespace.
 
-## Architecture overview
+## Documentation
 
-The package is layered: pure functions at the bottom (signing, symbol mapping, response parsing), standalone REST/WebSocket clients above them, and the Nautilus live clients (data, execution, instrument provider, factories) on top. The WebSocket transport handles reconnects with capped exponential backoff, drops duplicate and out-of-order candles, and counts gaps; execution fills are detected by REST delta polling against order state. See [docs/architecture.md](docs/architecture.md) for the full picture.
+| Page | Contents |
+|---|---|
+| [architecture.md](docs/architecture.md) | Package layout, dataflows, design decisions |
+| [symbology.md](docs/symbology.md) | Venue string, instrument ids, why only perpetuals get a suffix |
+| [products.md](docs/products.md) | Spot, margin (isolated/cross/unified), perpetual, inverse, delivery, options |
+| [configuration.md](docs/configuration.md) | Complete field reference for both config classes |
+| [market-data.md](docs/market-data.md) | Subscriptions, requests, order book synchronisation |
+| [execution.md](docs/execution.md) | Order translation, every rejection path, reconciliation |
+| [migration-0.1-to-0.2.md](docs/migration-0.1-to-0.2.md) | Every breaking change from 0.1.0 |
+| [validation.md](docs/validation.md) | What has actually been exercised, and where |
+| [testing.md](docs/testing.md) | Running the suite, coverage areas, credentialed-test rules |
+| [troubleshooting.md](docs/troubleshooting.md) | Real failure modes and their fixes |
+| [releasing.md](docs/releasing.md) | Release checklist |
+| [examples/README.md](examples/README.md) | The example scripts and what each needs |
 
 ## Testing
 
@@ -225,46 +357,45 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The default run executes unit tests only — they use fakes and recorded shapes, need no credentials, and hit no network. Tests that talk to Gate.io are marked `integration` and are deselected by default (`addopts = "-m 'not integration'"` in `pyproject.toml`); run them explicitly with:
-
-```bash
-pytest -m integration
-```
+The default run is unit tests only: no network, no credentials. Tests that talk
+to Gate.io are marked `integration` and deselected by default
+(`addopts = "-m 'not integration'"`); run them with `pytest -m integration`.
 
 ## Known limitations
 
-- **No real quote or trade streams into Nautilus** — bars are the only market data type delivered to the data engine; order-book streams and funding/open-interest data are not supported.
-- **Synthetic quotes are not market data** — the optional `QuoteTick`s are derived from bar closes for the benefit of quote-driven fill simulations; disable them (`emit_synthetic_quotes=False`) if quotes matter to your strategy.
-- **Fill detection is REST polling** — there is no private WebSocket, so fills arrive with polling latency (default 5 s cadence, plus an immediate post-submit check). Not suitable for latency-sensitive execution.
-- **MARKET orders are emulated** — implemented as aggressive IOC limit orders crossing the spread by 1% (a deliberate workaround for Gate.io's quote-amount semantics on spot market buys).
-- **No stop orders, post-only, or order modification**; time-in-force support is GTC and IOC only.
-- **No start-up reconciliation** — the execution client starts with fresh-state semantics; the standalone `reconcile()` helper only diagnoses discrepancies.
-- **Futures are experimental** — raw REST clients only, private side testnet-only, no Nautilus integration.
-- **Mainnet trading is not extensively exercised** — testnet is the verified path.
-- **Not yet on PyPI** — install from GitHub.
-
-## Troubleshooting
-
-1. **`LiveOrdersDisabledError` when placing an order** — intentional: construct `GateioHttpClient` with `live_orders=True`. Credentials alone never enable order flow.
-2. **Signature errors (`INVALID_SIGNATURE` / 401)** — call `client.sync_time()` first to align signature timestamps with the exchange clock, and check for whitespace in your key/secret (the config resolver strips it; direct construction does not).
-3. **No bars arriving** — only *closed* candles are emitted, so a 1-minute subscription produces its first bar up to a minute after connect; longer intervals take correspondingly longer.
-4. **`ValueError: cannot infer quote currency`** — use the canonical underscore symbol form (`BTC_USDT.GATEIO`); the no-underscore form is a best-effort heuristic for common quote currencies only.
-5. **Testnet authentication fails** — testnet keys are separate from mainnet keys; create them on the Gate.io testnet and set `GATE_TESTNET_API_KEY` / `GATE_TESTNET_API_SECRET`.
-
-More in [docs/troubleshooting.md](docs/troubleshooting.md).
+* **No mainnet validation yet.** Nothing is marked *Stable*; see
+  [docs/validation.md](docs/validation.md).
+* **Testnet covers spot and USDT perpetuals only.** Inverse perpetuals, delivery
+  futures and options have no testnet endpoint, and configuring them with
+  `environment="testnet"` is rejected up front.
+* **Delivery and options orders cannot be amended** — the venue has no amend
+  endpoint there, so modification is rejected explicitly.
+* **Options have no price-trigger endpoint**, so conditional order types are
+  rejected on that product.
+* **Cross margin and unified accounts need venue-side activation**, and the
+  richer unified modes need balances above the venue's own thresholds
+  (500 / 1000 USDT).
+* **Derivative wallets are created by the first transfer into them**; until then
+  Gate.io reports them as missing and the adapter skips that product.
+* **Not yet on PyPI** — install from GitHub.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy. Practical rules:
+See [SECURITY.md](SECURITY.md) for the disclosure policy. Practical rules:
 
-- **Never commit API keys** — use environment variables; `.gitignore` covers common secret-file patterns, but the responsibility is yours.
-- **Least privilege** — create API keys with spot-trade permission only; never grant withdrawal permission to a trading key.
-- **IP allowlist** — restrict keys to your trading host's address in the Gate.io API settings.
-- **Testnet first** — verify your full setup against the testnet before pointing anything at mainnet.
+* **Never commit API keys.** Use environment variables; `.gitignore` covers
+  common secret-file patterns, but the responsibility is yours.
+* **Least privilege.** Create keys with only the permissions the strategy needs;
+  never grant withdrawal permission to a trading key.
+* **IP allowlist.** Restrict keys to the host that will use them.
+* **Rehearse first.** Testnet, then mainnet with small sizes.
 
 ## Contributing
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, coding standards, and test requirements. Release history lives in [CHANGELOG.md](CHANGELOG.md).
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+workflow, coding standards and test requirements. Release history lives in
+[CHANGELOG.md](CHANGELOG.md). Validation results are especially welcome: see
+[docs/validation.md](docs/validation.md).
 
 ## Support the project
 

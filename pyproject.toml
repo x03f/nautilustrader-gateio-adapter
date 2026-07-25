@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nautilustrader-gateio-adapter"
-version = "0.1.0"
-description = "Community-maintained Gate.io adapter for NautilusTrader: spot market data and execution over REST and WebSocket"
+version = "0.2.0"
+description = "Community-maintained Gate.io adapter for NautilusTrader: spot, margin, perpetual, delivery and options market data and execution over REST and WebSocket"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = "MIT"
@@ -56,8 +56,8 @@ Repository = "https://github.com/x03f/nautilustrader-gateio-adapter"
 Issues = "https://github.com/x03f/nautilustrader-gateio-adapter/issues"
 Changelog = "https://github.com/x03f/nautilustrader-gateio-adapter/blob/main/CHANGELOG.md"
 
-[tool.setuptools]
-packages = ["nautilus_gateio"]
+[tool.setuptools.packages.find]
+include = ["nautilus_gateio*"]
 
 [tool.setuptools.package-data]
 nautilus_gateio = ["py.typed"]
