@@ -266,6 +266,31 @@ See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy. Practica
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, coding standards, and test requirements. Release history lives in [CHANGELOG.md](CHANGELOG.md).
 
+## Support the project
+
+This adapter is developed and maintained in free time. The best support is always a ⭐ star,
+a well-written issue, or a pull request. If the adapter saves you time and you would like to
+support its continued development financially, donations are welcome — entirely optional and
+without any additional benefits or obligations.
+
+<details>
+<summary>Donation addresses</summary>
+
+| Asset | Network | Address |
+|---|---|---|
+| BTC | Bitcoin Mainnet | `bc1qrzw790us8sen3wh7kl07yntvvkaa6upxk6jke9` |
+| ETH | Ethereum Mainnet | `0xcC3b21D33abA753dcbEA96AB823fD22b8B5C444D` |
+| USDT | TRON (TRC20) | `TAiVKz7LveKsqxeG8jnnang6fmpt8SX8Fq` |
+| USDT | TON Network | `UQA5cxIn0YIkezeOFqFQa0t7pIzQl1svhhm8w09Q9DUPtPRm` |
+| USDC | Base Network | `0xcC3b21D33abA753dcbEA96AB823fD22b8B5C444D` |
+
+Gate.io internal transfer (zero-fee within Gate.io) — UID: `4415345`
+
+Always send only the listed asset on the exactly matching network; double-check the address
+before sending. Donations are non-refundable.
+
+</details>
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
