@@ -7,12 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-07-26
+## [0.2.0a1] - 2026-07-26
 
-A rewrite. 0.1.0 was a spot-only adapter with a flat module layout; 0.2.0 is a
+An alpha. 0.1.0 was a spot-only adapter with a flat module layout; 0.2.0a1 is a
 multi-product connector built on real venue data throughout. See
 [docs/migration-0.1-to-0.2.md](docs/migration-0.1-to-0.2.md) for the upgrade
 path.
+
+Released as an alpha, not a stable version, because real-world validation and
+external user feedback are still limited. The test suite is extensive and runs
+without credentials, but a passing suite is evidence about the code, not about
+the exchange. Treat every capability as needing your own verification before it
+carries money. The per-capability status is in
+[docs/validation.md](docs/validation.md); the audit trail behind the code is in
+[docs/review-matrix.md](docs/review-matrix.md).
+
+0.1.0 remains available: its tag and release are untouched and its
+implementation is preserved on the `legacy/v0.1.0` branch.
+
+### Fixed since the 0.2.0 development line
+
+- **Fills arriving before the order message are no longer lost.** Gate.io
+  publishes order and user-trade updates on independent channels, so for a
+  conditional order the first message that mentions the fired order is
+  frequently its fill. Only the order path rebased the venue order id; the fill
+  path emitted an event the platform then refused, and the exception was
+  swallowed into a log line. The fill path now reconciles the identity first,
+  and a fill whose identity cannot be reconciled inline goes through
+  reconciliation instead of being emitted and dropped.
+- **One timestamp conversion instead of two.** A binary-float copy in the data
+  module disagreed with the canonical decimal implementation by 64 ns on
+  millisecond timestamps, so one venue instant became two different values
+  depending on which path carried it.
+- **The shared HTTP transport is released on shutdown.** It was reference
+  counted but nothing ever acquired or released it, so the connection pool
+  outlived every trading node in the process. A cached transport that has been
+  closed is now rebuilt rather than handed to the next node.
+- **The documented book intervals match the code.** The configuration comment
+  claimed spot and the perpetuals accept all three intervals; they accept two.
 
 ### Changed (breaking)
 
