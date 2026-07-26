@@ -23,7 +23,7 @@ exchange:
 
 The README feature matrix states what is unsupported, and
 [docs/validation.md](docs/validation.md) lists the paths that cannot easily be
-validated and why. Those two are more reliable starting points than a roadmap,
+validated and why. Those two are more reliable starting points than the [roadmap](docs/roadmap.md),
 which goes stale.
 
 ## Development setup

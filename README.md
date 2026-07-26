@@ -375,6 +375,8 @@ in public-data-only mode. Values are stripped of surrounding whitespace.
 | [releasing.md](docs/releasing.md) | Release checklist |
 | [examples/README.md](examples/README.md) | The example scripts and what each needs |
 
+Where the project is going, stage by stage, and how work is done here: [docs/roadmap.md](docs/roadmap.md).
+
 ## Testing
 
 ```bash
