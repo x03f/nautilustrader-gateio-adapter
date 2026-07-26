@@ -119,7 +119,12 @@ from nautilus_gateio.common.constants import (
 )
 from nautilus_gateio.common.enums import GateioProductType
 from nautilus_gateio.common.errors import GateioError
-from nautilus_gateio.common.parsing import to_decimal, to_float, to_int
+from nautilus_gateio.common.parsing import (
+    timestamp_to_nanos,
+    to_decimal,
+    to_float,
+    to_int,
+)
 from nautilus_gateio.common.symbols import (
     gateio_to_instrument_id,
     instrument_id_to_gateio,
@@ -169,7 +174,6 @@ _MARK: Final[str] = "mark"
 _INDEX: Final[str] = "index"
 _FUNDING: Final[str] = "funding"
 
-_MS_THRESHOLD: Final[float] = 1e12
 
 _NANOS_PER_SEC: Final[int] = 1_000_000_000
 
@@ -220,23 +224,6 @@ def venue_quantity(value: Any, precision: int) -> Quantity:
     except ArithmeticError:  # pragma: no cover - implausibly large venue size
         truncated = parsed
     return Quantity(truncated, precision)
-
-
-def timestamp_to_nanos(value: Any) -> int:
-    """Convert a Gate.io timestamp field to UNIX nanoseconds.
-
-    Gate.io is inconsistent about the unit: WebSocket messages use milliseconds,
-    several REST endpoints report seconds in a field named ``create_time_ms``,
-    and some carry fractional seconds. The magnitude disambiguates them, since
-    a seconds timestamp is roughly a thousand times smaller than the same
-    instant in milliseconds.
-    """
-    number = to_float(value)
-    if number <= 0.0:
-        return 0
-    if number >= _MS_THRESHOLD:
-        return int(number * 1_000_000)
-    return int(number * 1_000_000_000)
 
 
 def bar_type_to_interval(bar_type: BarType) -> str:
@@ -444,6 +431,9 @@ class GateioDataClient(LiveMarketDataClient):
         self._bar_flush_task = self.create_task(self._flush_bars_loop())
 
     async def _disconnect(self) -> None:
+        # See the execution client: the shared transport is reference counted and
+        # closes on the last release (seam-08).
+        await self._http_client.close()
         if self._update_instruments_task is not None:
             self._update_instruments_task.cancel()
             self._update_instruments_task = None

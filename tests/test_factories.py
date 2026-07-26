@@ -301,3 +301,50 @@ class TestCaching:
         """Guards the autouse ``_clear_factory_caches`` fixture in conftest."""
         assert get_cached_gateio_http_client.cache_info().currsize == 0
         assert get_cached_gateio_instrument_provider.cache_info().currsize == 0
+
+
+class TestSharedTransportLifecycle:
+    """Regression for seam-08: nothing ever released the shared HTTP transport.
+
+    The client was reference counted and closeable, but no caller acquired or
+    released it, so the connection pool outlived every trading node in the
+    process. Closing it naively was not enough either: the transport is cached,
+    so a second node in the same process would have been handed a closed client.
+    """
+
+    def test_the_factory_registers_one_owner_per_client(self, block_network):
+        from nautilus_gateio.factories import _build_http_client
+
+        transport = _build_http_client(GateioDataClientConfig()).acquire()
+        try:
+            assert transport.owner_count == 1
+            transport.acquire()
+            assert transport.owner_count == 2
+        finally:
+            get_cached_gateio_http_client.cache_clear()
+
+    def test_the_last_release_closes_the_transport(self, block_network):
+        from nautilus_gateio.factories import _build_http_client
+
+        transport = _build_http_client(GateioDataClientConfig()).acquire()
+        transport.acquire()
+        try:
+            asyncio.run(transport.close())
+            assert not transport.is_closed, "one owner still holds it"
+            asyncio.run(transport.close())
+            assert transport.is_closed
+        finally:
+            get_cached_gateio_http_client.cache_clear()
+
+    def test_a_closed_cached_transport_is_rebuilt(self, block_network):
+        """A second node in the same process must not receive a closed client."""
+        first = get_cached_gateio_http_client(base_url="https://example.invalid")
+        asyncio.run(first.close())
+        assert first.is_closed
+
+        second = get_cached_gateio_http_client(base_url="https://example.invalid")
+        try:
+            assert second is not first
+            assert not second.is_closed
+        finally:
+            get_cached_gateio_http_client.cache_clear()

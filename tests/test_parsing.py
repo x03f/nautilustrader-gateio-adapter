@@ -9,9 +9,11 @@ millisecond timestamp survives the conversion exactly.
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
+import nautilus_gateio
 from nautilus_gateio.common.parsing import (
     MS_THRESHOLD,
     NANOSECONDS_IN_MILLISECOND,
@@ -166,3 +168,51 @@ class TestPrecisionFromIncrement:
     def test_numeric_input_is_accepted(self):
         assert precision_from_increment(0.001) == 3
         assert precision_from_increment(1) == 0
+
+
+class TestSingleCanonicalTimestampConversion:
+    """Regression for seam-07 / SEAM-02: the conversion existed twice.
+
+    ``data.py`` carried its own copy that computed in binary floating point while
+    ``common/parsing.py`` computed in ``Decimal``. Both were correct-looking and
+    the suite was green, because the tests only ever exercised the canonical one.
+    The two disagreed by 64 ns on millisecond timestamps, so the same venue
+    instant became two different values depending on whether it arrived on the
+    data path or the execution path.
+    """
+
+    def test_the_package_defines_it_exactly_once(self):
+        """A second definition is the defect itself, so assert against the tree."""
+        package = Path(nautilus_gateio.__file__).resolve().parent
+        definitions = [
+            f"{path.relative_to(package)}:{index}"
+            for path in sorted(package.rglob("*.py"))
+            for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if line.startswith("def timestamp_to_nanos")
+        ]
+        assert definitions == ["common/parsing.py:56"], definitions
+
+    def test_every_module_uses_the_canonical_one(self):
+        """Importing it is fine; redefining it is not."""
+        from nautilus_gateio import data, execution
+        from nautilus_gateio.common import parsing
+
+        assert data.timestamp_to_nanos is parsing.timestamp_to_nanos
+        assert execution.timestamp_to_nanos is parsing.timestamp_to_nanos
+
+    @pytest.mark.parametrize(
+        "millis",
+        [1700000000123, 1790000000123, 1790000000999, 1785555555555],
+    )
+    def test_millisecond_timestamps_are_exact_on_every_path(self, millis):
+        """The measured 64 ns divergence: the float implementation failed this."""
+        from nautilus_gateio import data
+
+        assert data.timestamp_to_nanos(millis) == millis * 1_000_000
+
+    def test_the_data_path_and_the_execution_path_agree(self):
+        """The property that actually matters: one instant, one value."""
+        from nautilus_gateio import data, execution
+
+        for value in (1790000000123, "1790000000123", 1790000000.123456, 1790000000):
+            assert data.timestamp_to_nanos(value) == execution.timestamp_to_nanos(value)

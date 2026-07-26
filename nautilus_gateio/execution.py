@@ -573,6 +573,9 @@ class GateioExecutionClient(LiveExecutionClient):
             )
 
     async def _disconnect(self) -> None:
+        # Release this client's share of the transport. It is reference counted,
+        # so the socket pool closes only once every holder has let go (seam-08).
+        await self._http_client.close()
         if self._account_poll_task is not None:
             self._account_poll_task.cancel()
             self._account_poll_task = None
