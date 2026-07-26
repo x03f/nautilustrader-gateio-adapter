@@ -108,17 +108,21 @@ def _futures_fills(count: int, create_time: int = INSIDE_SECS) -> list[dict[str,
     ]
 
 
-# -- MANDATORY-ADJACENT: EXEC-4, the spot base-fee netting must agree ---------
+# -- MANDATORY-ADJACENT: the report and the fills must state the same order ---
 
 
-class TestSpotBaseFeeNettingInReports:
-    """Regression for EXEC-4.
+class TestSpotBaseFeeInReports:
+    """The report states the venue's own quantities, exactly as the fills do.
 
-    ``_fill_quantity_and_commission`` nets a base-currency fee off every fill, so
-    a fully filled spot BUY produces fills summing to ``amount - fee``. If the
-    order status report keeps stating the raw ``filled_amount`` the order can
-    never reconcile as closed, and NautilusTrader synthesises a phantom fill for
-    the difference.
+    A spot BUY is commissioned in the currency being bought, and it is the
+    platform that takes that off the position (``Position.apply``,
+    model/position.pyx:591-612) — neither the fill nor the report nets it.
+    They have to agree, and on the venue's own numbers: ``_should_update``
+    (live/execution_engine.py:3307) restates the order to ``report.quantity``
+    whenever it differs, and ``_handle_fill_quantity_mismatch`` (:3164) makes up
+    an inferred fill for whatever ``report.filled_qty`` claims beyond the fills
+    on the order. A report netted of a fee the fills are not would be undone on
+    one reconciliation pass and inflated on the next.
     """
 
     PAYLOAD: dict[str, Any] = {
@@ -149,7 +153,7 @@ class TestSpotBaseFeeNettingInReports:
         )
         assert report is not None
 
-        fill_qty, _ = env.client._fill_quantity_and_commission(
+        fill_qty, commission = env.client._fill_quantity_and_commission(
             GateioProductType.SPOT,
             {
                 "amount": "0.010000",
@@ -160,7 +164,9 @@ class TestSpotBaseFeeNettingInReports:
             env.instruments[0],
         )
         assert report.filled_qty == fill_qty
-        assert report.filled_qty == Quantity.from_str("0.009990")
+        assert report.filled_qty == Quantity.from_str("0.010000")
+        # The fee is a fact of its own, on the fill and nowhere else.
+        assert commission.as_decimal() == Decimal("0.000010")
 
     def test_fully_filled_report_can_close_the_order(self, spot_env):
         env = spot_env
@@ -175,7 +181,14 @@ class TestSpotBaseFeeNettingInReports:
         # order permanently open.
         assert report.filled_qty == report.quantity
 
-    def test_partial_fill_report_nets_the_fee_but_keeps_the_quantity(self, spot_env):
+    def test_partial_fill_report_states_the_venues_own_quantities(self, spot_env):
+        """A partially filled report must agree with the order it describes.
+
+        Netting the fee off ``filled_qty`` only while the order is still working
+        was the other half of the double count: the report claimed less filled
+        than the order had, so every startup reconciliation restated the
+        quantity back and published a quantity change the venue never made.
+        """
         env = spot_env
         payload = dict(
             self.PAYLOAD,
@@ -192,7 +205,7 @@ class TestSpotBaseFeeNettingInReports:
         )
         assert report is not None
         assert report.quantity == Quantity.from_str("0.010000")
-        assert report.filled_qty == Quantity.from_str("0.005994")
+        assert report.filled_qty == Quantity.from_str("0.006000")
         assert report.order_status == OrderStatus.PARTIALLY_FILLED
 
     def test_quote_currency_fee_is_not_netted(self, spot_env):

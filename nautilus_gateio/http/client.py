@@ -36,6 +36,12 @@ unless the replay is provably harmless:
   venue answered 5xx — the error raised is a
   :class:`GateioRequestAmbiguousError`, which tells the caller to reconcile the
   order/transfer state instead of resubmitting.
+* Replaying does not make an outcome known. A request that reached the venue and
+  was never answered, however many times it was replayed, also raises
+  :class:`GateioRequestAmbiguousError`; ``NETWORK_ERROR`` is reserved for the
+  case where no byte of any attempt left this process. A cancel is the reason
+  this matters: ``DELETE`` is replayed, so it would otherwise report a
+  definitive failure for an order the venue had in fact already cancelled.
 
 The client id Gate.io carries in an order's ``text`` field is *not* treated as
 an idempotency key here. The venue rejects a duplicate ``text`` with
@@ -109,13 +115,14 @@ _RETRY_DELAY_MAX_SECS: Final[float] = 5.0
 
 
 class GateioRequestAmbiguousError(GateioError):
-    """A mutating request failed after it may already have reached the venue.
+    """A request failed after it may already have reached the venue.
 
-    The request was not replayed, because a replay could execute it twice.
-    Whether the venue applied it is unknown: the caller must reconcile (query
-    the order by client id, poll the transfer status) before deciding to
-    resubmit. This is a :class:`~nautilus_gateio.common.errors.GateioError`, so
-    existing handlers still catch it.
+    Either it was not replayed, because a replay could execute it twice, or it
+    was replayed and never answered. Whether the venue applied it is unknown:
+    the caller must reconcile (query the order by client id, poll the transfer
+    status) before deciding to resubmit. This is a
+    :class:`~nautilus_gateio.common.errors.GateioError`, so existing handlers
+    still catch it.
     """
 
 
@@ -363,6 +370,7 @@ class GateioHttpClient:
         url = url_path + (f"?{query}" if query else "")
 
         last_error: Exception | None = None
+        reached_venue = False
         for attempt in range(1, self.max_retries + 1):
             final_attempt = attempt >= self.max_retries
             await self._limiter.acquire()
@@ -376,6 +384,7 @@ class GateioHttpClient:
                 )
             except httpx.HTTPError as exc:
                 unsent = isinstance(exc, _UNSENT_ERRORS)
+                reached_venue = reached_venue or not unsent
                 if not idempotent and not unsent:
                     # The request was already on the wire: replaying it could
                     # execute it twice, so surface the ambiguity instead.
@@ -387,9 +396,29 @@ class GateioHttpClient:
                     ) from exc
                 last_error = exc
                 if final_attempt:
+                    if reached_venue:
+                        # An idempotent request may be replayed safely, but a
+                        # replay makes a duplicate harmless, not the outcome
+                        # known: a cancel Gate.io applied and could not report
+                        # back is indistinguishable here from one it never
+                        # received. Only the caller can resolve that, and it
+                        # must not be told the command definitively failed.
+                        raise GateioRequestAmbiguousError(
+                            0,
+                            "REQUEST_AMBIGUOUS",
+                            f"{method} {path} reached the venue and was never answered "
+                            f"({str(exc)[:160]}); it may or may not have been applied - "
+                            "reconcile before resubmitting",
+                        ) from exc
+                    # Every attempt failed before a byte left this process, so
+                    # the venue cannot have seen the request.
                     raise GateioError(0, "NETWORK_ERROR", str(exc)[:200]) from exc
                 await self._retry_delay(attempt)
                 continue
+
+            # The venue answered, whatever the status: a later attempt that
+            # fails before sending no longer proves the request was unseen.
+            reached_venue = True
 
             if response.status_code == 429:
                 # Rejected by the venue's rate limiter before processing, so a

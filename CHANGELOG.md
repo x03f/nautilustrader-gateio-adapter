@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A command the venue never answered is no longer reported as a rejection.**
+  A submit, cancel or amend that failed on the transport, on a 5xx, or while
+  reading the response produced `OrderRejected` / `OrderCancelRejected` /
+  `OrderModifyRejected`, telling the strategy the venue refused a command it may
+  well have applied. `OrderRejected` is terminal, so an order Gate.io was holding
+  could never be represented locally again. Such outcomes are now logged and the
+  order is left in flight for the execution engine to resolve, as
+  NautilusTrader's order command outcome policy requires; only a venue refusal
+  (a 4xx answer, or a failure that never left the process) still produces a
+  rejection event. A whole-batch cancel failure no longer emits one
+  `OrderCancelRejected` per order in the batch.
+- **A replayed request that was never answered reports the ambiguity.** Cancels
+  are replayed because cancelling twice is harmless, but a replay makes a
+  duplicate harmless, not the outcome known; the transport raised
+  `NETWORK_ERROR` — "this definitely did not happen" — for a cancel the venue may
+  have applied. That case now raises `GateioRequestAmbiguousError`, and
+  `NETWORK_ERROR` is reserved for requests no byte of which left the process.
+- **A fully hidden order is no longer submitted fully displayed.** NautilusTrader
+  reads `display_qty=0` as "hide the whole order"; Gate.io reads `iceberg=0` as
+  "normal order" and does not support hiding the whole amount, so the instruction
+  was inverted and the entire size rested visibly on the book. It is now refused,
+  naming the venue restriction. A fractional `display_qty` on a derivative is
+  refused too, rather than being truncated to `0` — which inverted it the same
+  way.
+- **Post-only no longer overrides IOC and FOK.** `post_only=True` mapped to `poc`
+  whatever the time in force, so an order the strategy expected to terminate in
+  milliseconds rested at the venue until it was cancelled. Post-only is Gate.io's
+  `poc` time in force, a maker-only *resting* order: it still composes with GTC,
+  and the two immediate combinations are now refused instead of substituted.
+- **Off-tick prices are refused instead of being sent.** The `BNB_USDT` perpetual
+  and the longer-dated `ETH_USDT` delivery contracts quote two decimals but tick
+  in `0.05`. `Instrument.make_price()` rounds to the precision and the
+  `RiskEngine` checks precision rather than increment, so four of every five
+  two-decimal prices reached the venue and came back as an opaque parameter
+  error. An order or amendment whose price or trigger price is not a multiple of
+  the instrument's tick is now rejected with the tick named.
+
+### Added
+
+- **Every instrument carries a tick scheme.** `Instrument.next_bid_price()`,
+  `next_ask_price()` and their plural forms raised `ValueError` on every Gate.io
+  instrument because none named one. Power-of-ten grids use NautilusTrader's
+  pre-registered `FIXED_PRECISION_{n}`; a grid that is not a power of ten gets a
+  `FixedTickScheme` registered as `GATEIO_TICK_{increment}_P{precision}` carrying
+  the venue's own increment, which is how an on-tick price can be produced at all
+  on those contracts.
+
 ## [0.2.0a1] - 2026-07-26
 
 An alpha. 0.1.0 was a spot-only adapter with a flat module layout; 0.2.0a1 is a

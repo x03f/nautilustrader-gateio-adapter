@@ -127,9 +127,21 @@ class TestTimeInForce:
     def test_supported_values_map_to_the_venue_vocabulary(self, nautilus_tif, expected):
         assert time_in_force_to_gateio(nautilus_tif) is expected
 
-    @pytest.mark.parametrize("nautilus_tif", [TimeInForce.GTC, TimeInForce.IOC, TimeInForce.FOK])
-    def test_post_only_takes_precedence_and_maps_to_poc(self, nautilus_tif):
-        assert time_in_force_to_gateio(nautilus_tif, post_only=True) is GateioTimeInForce.POC
+    def test_post_only_gtc_maps_to_poc(self):
+        """``poc`` *is* Gate.io's post-only GTC order, so nothing is lost here."""
+        assert time_in_force_to_gateio(TimeInForce.GTC, post_only=True) is GateioTimeInForce.POC
+
+    @pytest.mark.parametrize("nautilus_tif", [TimeInForce.IOC, TimeInForce.FOK])
+    def test_post_only_with_an_immediate_time_in_force_is_refused(self, nautilus_tif):
+        """Regression: post-only used to override IOC and FOK into a resting ``poc``.
+
+        Post-only is a liquidity constraint, not a time in force, so an IOC or
+        FOK post-only order asks for maker-only *and* immediate. ``poc`` rests
+        until cancelled, so answering with it keeps only half the instruction —
+        the substitution the platform tells an adapter to refuse.
+        """
+        with pytest.raises(ValueError, match="post-only cannot be combined"):
+            time_in_force_to_gateio(nautilus_tif, post_only=True)
 
     @pytest.mark.parametrize(
         "nautilus_tif",

@@ -122,11 +122,11 @@ coverage, not about test coverage.
 |---|---|---|---|---|---|---|
 | MARKET | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
 | LIMIT (GTC / IOC / FOK) | yes | yes | yes | yes | GTC/IOC | Implemented — not mainnet-validated |
-| Post-only (`poc`) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| Post-only (`poc`, GTC only) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
 | STOP_MARKET / STOP_LIMIT | yes | yes | yes | yes | no | Implemented — not mainnet-validated |
 | MARKET_IF_TOUCHED / LIMIT_IF_TOUCHED | yes | yes | yes | yes | no | Implemented — not mainnet-validated |
 | Reduce-only | n/a | yes | yes | yes | yes | Implemented — not mainnet-validated |
-| Iceberg (`display_qty`) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
+| Iceberg (`display_qty`, non-zero) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
 | Quote-denominated quantity | market buy | no | no | no | no | Implemented — not mainnet-validated |
 | Cancel / cancel-all / batch cancel | yes | yes | yes | yes | yes | Implemented — not mainnet-validated |
 | Modify (amend) | yes | yes | yes | no | no | Partial (delivery and options reject explicitly) |

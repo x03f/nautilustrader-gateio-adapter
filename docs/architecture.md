@@ -183,6 +183,13 @@ process. Any other failure of a mutating request raises
 `GateioRequestAmbiguousError`, whose contract is "this may or may not have been
 applied — reconcile before resubmitting" rather than a silent retry.
 
+Replaying does not make an outcome known, so the same error is raised for a
+request that reached the venue and was never answered however often it was
+replayed; `NETWORK_ERROR` is reserved for the case where no byte of any attempt
+left the process. A cancel is why that distinction is load-bearing: `DELETE` *is*
+replayed, and reporting a definitive failure for an order the venue had already
+cancelled is what the execution client would then tell the strategy.
+
 ## One WebSocket transport per product
 
 Gate.io serves each product family from its own WebSocket host, and perpetual

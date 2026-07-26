@@ -89,7 +89,6 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
@@ -170,6 +169,7 @@ from nautilus_gateio.common.enums import (
 )
 from nautilus_gateio.common.errors import (
     GateioError,
+    GateioServerError,
     OrderValidationError,
     UnsupportedOrderError,
     WalletNotProvisionedError,
@@ -182,51 +182,13 @@ from nautilus_gateio.common.symbols import (
     parse_option_symbol,
 )
 from nautilus_gateio.config import GateioExecClientConfig, validate_products
-from nautilus_gateio.http.client import GateioHttpClient
+from nautilus_gateio.http.client import GateioHttpClient, GateioRequestAmbiguousError
 from nautilus_gateio.http.futures import GateioFuturesHttpAPI
 from nautilus_gateio.http.margin import GateioMarginHttpAPI, require_wallet
 from nautilus_gateio.http.options import GateioOptionsHttpAPI
 from nautilus_gateio.http.spot import GateioSpotHttpAPI
 from nautilus_gateio.http.wallet import GateioWalletHttpAPI
 from nautilus_gateio.websocket.private import ALL, GateioPrivateWebSocket
-
-
-@dataclass
-class SpotQuantity:
-    """What a live spot order's quantity is made of, tracked apart from the order.
-
-    A Gate.io spot BUY is charged its fee in the currency being bought, so the
-    venue credits ``amount - fee`` base units for a match of ``amount``. The
-    fills this client publishes are netted of that fee (EXEC-4), so a fully
-    matched order's fills add up to less than the quantity it was submitted with,
-    and the order has to be restated or it never leaves ``cache.orders_open()``.
-
-    The restatement is *not* a second opinion about the order's quantity: it is
-    ``gross - withheld``, and the two move for entirely unrelated reasons.
-    ``gross`` is the venue's own order size and changes only when the venue says
-    so — a spot amend, which ``_modify_order`` supports and another session can
-    make at any time. ``withheld`` only ever grows, by whatever the venue kept on
-    each fill. Keeping them apart is what lets an amend and the fee compose:
-    what is still working at the venue is ``gross - matched``, and no arithmetic
-    over fees may change that.
-
-    They are held here rather than read back off the order because
-    ``OrderUpdated`` reaches the order through the execution engine's event
-    queue, so ``order.quantity`` still reads its pre-update value for as long as
-    the queue is undrained — and Gate.io delivers several fills in one frame,
-    which the fill handler walks synchronously. A shadow of the *result*, though,
-    is what refuted the first attempt at this: it went stale the moment anyone
-    else restated the order, and silently discarded the amend. These three
-    numbers cannot go stale that way, because every source that changes the
-    order's quantity updates the one it owns.
-    """
-
-    #: The order size as the venue states it, in base units.
-    gross: Decimal
-    #: Cumulative base currency the venue has kept as its fee.
-    withheld: Decimal = Decimal(0)
-    #: Cumulative base currency actually credited by fills (net of the fee).
-    matched: Decimal = Decimal(0)
 
 
 class PositionStatusUnavailable(Exception):
@@ -345,6 +307,43 @@ def venue_symbol_of(payload: dict[str, Any]) -> str:
     return ""
 
 
+def is_ambiguous_outcome(error: BaseException) -> bool:
+    """Return whether ``error`` leaves the venue's handling of a command unknown.
+
+    NautilusTrader allows an execution client to emit ``OrderRejected``,
+    ``OrderCancelRejected`` or ``OrderModifyRejected`` only for a *definitive*
+    outcome — the venue must have refused the command (concepts/live.md, "Order
+    command outcome policy"). Every other failure is ambiguous, and an ambiguous
+    command must be left in its in-flight state for the engine to resolve.
+
+    The classification is by exception type rather than by message or label,
+    because only the transport knows whether the request reached the venue:
+
+    * :class:`GateioRequestAmbiguousError` — the request was on the wire, and was
+      either deliberately not replayed or replayed without ever being answered;
+    * :class:`GateioServerError` — Gate.io answered 5xx, which it can do either
+      before or after applying the request;
+    * anything that is not a :class:`GateioError` — the adapter itself failed
+      around a request that may already have been applied, typically while
+      reading the response.
+
+    A plain :class:`GateioError` is definitive. A 4xx is the venue's own refusal
+    (live.md names HTTP 400, 401, 403 and 429 as proof of non-acceptance), and
+    the status-0 errors this adapter raises — ``NETWORK_ERROR``,
+    ``CLIENT_CLOSED``, ``MISSING_CREDENTIALS`` — are raised only when no byte of
+    the request left the process.
+
+    :class:`OrderValidationError` and :class:`UnsupportedOrderError` are the
+    adapter's own pre-flight refusals, raised before anything is sent, so they
+    are definitive too however deep in a submit path they occur.
+    """
+    if isinstance(error, OrderValidationError | UnsupportedOrderError):
+        return False
+    if isinstance(error, GateioRequestAmbiguousError | GateioServerError):
+        return True
+    return not isinstance(error, GateioError)
+
+
 def trigger_rule(
     order_side: OrderSide,
     order_type: OrderType,
@@ -377,6 +376,22 @@ TRIGGERABLE_ORDER_TYPES: Final[frozenset[OrderType]] = frozenset(
 
 #: ``status`` values a price-triggered order reports while it is still armed.
 ARMED_TRIGGER_STATUSES: Final[frozenset[str]] = frozenset({"", "open"})
+
+#: Terminal order statuses a late fill can still be booked from.
+#:
+#: Gate.io does not order ``*.orders`` against ``*.usertrades``, so the message
+#: that closes an order can win the race against the fill that caused it. Whether
+#: that fill can still be applied is decided by the platform's own order state
+#: table, and among the terminal statuses it holds exactly two entries —
+#: ``(CANCELED, PARTIALLY_FILLED)`` and ``(CANCELED, FILLED)``, both annotated
+#: "Real world possibility" (installed model/orders/base.pyx:132-133). Every
+#: other terminal status raises ``InvalidStateTrigger``, which
+#: ``LiveExecutionEngine._reconcile_fill_report`` (live/execution_engine.py:3379)
+#: catches and turns into a log line, so a fill routed there is not reconciled —
+#: it is discarded.
+FILLABLE_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+    {OrderStatus.CANCELED},
+)
 
 
 class GateioTriggerLink:
@@ -562,8 +577,9 @@ class GateioExecutionClient(LiveExecutionClient):
 
         # Fills already applied, so a replayed usertrade cannot fill twice
         self._applied_trade_ids: dict[ClientOrderId, set[str]] = {}
-        #: What each live spot order's quantity is made of (see `SpotQuantity`).
-        self._spot_quantities: dict[ClientOrderId, SpotQuantity] = {}
+        #: Spot market buys whose quote-denominated quantity has been restated
+        #: in base units (see `_maybe_convert_quote_quantity`).
+        self._quote_quantity_converted: set[ClientOrderId] = set()
 
         # Last known wallet state per currency: {currency: (total, free)}
         self._balances: dict[str, tuple[Decimal, Decimal]] = {}
@@ -777,12 +793,11 @@ class GateioExecutionClient(LiveExecutionClient):
           same execution: it is either applied on top (4 lots recorded as 8) or,
           when the inferred fill is stamped later than the real one, discarded —
           and with it the only key by which any later replay could be matched;
-        * a fill report alone cannot restate the order's quantity, so a spot buy
-          whose base-currency fee shrinks the quantity the venue can ever credit
-          (EXEC-4) is applied as a fill against a quantity it can never reach.
-          ``Order.apply(OrderUpdated)`` never triggers a terminal status, so the
-          restatement that follows leaves the order at zero remaining quantity
-          and permanently PARTIALLY_FILLED.
+        * a fill report alone cannot restate the order's quantity, so a fill
+          against an order the venue has since amended is applied to a quantity
+          that cannot hold it. ``Order.apply(OrderUpdated)`` never triggers a
+          terminal status, so a restatement arriving after the last fill leaves
+          the order at zero remaining quantity and permanently PARTIALLY_FILLED.
 
         Merely sending the fills before the orders fixes the first half and
         creates the second. ``_reconcile_execution_mass_status`` takes an order
@@ -886,10 +901,11 @@ class GateioExecutionClient(LiveExecutionClient):
         over the message bus and the engine applies reconciliation fills
         immediately, so by the time it returns the cache already shows which
         trade ids were booked. Anything missing goes through
-        ``_reconcile_fill_report_single``, which has no status gate. A trade the
-        grouped pass *did* book is skipped, and a replay of one is refused by the
-        engine's own trade-id de-duplication, so no execution can be counted
-        twice.
+        ``_reconcile_fill_report_single``, which has no status gate — through
+        :meth:`_hand_over_fill`, because that endpoint can only resolve a trade
+        whose venue order id the cache already indexes. A trade the grouped pass
+        *did* book is skipped, and a replay of one is refused by the engine's own
+        trade-id de-duplication, so no execution can be counted twice.
         """
         for report in fill_reports:
             if self._fill_is_booked(report):
@@ -898,7 +914,127 @@ class GateioExecutionClient(LiveExecutionClient):
                 f"Recovered trade {report.trade_id.value} was not booked by the grouped "
                 f"hand-over for {report.venue_order_id!r}; reporting it on its own",
             )
+            self._hand_over_fill(report)
+
+    def _hand_over_fill(self, report: FillReport) -> None:
+        """Give the engine one execution that no order event can carry.
+
+        A standalone ``FillReport`` lands in
+        ``LiveExecutionEngine._reconcile_fill_report_single``, which resolves the
+        order it belongs to **only** through
+        ``cache.client_order_id(report.venue_order_id)`` (installed 1.230.0,
+        live/execution_engine.py:2183-2200). ``report.client_order_id`` is read
+        afterwards as a consistency check, never as a fallback. With that index
+        empty the engine logs "FillReport received before OrderStatusReport ...
+        deferring reconciliation" and returns False — and nothing ever comes back
+        for it: ``reconcile_execution_report`` (:1816) keeps no deferral queue,
+        and the sole retry loop (``_reconcile_missing_fills``, :1236) is driven by
+        ``position_check_interval_secs``, which defaults to ``None``.
+        concepts/execution.md ("External order is created from the fill") and
+        concepts/live.md ("Fill reports arriving before order status reports are
+        deferred") describe a version that behaves differently from the one we
+        build against; the installed source decides.
+
+        So an unindexed trade is not handed over on its own. The venue is asked
+        for the order it belongs to, and the two go over together as an
+        ``ExecutionMassStatus`` — the path ``_reconcile_execution_mass_status``
+        (:1878-1910) implements: it creates the external order from the order
+        report, indexes its venue order id, and only then applies the trades
+        grouped under that id, each keeping its own ``trade_id`` and commission.
+        """
+        if self._cache.client_order_id(report.venue_order_id) is not None:
             self._send_fill_report(report)
+            return
+        self.create_task(
+            self._hand_over_fill_with_its_order(report),
+            log_msg=f"hand_over_fill_{report.trade_id.value}",
+        )
+
+    async def _hand_over_fill_with_its_order(self, report: FillReport) -> None:
+        """Re-read the order an unattributed trade belongs to and hand both over."""
+        order_report = await self.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=report.instrument_id,
+                client_order_id=None,
+                venue_order_id=report.venue_order_id,
+                command_id=UUID4(),
+                ts_init=self._clock.timestamp_ns(),
+            ),
+        )
+        if order_report is None:
+            self._log.error(
+                f"Trade {report.trade_id.value} on {report.instrument_id} cannot be booked: "
+                f"Gate.io did not answer for order {report.venue_order_id!r}, and the execution "
+                f"engine discards a fill report whose venue order id it has never seen. "
+                f"{report.last_qty} at {report.last_px} is traded and missing from the position",
+            )
+            return
+
+        mass_status = ExecutionMassStatus(
+            client_id=self.id,
+            account_id=self.account_id,
+            venue=self.venue,
+            report_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+        )
+        # The engine groups trades under an order report by venue order id, so
+        # the fill has to be added alongside the report of the very order the
+        # venue attributed it to — which is the one that was just queried by that
+        # id.
+        mass_status.add_order_reports(reports=[order_report])
+        mass_status.add_fill_reports(reports=[report])
+        self._send_mass_status_report(mass_status)
+
+    def _handle_late_fill(
+        self,
+        product: GateioProductType,
+        order: Order,
+        instrument: Instrument,
+        payload: dict[str, Any],
+        trade_id: TradeId,
+    ) -> None:
+        """Book a fill that arrived after the order was reported closed.
+
+        Gate.io does not order ``*.orders`` against ``*.usertrades``, so the
+        terminal order message can win the race against the fill that caused it —
+        the ordinary IOC/FOK/STP case, which ``order_status_from_gateio`` maps to
+        CANCELED. ``Order.apply`` refuses an ``OrderFilled`` on a closed order, so
+        the only remaining route is reconciliation, and it works from CANCELED:
+        the platform's state table holds ``(CANCELED, PARTIALLY_FILLED)`` and
+        ``(CANCELED, FILLED)`` for exactly this ("Real world possibility",
+        model/orders/base.pyx:132-133).
+
+        It works from CANCELED and from nowhere else. There is no transition out
+        of EXPIRED, REJECTED or DENIED for a fill, so the engine's
+        ``_generate_order_filled`` raises ``InvalidStateTrigger``,
+        ``_reconcile_fill_report`` (live/execution_engine.py:3379-3383) catches it,
+        logs it and returns False, and the execution is gone. Handing those to
+        reconciliation anyway would bury a real trade under a generic
+        reconciliation error, so the loss is reported here instead, with
+        everything needed to account for it.
+        """
+        report = self._parse_fill_report(product, payload, instrument)
+        if report is None:
+            self._log.error(
+                f"Fill {trade_id.value} arrived after {order.client_order_id!r} was reported "
+                f"{order.status_string()} and cannot be expressed as a fill report",
+            )
+            return
+        if order.status not in FILLABLE_TERMINAL_STATUSES:
+            self._log.error(
+                f"Trade {trade_id.value} of {report.last_qty} at {report.last_px} "
+                f"(commission {report.commission}) is lost: it arrived after "
+                f"{order.client_order_id!r} was reported {order.status_string()}, and "
+                f"NautilusTrader has no state transition applying a fill to an order in that "
+                f"status. The position on {order.instrument_id} is short of this trade until "
+                f"the venue's own position is reconciled",
+            )
+            return
+        self._log.warning(
+            f"Fill {trade_id.value} arrived after {order.client_order_id!r} was reported "
+            f"{order.status_string()}; routing it through the reconciliation path",
+        )
+        self._hand_over_fill(report)
 
     def _fill_is_booked(self, report: FillReport) -> bool:
         """Return whether this venue trade is already on the order it belongs to."""
@@ -1121,7 +1257,7 @@ class GateioExecutionClient(LiveExecutionClient):
         if text is not None:
             self._client_order_id_by_text.pop(text, None)
         self._applied_trade_ids.pop(client_order_id, None)
-        self._spot_quantities.pop(client_order_id, None)
+        self._quote_quantity_converted.discard(client_order_id)
         link = self._trigger_links.pop(client_order_id, None)
         if link is not None:
             self._trigger_by_armed_id.pop(link.armed_id, None)
@@ -1214,6 +1350,15 @@ class GateioExecutionClient(LiveExecutionClient):
         )
 
         try:
+            # Both prices are checked here rather than in each builder: the grid
+            # is a property of the instrument, and every order type that carries
+            # a price reaches the venue through one of the two calls below.
+            self._assert_on_tick_grid(instrument, "price", getattr(order, "price", None))
+            self._assert_on_tick_grid(
+                instrument,
+                "trigger price",
+                getattr(order, "trigger_price", None),
+            )
             if order.order_type in CONDITIONAL_ORDER_TYPES:
                 await self._submit_trigger_order(order, instrument, product, raw_symbol)
             else:
@@ -1221,13 +1366,18 @@ class GateioExecutionClient(LiveExecutionClient):
         except (UnsupportedOrderError, OrderValidationError, ValueError) as e:
             self._reject(order, str(e))
         except GateioError as e:
-            self._reject(
-                order,
-                f"{e.label or 'ERROR'}: {e.message}",
-                due_post_only=e.label in POST_ONLY_LABELS,
-            )
+            reason = f"{e.label or 'ERROR'}: {e.message}"
+            if is_ambiguous_outcome(e):
+                self._outcome_unresolved("Submission", order.client_order_id, reason)
+                return
+            self._reject(order, reason, due_post_only=e.label in POST_ONLY_LABELS)
         except Exception as e:  # noqa: BLE001 - never leave an order in limbo
-            self._reject(order, f"submit failed: {e}")
+            # Everything the adapter itself refuses is caught above, so what is
+            # left happened around a request Gate.io may already have accepted:
+            # a response this client could not read, a task cancelled mid-call.
+            # Rejecting on that is unrecoverable, not merely pessimistic — see
+            # `_outcome_unresolved`.
+            self._outcome_unresolved("Submission", order.client_order_id, f"submit failed: {e}")
 
     def _deny(self, order: Order, reason: str) -> None:
         self._log.error(f"Denying {order.client_order_id!r}: {reason}")
@@ -1248,6 +1398,51 @@ class GateioExecutionClient(LiveExecutionClient):
             reason=reason,
             ts_event=self._clock.timestamp_ns(),
             due_post_only=due_post_only,
+        )
+
+    def _outcome_unresolved(
+        self,
+        action: str,
+        client_order_id: ClientOrderId,
+        reason: str,
+    ) -> None:
+        """Record a command whose venue outcome is unknown, emitting no event.
+
+        This is the whole handling NautilusTrader prescribes for an ambiguous
+        outcome: "Nautilus logs the failure, keeps the order in its current
+        in-flight state, and waits for WebSocket updates, open-order polling,
+        in-flight checks, or startup reconciliation to resolve the state"
+        (concepts/live.md, "Ambiguous outcomes"). The order stays ``SUBMITTED``,
+        ``PENDING_UPDATE`` or ``PENDING_CANCEL``, which is exactly what the
+        engine's in-flight check looks for.
+
+        Emitting a rejection instead is not a conservative approximation, it is
+        unrecoverable. ``OrderRejected`` is terminal: verified against installed
+        1.230.0, ``Order.apply`` then raises ``InvalidStateTrigger`` on the
+        ``OrderAccepted`` that reconciliation would have to emit, so an order
+        Gate.io is holding could never be represented locally again and the
+        position would drift for the life of the process. ``OrderCancelRejected``
+        and ``OrderModifyRejected`` are not terminal but are just as wrong: they
+        put the order back to ``ACCEPTED`` carrying state the venue no longer
+        has. Resolving those two is the engine's call, not this client's — and
+        the two sources disagree about what it decides, so the installed one is
+        what this comment describes: live.md's "In-flight order timeout
+        resolution" table leaves ``PENDING_CANCEL`` and ``PENDING_UPDATE``
+        unresolved, while 1.230.0's ``_resolve_inflight_order`` generates
+        ``OrderCanceled`` for both once the retries are spent. Either way the
+        engine decides it after querying the venue, which is more than this
+        client knows at the point of failure.
+
+        Querying the venue from here instead would duplicate
+        ``LiveExecutionEngine._check_inflight_orders``, which already re-queries
+        every in-flight order through ``generate_order_status_report``, bounded
+        by ``inflight_check_retries`` and sharing its retry counter with the
+        open-order loop. A second, uncoordinated poll would race it.
+        """
+        self._log.warning(
+            f"{action} of {client_order_id!r} is unresolved: {reason}. The venue may or may "
+            f"not have applied it, so the order is left in flight for the execution engine "
+            f"to resolve",
         )
 
     async def _submit_regular_order(
@@ -1336,7 +1531,7 @@ class GateioExecutionClient(LiveExecutionClient):
         body["price"] = str(price)
         body["time_in_force"] = self._time_in_force(order, allow_fok=True).value
 
-        display_qty = getattr(order, "display_qty", None)
+        display_qty = self._display_quantity(order, whole_contracts=False)
         if display_qty is not None:
             body["iceberg"] = str(display_qty)
         return body
@@ -1412,7 +1607,7 @@ class GateioExecutionClient(LiveExecutionClient):
         body["price"] = str(price)
         body["tif"] = self._time_in_force(order, allow_fok=True).value
 
-        display_qty = getattr(order, "display_qty", None)
+        display_qty = self._display_quantity(order, whole_contracts=True)
         if display_qty is not None:
             body["iceberg"] = int(display_qty.as_decimal())
         return body
@@ -1443,10 +1638,46 @@ class GateioExecutionClient(LiveExecutionClient):
         body["price"] = str(price)
         body["tif"] = self._time_in_force(order, allow_fok=False).value
 
-        display_qty = getattr(order, "display_qty", None)
+        display_qty = self._display_quantity(order, whole_contracts=True)
         if display_qty is not None:
             body["iceberg"] = int(display_qty.as_decimal())
         return body
+
+    @staticmethod
+    def _display_quantity(order: Order, whole_contracts: bool) -> Quantity | None:
+        """Return the order's ``display_qty``, refusing what ``iceberg`` cannot carry.
+
+        Zero is not a no-op here, it is the *opposite* instruction on each side.
+        NautilusTrader reads ``display_qty=0`` as a fully hidden order
+        (concepts/orders/index.md, "Display quantity"), while Gate.io documents
+        ``iceberg`` as "Null or 0 for normal orders. Hiding all amount is not
+        supported" — so passing the zero through would rest the whole size
+        visibly on the book. There is no other encoding for a hidden order on
+        this venue, so the order is refused rather than inverted.
+
+        The same inversion is what makes ``int()`` the wrong way to fit a display
+        quantity into a contract count: ``int(Decimal("0.5"))`` is ``0``, which
+        the venue again reads as "display everything". A display quantity that is
+        not a whole number of contracts is therefore refused too, exactly as
+        :meth:`_contract_size` refuses a fractional order quantity.
+        """
+        display_qty = getattr(order, "display_qty", None)
+        if display_qty is None:
+            return None
+
+        value = display_qty.as_decimal()
+        if value == 0:
+            raise UnsupportedOrderError(
+                "Gate.io reads `iceberg=0` as a normal (fully displayed) order and does not "
+                "support hiding the whole amount, so `display_qty=0` cannot be submitted; "
+                "omit `display_qty`, or name the portion to show",
+            )
+        if whole_contracts and value != int(value):
+            raise OrderValidationError(
+                f"Gate.io displays whole contracts on a derivatives iceberg order, "
+                f"`display_qty` was {value}",
+            )
+        return display_qty
 
     def _contract_size(self, order: Order) -> int:
         """Return the signed contract count for a derivatives order."""
@@ -1464,6 +1695,39 @@ class GateioExecutionClient(LiveExecutionClient):
         if contracts <= 0:
             raise OrderValidationError(f"order quantity must be positive, was {quantity}")
         return contracts if order.side == OrderSide.BUY else -contracts
+
+    @staticmethod
+    def _assert_on_tick_grid(instrument: Instrument, label: str, price: Price | None) -> None:
+        """Refuse a price that is not on the instrument's tick grid.
+
+        On Gate.io the grid is not implied by the precision: ``BNB_USDT``
+        perpetuals and the longer-dated ``ETH_USDT`` delivery contracts quote two
+        decimals but tick in ``0.05``, so four of every five two-decimal prices
+        are invalid at the venue. Nothing upstream catches that —
+        ``Instrument.make_price`` rounds to the precision only
+        (model/instruments/base.pyx:565) and the ``RiskEngine`` compares
+        precisions, not increments (risk/engine.pyx:1041) — so a price built the
+        documented way reaches this client off-grid and comes back as an opaque
+        venue parameter error.
+
+        Snapping it here would be worse than refusing: moving a limit price by up
+        to a tick is a different order from the one the strategy sent, and this
+        client's rule is that nothing is silently altered. Instruments carry a
+        tick scheme for this (``next_bid_price`` / ``next_ask_price``), which the
+        message points at. For the ~3,100 instruments whose tick *is* a power of
+        ten, the check can never fire, since any price of the right precision is
+        already a multiple of the increment.
+        """
+        if price is None:
+            return
+        increment = instrument.price_increment.as_decimal()
+        if price.as_decimal() % increment != 0:
+            raise OrderValidationError(
+                f"{label} {price} is not a multiple of the {instrument.id} tick size "
+                f"{increment}, and Gate.io accepts on-tick prices only. `make_price()` rounds "
+                f"to the price precision, not to the tick; use the instrument's tick scheme "
+                f"(`next_bid_price()` / `next_ask_price()`) to price on the grid",
+            )
 
     @staticmethod
     def _market_time_in_force(order: Order, allow_fok: bool) -> GateioTimeInForce:
@@ -1500,10 +1764,12 @@ class GateioExecutionClient(LiveExecutionClient):
         try:
             return time_in_force_to_gateio(order.time_in_force, post_only=order.is_post_only)
         except ValueError as e:
-            raise UnsupportedOrderError(
-                f"time in force {time_in_force_to_str(order.time_in_force)} is not supported "
-                f"by Gate.io ({e})",
-            ) from e
+            # The mapping's own message is passed through rather than wrapped:
+            # it distinguishes an unsupported time in force from a post-only
+            # combination that Gate.io cannot express, and re-prefixing it with
+            # "time in force IOC is not supported" would misreport the second as
+            # the first (IOC on its own is supported).
+            raise UnsupportedOrderError(str(e)) from e
 
     # -- price-triggered orders --------------------------------------------
 
@@ -1543,7 +1809,12 @@ class GateioExecutionClient(LiveExecutionClient):
 
         trigger_id = self._trigger_order_id(response)
         if trigger_id is None:
-            raise GateioError(
+            # The venue answered without an error, so it armed the order and
+            # this client merely cannot read back the handle. That is a
+            # post-submit parse failure, which the platform classifies as an
+            # ambiguous outcome rather than a rejection: the order exists, and
+            # only reconciliation can recover its id.
+            raise GateioRequestAmbiguousError(
                 0,
                 "TRIGGER_ORDER_ID_MISSING",
                 "the venue accepted the price-triggered order without returning its id",
@@ -1732,8 +2003,24 @@ class GateioExecutionClient(LiveExecutionClient):
         try:
             await self._cancel_one(product, raw_symbol, command.client_order_id, command)
         except GateioError as e:
-            self._cancel_rejected(command, f"{e.label or 'ERROR'}: {e.message}")
+            reason = f"{e.label or 'ERROR'}: {e.message}"
+            if is_ambiguous_outcome(e):
+                # The cancel endpoints are idempotent and replayed, so the usual
+                # shape of this failure is a cancel Gate.io did apply and could
+                # not report back. OrderCancelRejected would put the order back
+                # to ACCEPTED, and a strategy that re-quotes on that event would
+                # replace an order that no longer exists - double exposure.
+                self._outcome_unresolved("Cancellation", command.client_order_id, reason)
+                return
+            self._cancel_rejected(command, reason)
         except Exception as e:  # noqa: BLE001 - report, never propagate
+            if is_ambiguous_outcome(e):
+                self._outcome_unresolved(
+                    "Cancellation",
+                    command.client_order_id,
+                    f"cancel failed: {e}",
+                )
+                return
             self._cancel_rejected(command, f"cancel failed: {e}")
 
     async def _cancel_one(
@@ -1986,8 +2273,20 @@ class GateioExecutionClient(LiveExecutionClient):
             try:
                 results = await self._spot_http.cancel_batch(items)
             except GateioError as e:
+                # A whole-request failure carries no per-order result, so it says
+                # nothing about the individual cancels unless the venue refused
+                # the request outright (live.md: "A whole-request failure without
+                # per-order results remains unresolved unless the target command
+                # is proven refused"). Fanning a timeout or a 502 out as one
+                # OrderCancelRejected per order is the single-cancel defect
+                # multiplied by the batch size.
+                reason = f"{e.label or 'ERROR'}: {e.message}"
+                ambiguous = is_ambiguous_outcome(e)
                 for cancel in by_venue_id.values():
-                    self._cancel_rejected(cancel, f"{e.label or 'ERROR'}: {e.message}")
+                    if ambiguous:
+                        self._outcome_unresolved("Cancellation", cancel.client_order_id, reason)
+                    else:
+                        self._cancel_rejected(cancel, reason)
                 continue
 
             for result in results or []:
@@ -2040,6 +2339,17 @@ class GateioExecutionClient(LiveExecutionClient):
                 "Gate.io cannot amend the trigger price of a working order",
             )
             return
+
+        # An amended price must sit on the venue's grid exactly as a submitted
+        # one does, and perpetuals are the one amendable product that includes an
+        # off-decimal grid (`BNB_USDT` ticks in 0.05).
+        instrument = self._instrument(command.instrument_id)
+        if instrument is not None:
+            try:
+                self._assert_on_tick_grid(instrument, "price", command.price)
+            except OrderValidationError as e:
+                self._modify_rejected(command, str(e))
+                return
 
         venue_order_id = command.venue_order_id or self._cache.venue_order_id(
             command.client_order_id,
@@ -2108,9 +2418,29 @@ class GateioExecutionClient(LiveExecutionClient):
             self._modify_rejected(command, str(e))
             return
         except GateioError as e:
-            self._modify_rejected(command, f"{e.label or 'ERROR'}: {e.message}")
+            reason = f"{e.label or 'ERROR'}: {e.message}"
+            if is_ambiguous_outcome(e):
+                # Silently the worst of the three. OrderModifyRejected returns
+                # the order to ACCEPTED with the OLD price and quantity while
+                # the venue may be holding the new ones, and in 1.230.0 nothing
+                # repairs that: the open-order check sets `should_reconcile`
+                # only on an is_open or filled_qty mismatch, so `_should_update`
+                # - the one comparison that looks at price and quantity - is
+                # never reached from that loop, and the loop is off by default.
+                # Left in PENDING_UPDATE, the in-flight check queries the order
+                # and that same comparison does run.
+                self._outcome_unresolved("Amendment", command.client_order_id, reason)
+                return
+            self._modify_rejected(command, reason)
             return
         except Exception as e:  # noqa: BLE001 - report, never propagate
+            if is_ambiguous_outcome(e):
+                self._outcome_unresolved(
+                    "Amendment",
+                    command.client_order_id,
+                    f"amend failed: {e}",
+                )
+                return
             self._modify_rejected(command, f"amend failed: {e}")
             return
 
@@ -2285,7 +2615,7 @@ class GateioExecutionClient(LiveExecutionClient):
         order: Order,
         venue_order_id: VenueOrderId,
         ts_event: int,
-    ) -> bool:
+    ) -> None:
         """Follow a price-triggered order onto the real order the venue fired.
 
         Gate.io arms a price-triggered order under one id and, when the trigger
@@ -2303,30 +2633,43 @@ class GateioExecutionClient(LiveExecutionClient):
         identifies this order in the venue's price-order listings, which is what
         makes the identity rebuildable after a restart.
 
-        Returns whether an event carrying ``venue_order_id`` can now be applied
-        to ``order``. Callers on the fill path need that answer: Gate.io orders
-        ``*.orders`` and ``*.usertrades`` independently, so a fill can arrive
-        before the order message that would have rebased the identity, and
-        emitting it against a stale identity gets it rejected and dropped.
+        A conditional order is the common case, not the only one: any event this
+        client resolved to ``order`` — through the ``text`` alias it registered
+        for it, or through the cache's own index — while carrying a venue order
+        id the order does not hold is the venue speaking about a replacement
+        object it created. Rebasing is the only way to take delivery of it. The
+        tempting alternative, handing such an event to reconciliation, cannot
+        work on any path: ``create_order_filled_event``
+        (live/reconciliation.py:381) stamps the fill with
+        ``report.venue_order_id``, so ``Order.apply`` raises the same
+        ``ValueError`` there, and ``_reconcile_fill_report`` logs it away.
         """
         if order.venue_order_id is not None and order.venue_order_id == venue_order_id:
-            return True  # Already rebased onto this order
-        link = self._trigger_links.get(order.client_order_id)
-        if link is None:
-            # Not a conditional order. The identity is reconcilable only while
-            # the order carries none of its own, which the framework permits.
-            return order.venue_order_id is None
-        if venue_order_id.value == link.armed_id:
-            return True  # The event carries the armed id the order already holds
+            return  # Already rebased onto this order
         if self._cache.venue_order_id(order.client_order_id) == venue_order_id:
             # The rebase was already emitted. `order.venue_order_id` may still
-            # read as the armed id here, because the order object is only updated
-            # once the execution engine applies the `OrderUpdated` — and several
-            # fills for a freshly fired order can be handled before that happens.
-            # The cache mapping is written synchronously by the rebase itself, so
-            # it is the one signal that does not depend on event delivery.
-            return True
-        self._attach_fired_order_id(link, venue_order_id.value)
+            # read as the previous id here, because the order object is only
+            # updated once the execution engine applies the `OrderUpdated` — and
+            # several fills for a freshly fired order can be handled before that
+            # happens. The cache mapping is written synchronously by the rebase
+            # itself, so it is the one signal that does not depend on event
+            # delivery.
+            return
+        link = self._trigger_links.get(order.client_order_id)
+        if link is not None and venue_order_id.value == link.armed_id:
+            return  # The event carries the armed id the order already holds
+        if link is None and order.venue_order_id is None:
+            # Nothing to rebase: `Order.apply` adopts the id an event carries
+            # when the order holds none, which the framework permits.
+            return
+        if link is not None:
+            self._attach_fired_order_id(link, venue_order_id.value)
+        else:
+            self._log.warning(
+                f"{order.client_order_id!r} holds venue order id {order.venue_order_id}, but "
+                f"Gate.io reports it under {venue_order_id.value}; rebasing onto the id the "
+                f"venue is using, since every later event and cancel is addressed by it",
+            )
         self._cache.add_venue_order_id(
             client_order_id=order.client_order_id,
             venue_order_id=venue_order_id,
@@ -2345,7 +2688,7 @@ class GateioExecutionClient(LiveExecutionClient):
             ts_event=ts_event,
             venue_order_id_modified=True,
         )
-        if order.order_type in TRIGGERABLE_ORDER_TYPES:
+        if link is not None and order.order_type in TRIGGERABLE_ORDER_TYPES:
             self.generate_order_triggered(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
@@ -2353,7 +2696,6 @@ class GateioExecutionClient(LiveExecutionClient):
                 venue_order_id=venue_order_id,
                 ts_event=ts_event,
             )
-        return True
 
     def _schedule_fired_order_resolution(
         self,
@@ -2447,15 +2789,13 @@ class GateioExecutionClient(LiveExecutionClient):
     ) -> None:
         """Emit ``OrderUpdated`` when the venue reports an amended order.
 
-        The payload's quantity is the venue's *gross* order size, which is what
-        a Gate.io amend restates and what another session's amend restates too —
-        nothing in the payload distinguishes the two, and nothing should. On spot
-        it is recorded as ``SpotQuantity.gross`` and the order is asked for
-        ``gross - withheld``, so an amend and the base-currency fee compose
-        instead of overwriting each other. Without that, every venue update
-        during a partially filled spot buy would restate the order back to gross
-        and undo the netting — which the next fill would redo, leaving the final
-        state decided by whichever message happened to arrive last.
+        The payload's quantity is the venue's own order size, which is what a
+        Gate.io amend restates and what another session's amend restates too —
+        nothing in the payload distinguishes the two, and nothing should. It is
+        passed on unaltered, spot included: a fill states the quantity the venue
+        matched, gross of any fee withheld from it
+        (:meth:`_fill_quantity_and_commission`), so the order's own quantity has
+        to stay on that footing or its fills could never add up to it.
         """
         if order.order_type == OrderType.MARKET:
             # A market order has no resting price or quantity to amend on
@@ -2479,22 +2819,8 @@ class GateioExecutionClient(LiveExecutionClient):
         if quantity is None:
             return
 
-        if product.is_spot:
-            state = self._spot_quantities.get(order.client_order_id)
-            if state is None:
-                state = SpotQuantity(
-                    gross=quantity.as_decimal(),
-                    matched=order.filled_qty.as_decimal(),
-                )
-                self._spot_quantities[order.client_order_id] = state
-            else:
-                state.gross = quantity.as_decimal()
-            restated = instrument.make_qty(max(state.gross - state.withheld, state.matched))
-        else:
-            restated = quantity
-
         order_price = getattr(order, "price", None)
-        if restated == order.quantity and (price is None or price == order_price):
+        if quantity == order.quantity and (price is None or price == order_price):
             return
 
         self.generate_order_updated(
@@ -2502,7 +2828,7 @@ class GateioExecutionClient(LiveExecutionClient):
             instrument_id=order.instrument_id,
             client_order_id=order.client_order_id,
             venue_order_id=venue_order_id,
-            quantity=restated,
+            quantity=quantity,
             price=price,
             trigger_price=getattr(order, "trigger_price", None),
             ts_event=ts_event,
@@ -2598,7 +2924,7 @@ class GateioExecutionClient(LiveExecutionClient):
                 return
             report = self._parse_fill_report(product, payload, instrument)
             if report is not None:
-                self._send_fill_report(report)
+                self._hand_over_fill(report)
             return
 
         applied = self._applied_trade_ids.setdefault(order.client_order_id, set())
@@ -2609,22 +2935,11 @@ class GateioExecutionClient(LiveExecutionClient):
             return
 
         if order.is_closed:
-            # Gate.io does not order `*.orders` against `*.usertrades`, so a
-            # terminal order message can win the race against the fill that
-            # caused it. `Order.apply` refuses an `OrderFilled` on a closed
-            # order, so the fill goes through the reconciliation path, which
-            # knows how to apply it to an order that has already finished.
-            self._log.warning(
-                f"Fill {trade_id.value} arrived after {order.client_order_id!r} was reported "
-                f"{order.status_string()}; routing it through the reconciliation path",
-            )
             # `_forget_order` already dropped this order's applied-trade set when
             # the terminal message arrived; re-seeding it deliberately keeps a
             # replay of the same late fill from being reported a second time.
             applied.add(trade_id.value)
-            report = self._parse_fill_report(product, payload, instrument)
-            if report is not None:
-                self._send_fill_report(report)
+            self._handle_late_fill(product, order, instrument, payload, trade_id)
             return
 
         last_px = instrument.make_price(to_decimal(payload.get("price")))
@@ -2644,36 +2959,19 @@ class GateioExecutionClient(LiveExecutionClient):
             or self._clock.timestamp_ns()
         )
 
-        if not self._maybe_swap_trigger_venue_order_id(order, venue_order_id, ts_event):
-            # Gate.io orders `*.orders` and `*.usertrades` independently, so this
-            # fill can be the first message that mentions the fired order at all.
-            # The identity could not be reconciled inline, and `Order.apply`
-            # refuses an `OrderFilled` whose venue order id differs from the one
-            # already on the order — the exception is swallowed by the execution
-            # engine, which is how a fill goes missing silently. Report it
-            # through reconciliation instead, where an id mismatch is expected
-            # and resolved against the venue, and say so loudly enough to act on.
-            self._log.error(
-                f"Fill {trade_id.value} carries venue order id {venue_order_id.value}, but "
-                f"{order.client_order_id!r} holds {order.venue_order_id}; the identity could not "
-                f"be reconciled from this event. Routing the fill through reconciliation.",
-            )
-            applied.add(trade_id.value)
-            report = self._parse_fill_report(product, payload, instrument)
-            if report is not None:
-                self._send_fill_report(report)
-            return
+        # Gate.io orders `*.orders` and `*.usertrades` independently, so this
+        # fill can be the first message that mentions a venue-created
+        # replacement order at all. The identity is rebased here rather than
+        # handed to reconciliation: `Order.apply` refuses an `OrderFilled` whose
+        # venue order id differs from the one already on the order, and it
+        # refuses it just the same when the engine builds that fill —
+        # `create_order_filled_event` (live/reconciliation.py:381) stamps it with
+        # `report.venue_order_id`, so a mismatched fill raises `ValueError`
+        # inside `_reconcile_fill_report` and is logged away. `OrderUpdated` is
+        # the one carrier the platform lets change a venue order id.
+        self._maybe_swap_trigger_venue_order_id(order, venue_order_id, ts_event)
 
         self._maybe_convert_quote_quantity(order, instrument, venue_order_id, last_px, ts_event)
-        self._net_withheld_base(
-            product,
-            order,
-            instrument,
-            payload,
-            venue_order_id,
-            last_qty,
-            ts_event,
-        )
 
         applied.add(trade_id.value)
         self.generate_order_filled(
@@ -2699,13 +2997,25 @@ class GateioExecutionClient(LiveExecutionClient):
         payload: dict[str, Any],
         instrument: Instrument,
     ) -> tuple[Quantity, Money]:
-        """Return the fill quantity and commission, netting a base-currency fee.
+        """Return the quantity the venue matched and the fee it charged, unnetted.
 
-        On spot Gate.io deducts the fee from the currency received, so a buy
-        credits slightly less base currency than the fill quantity states.
-        Netting the fee off ``last_qty`` when it is charged in the base currency
-        keeps the Nautilus position equal to the balance the venue actually
-        credited.
+        ``OrderFilled`` states the two as independent facts — ``last_qty`` is
+        "the fill quantity for this execution" and ``commission`` "the fill
+        commission" (docs/concepts/events/order_filled.md) — so both are reported
+        exactly as the venue published them.
+
+        Netting a spot base-currency fee off the quantity looks right, because
+        Gate.io deducts its fee from the currency being bought and credits
+        ``amount - fee`` base units for a match of ``amount``. The platform
+        already does that, once and for itself: ``Position.apply``
+        (model/position.pyx:591-612) raises a
+        ``PositionAdjusted(COMMISSION, -commission)`` for every fill on a
+        ``CurrencyPair`` whose commission is charged in the base currency, and
+        ``apply_adjustment`` subtracts it from ``signed_qty``. Netting here as
+        well subtracts the same fee twice and leaves every spot BUY position
+        short by the cumulative fee — concepts/positions.md, "Base currency
+        commissions": a buy of 1.0 BTC with a 0.001 BTC commission is a net long
+        position of 0.999 BTC, *from a fill of 1.0*.
         """
         fee = to_decimal(payload.get("fee"))
         if product.is_spot:
@@ -2714,9 +3024,6 @@ class GateioExecutionClient(LiveExecutionClient):
                 default=instrument.quote_currency.code,
             )
             quantity = to_decimal(payload.get("amount"))
-            base_currency = getattr(instrument, "base_currency", None)
-            if base_currency is not None and fee_currency == base_currency and fee > 0:
-                quantity = max(Decimal(0), quantity - fee)
             return instrument.make_qty(quantity), Money(fee, fee_currency)
 
         settlement = getattr(instrument, "settlement_currency", instrument.quote_currency)
@@ -2740,12 +3047,11 @@ class GateioExecutionClient(LiveExecutionClient):
         the venue's own fill price before the first fill is applied, so that
         position and PnL arithmetic downstream works in one unit.
         """
-        if order.client_order_id in self._spot_quantities:
-            # This order's quantity is already tracked in base units, so the
-            # conversion has either happened or is not needed. Both guards below
-            # read the order, which still carries its pre-update state while the
-            # engine's queue is undrained, so a second fill in the same frame
-            # would otherwise convert a second time.
+        if order.client_order_id in self._quote_quantity_converted:
+            # This order's quantity is already stated in base units. Both guards
+            # below read the order, which still carries its pre-update state
+            # while the engine's queue is undrained, so a second fill in the same
+            # frame would otherwise convert a second time.
             return
         if not order.is_quote_quantity or order.filled_qty.as_decimal() > 0:
             return
@@ -2753,9 +3059,7 @@ class GateioExecutionClient(LiveExecutionClient):
         if price <= 0:
             return
         base_quantity = instrument.make_qty(order.quantity.as_decimal() / price)
-        self._spot_quantities[order.client_order_id] = SpotQuantity(
-            gross=base_quantity.as_decimal(),
-        )
+        self._quote_quantity_converted.add(order.client_order_id)
         self.generate_order_updated(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -2764,127 +3068,6 @@ class GateioExecutionClient(LiveExecutionClient):
             quantity=base_quantity,
             price=getattr(order, "price", None),
             trigger_price=None,
-            ts_event=ts_event,
-            is_quote_quantity=False,
-        )
-
-    def _net_withheld_base(
-        self,
-        product: GateioProductType,
-        order: Order,
-        instrument: Instrument,
-        payload: dict[str, Any],
-        venue_order_id: VenueOrderId,
-        last_qty: Quantity,
-        ts_event: int,
-    ) -> None:
-        """Fold one spot fill into the order's quantity bookkeeping and restate it.
-
-        Gate.io charges a spot BUY fee in the currency being bought, so it
-        credits ``amount - fee`` base units for a match of ``amount``.
-        ``_fill_quantity_and_commission`` nets that off ``last_qty`` (EXEC-4), so
-        the order's fills can never add up to the quantity it was submitted with:
-        the shortfall is exactly the cumulative fee, and it is not a quantity
-        still working at the venue. Left alone, a fully matched buy ends with
-        zero remaining quantity and status PARTIALLY_FILLED, and stays in
-        ``cache.orders_open()`` for the rest of the session.
-
-        Restating the order is the only way out, and it has to happen *before*
-        the closing fill: ``Order.apply(OrderUpdated)`` never triggers a terminal
-        status, so an update that arrives after the last fill lands leaves the
-        order at zero remaining quantity and still open — which is precisely what
-        the REST report path does when the stream applied the fill first. The
-        same reasoning already governs ``_maybe_convert_quote_quantity``.
-
-        What is recorded here is the fee itself, not the quantity it implies:
-        ``SpotQuantity.withheld`` grows by this fill's withheld base and
-        ``gross`` is left alone, because only the venue moves ``gross``. The
-        target quantity is then always ``gross - withheld``, whoever last
-        amended the order — which is the difference between this and a shadow
-        copy of the order's quantity, and the reason an amend between two fills
-        now survives instead of being discarded.
-
-        The withheld amount is derived from ``last_qty`` rather than from the
-        payload's ``fee`` so that both sides carry the same rounding: netting the
-        raw fee here and a rounded fee into the fill would reintroduce the gap
-        this method exists to close, one dust unit at a time.
-        """
-        if not product.is_spot:
-            return  # Derivative fees are charged in the settlement currency
-
-        state = self._spot_quantities.get(order.client_order_id)
-        if state is None:
-            if order.is_quote_quantity:
-                # A quote-denominated spot market buy whose conversion could not
-                # run (the venue published no usable fill price). Its quantity is
-                # a cash amount, and netting base units off cash means nothing.
-                self._log.warning(
-                    f"Not restating {order.client_order_id!r}: its quantity is still "
-                    f"denominated in {instrument.quote_currency}, so the base-currency fee "
-                    f"withheld from fill {payload.get('id')!r} cannot be netted off it",
-                )
-                return
-            state = SpotQuantity(
-                gross=order.quantity.as_decimal(),
-                matched=order.filled_qty.as_decimal(),
-            )
-            self._spot_quantities[order.client_order_id] = state
-
-        state.matched += last_qty.as_decimal()
-        state.withheld += max(
-            Decimal(0),
-            to_decimal(payload.get("amount")) - last_qty.as_decimal(),
-        )
-        self._restate_spot_quantity(order, instrument, venue_order_id, ts_event, state)
-
-    def _restate_spot_quantity(
-        self,
-        order: Order,
-        instrument: Instrument,
-        venue_order_id: VenueOrderId,
-        ts_event: int,
-        state: SpotQuantity,
-    ) -> None:
-        """Ask the engine for ``gross - withheld``, the only quantity that composes.
-
-        ``gross - matched`` is what the venue is still working, and netting the
-        fee off the order's quantity has to leave that untouched: with the order
-        at ``gross - withheld`` and its fills summing to ``matched - withheld``,
-        the remaining quantity reads ``gross - matched`` exactly. It reaches zero
-        when the venue has matched the order in full and never before, whether or
-        not the venue amended the order along the way.
-
-        ``is_quote_quantity`` is stated rather than inherited: ``generate_order_updated``
-        resolves ``None`` from the *cached* order, which still reads ``True``
-        while the conversion's own ``OrderUpdated`` sits in the engine's queue, so
-        inheriting it would re-flag a base-denominated quantity as quote.
-        """
-        target = state.gross - state.withheld
-        if target < state.matched:
-            # The venue would have to have amended the order below what it has
-            # already matched. Nothing this client can express is below its own
-            # fills, so clamp and say so rather than emit a quantity that makes
-            # `leaves_qty` negative.
-            self._log.warning(
-                f"Clamping the restated quantity of {order.client_order_id!r} from {target} "
-                f"to {state.matched}: the venue's order size ({state.gross}) less the "
-                f"base-currency fees it withheld ({state.withheld}) is below what it has "
-                f"already credited",
-            )
-            target = state.matched
-
-        quantity = instrument.make_qty(target)
-        if quantity == order.quantity:
-            return
-
-        self.generate_order_updated(
-            strategy_id=order.strategy_id,
-            instrument_id=order.instrument_id,
-            client_order_id=order.client_order_id,
-            venue_order_id=venue_order_id,
-            quantity=quantity,
-            price=getattr(order, "price", None),
-            trigger_price=getattr(order, "trigger_price", None),
             ts_event=ts_event,
             is_quote_quantity=False,
         )
@@ -3897,21 +4080,6 @@ class GateioExecutionClient(LiveExecutionClient):
             ts_init=ts_init,
         )
 
-    @staticmethod
-    def _base_currency_fee(payload: dict[str, Any], instrument: Instrument) -> Decimal:
-        """Return the payload's fee when it is charged in the base currency, else zero.
-
-        Gate.io deducts a spot fee from the currency received, so a buy credits
-        slightly less base currency than the raw ``filled_amount`` states.
-        """
-        base_currency = getattr(instrument, "base_currency", None)
-        if base_currency is None:
-            return Decimal(0)
-        fee_currency = str(payload.get("fee_currency") or "").upper()
-        if fee_currency != base_currency.code:
-            return Decimal(0)
-        return max(Decimal(0), to_decimal(payload.get("fee")))
-
     def _parse_spot_order_fields(
         self,
         payload: dict[str, Any],
@@ -3933,20 +4101,14 @@ class GateioExecutionClient(LiveExecutionClient):
                 return None
             amount = filled
 
-        # The event stream nets a base-currency fee off every fill quantity, so
-        # the report has to net the cumulative fee off the filled quantity too.
-        # Without this the report claims a larger filled quantity than the fills
-        # that produced it: reconciliation then sees the order as permanently
-        # short of its own report, never closes it, and synthesises a fill.
-        fee = self._base_currency_fee(payload, instrument)
-        if fee > 0:
-            fully_filled = filled > 0 and (to_decimal(payload.get("left")) <= 0 or filled >= amount)
-            filled = max(Decimal(0), filled - fee)
-            if fully_filled:
-                # A fully filled order can never report a quantity its own fills
-                # cannot reach, or it would stay open forever.
-                amount = filled
-
+        # `filled_amount` and `amount` are passed on as the venue states them,
+        # base-currency fee and all. The report and the fills have to describe
+        # the same order in the same units: `_should_update` (installed
+        # live/execution_engine.py:3307) restates the order to `report.quantity`
+        # whenever it differs, and `_handle_fill_quantity_mismatch` (:3164)
+        # compares `report.filled_qty` against the sum of the fills, so a report
+        # netted of a fee the fills are not would have the engine restating the
+        # quantity on one pass and inferring a phantom fill on the next.
         if amount <= 0:
             return None
         price_value = payload.get("price")
@@ -4574,6 +4736,7 @@ def _trigger_type(price_type: Any) -> TriggerType:
 
 __all__ = [
     "CONDITIONAL_ORDER_TYPES",
+    "FILLABLE_TERMINAL_STATUSES",
     "SUPPORTED_ORDER_TYPES",
     "TRIGGERABLE_ORDER_TYPES",
     "GateioExecutionClient",

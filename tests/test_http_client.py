@@ -399,6 +399,57 @@ async def test_persistent_5xx_on_a_get_raises_after_max_retries():
     assert client.backoffs == [1, 2]  # type: ignore[attr-defined]
 
 
+async def test_a_replayed_cancel_that_is_never_answered_is_ambiguous():
+    """Replaying makes a duplicate harmless, not the outcome known.
+
+    A ``DELETE`` is replayed, so it used to end in a plain ``NETWORK_ERROR``,
+    which reads as "this definitely did not happen". For a cancel that is the
+    wrong half of the truth: the venue may have applied it and lost the answer.
+    """
+    log: list[httpx.Request] = []
+    handler = counting_handler([httpx.ReadTimeout("timed out")], log)
+    client = make_client(handler, api_key="k", api_secret="s", max_retries=3)
+
+    with pytest.raises(GateioRequestAmbiguousError) as excinfo:
+        await client.delete("/spot/orders/1001", params={"currency_pair": "BTC_USDT"})
+
+    assert len(log) == 3
+    assert excinfo.value.label == "REQUEST_AMBIGUOUS"
+    assert "reconcile" in excinfo.value.message
+
+
+async def test_a_request_that_never_left_the_process_stays_definitive():
+    """No byte was sent on any attempt, so the venue cannot have seen it."""
+    log: list[httpx.Request] = []
+    handler = counting_handler([httpx.ConnectError("connection refused")], log)
+    client = make_client(handler, api_key="k", api_secret="s", max_retries=3)
+
+    with pytest.raises(GateioError) as excinfo:
+        await client.delete("/spot/orders/1001", params={"currency_pair": "BTC_USDT"})
+
+    assert len(log) == 3
+    assert excinfo.value.label == "NETWORK_ERROR"
+    assert not isinstance(excinfo.value, GateioRequestAmbiguousError)
+
+
+async def test_an_answered_attempt_makes_later_unsent_failures_ambiguous():
+    """The venue answered once; a later connect failure cannot unsay that."""
+    log: list[httpx.Request] = []
+    handler = counting_handler(
+        [
+            httpx.Response(500, json={"label": "SERVER_ERROR", "message": "internal"}),
+            httpx.ConnectError("connection refused"),
+        ],
+        log,
+    )
+    client = make_client(handler, api_key="k", api_secret="s", max_retries=3)
+
+    with pytest.raises(GateioRequestAmbiguousError):
+        await client.delete("/spot/orders/1001", params={"currency_pair": "BTC_USDT"})
+
+    assert len(log) == 3
+
+
 async def test_idempotent_method_set_is_explicit():
     assert IDEMPOTENT_METHODS == {"GET", "HEAD", "OPTIONS", "DELETE"}
 

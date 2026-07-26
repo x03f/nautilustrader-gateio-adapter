@@ -986,3 +986,348 @@ class TestOrderRouting:
         assert CONDITIONAL_ORDER_TYPES <= SUPPORTED_ORDER_TYPES
         assert OrderType.LIMIT_IF_TOUCHED in CONDITIONAL_ORDER_TYPES
         assert OrderType.MARKET not in CONDITIONAL_ORDER_TYPES
+
+
+# -- display quantity: `iceberg` cannot carry every Nautilus instruction -------
+
+
+class TestDisplayQuantity:
+    """Regression: a fully hidden order used to be submitted fully displayed.
+
+    NautilusTrader reads ``display_qty=0`` as "hidden" (concepts/orders, "Display
+    quantity"); Gate.io reads ``iceberg=0`` as "normal order" and states that
+    hiding the whole amount is not supported. Passing the zero through therefore
+    broadcast the entire size to the book.
+    """
+
+    def test_spot_limit_sends_the_displayed_portion(self, harness):
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+            display_qty=Quantity.from_str("0.001000"),
+        )
+        body = harness.run(
+            harness.client._build_spot_order(order, harness.instruments[0], "BTC_USDT"),
+        )
+
+        assert body["iceberg"] == "0.001000"
+
+    def test_spot_hidden_order_is_refused_not_inverted(self, harness):
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+            display_qty=Quantity.from_str("0.000000"),
+        )
+        _submit(harness, order)
+
+        rejected = _rejections(harness)
+        assert len(rejected) == 1
+        assert "hiding the whole amount" in rejected[0].reason
+        assert not harness.spot.called("create_order")
+
+    def test_futures_hidden_order_is_refused_not_inverted(self):
+        env = ExecHarness(products=(GateioProductType.PERP,))
+        try:
+            order = env.order_factory.limit(
+                PERP_BTC_USDT,
+                OrderSide.SELL,
+                Quantity.from_int(10),
+                Price.from_str("60000.0"),
+                display_qty=Quantity.from_int(0),
+            )
+            _submit(env, order)
+
+            rejected = _rejections(env)
+            assert len(rejected) == 1
+            assert "hiding the whole amount" in rejected[0].reason
+            assert not env.perp.called("create_order")
+        finally:
+            env.close()
+
+    def test_options_hidden_order_is_refused_not_inverted(self):
+        env = ExecHarness(products=(GateioProductType.OPT,))
+        try:
+            order = env.order_factory.limit(
+                OPT_BTC_USDT,
+                OrderSide.SELL,
+                Quantity.from_int(4),
+                Price.from_str("25"),
+                display_qty=Quantity.from_int(0),
+            )
+            _submit(env, order)
+
+            rejected = _rejections(env)
+            assert len(rejected) == 1
+            assert "hiding the whole amount" in rejected[0].reason
+            assert not env.options.called("create_order")
+        finally:
+            env.close()
+
+    def test_a_fractional_contract_display_is_refused_not_truncated(self):
+        """``int(Decimal("0.5"))`` is 0, which the venue reads as full display."""
+        env = ExecHarness(products=(GateioProductType.PERP,))
+        try:
+            order = env.order_factory.limit(
+                PERP_BTC_USDT,
+                OrderSide.SELL,
+                Quantity.from_int(10),
+                Price.from_str("60000.0"),
+                display_qty=Quantity.from_str("0.5"),
+            )
+            _submit(env, order)
+
+            rejected = _rejections(env)
+            assert len(rejected) == 1
+            assert "whole contracts" in rejected[0].reason
+            assert not env.perp.called("create_order")
+        finally:
+            env.close()
+
+    def test_a_whole_contract_display_is_still_sent(self):
+        env = ExecHarness(products=(GateioProductType.PERP,))
+        try:
+            order = env.order_factory.limit(
+                PERP_BTC_USDT,
+                OrderSide.SELL,
+                Quantity.from_int(10),
+                Price.from_str("60000.0"),
+                display_qty=Quantity.from_int(2),
+            )
+            body = env.client._build_futures_order(order, "BTC_USDT")
+
+            assert body["iceberg"] == 2
+        finally:
+            env.close()
+
+
+# -- post-only is a liquidity constraint, not a time in force ------------------
+
+
+class TestPostOnlyWithImmediateTimeInForce:
+    """Regression: ``post_only=True`` used to override IOC and FOK into ``poc``.
+
+    ``poc`` is Gate.io's maker-only *resting* order, so an order the strategy
+    expects to be gone within milliseconds instead rested at the venue until
+    cancelled and could fill later at a stale price.
+    """
+
+    @pytest.mark.parametrize("tif", [TimeInForce.IOC, TimeInForce.FOK])
+    def test_spot_limit_is_refused(self, harness, tif):
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+            time_in_force=tif,
+            post_only=True,
+        )
+        _submit(harness, order)
+
+        rejected = _rejections(harness)
+        assert len(rejected) == 1
+        assert "post-only cannot be combined" in rejected[0].reason
+        assert not harness.spot.called("create_order")
+
+    @pytest.mark.parametrize("tif", [TimeInForce.IOC, TimeInForce.FOK])
+    def test_futures_limit_is_refused(self, tif):
+        env = ExecHarness(products=(GateioProductType.PERP,))
+        try:
+            order = env.order_factory.limit(
+                PERP_BTC_USDT,
+                OrderSide.BUY,
+                Quantity.from_int(10),
+                Price.from_str("60000.0"),
+                time_in_force=tif,
+                post_only=True,
+            )
+            _submit(env, order)
+
+            rejected = _rejections(env)
+            assert len(rejected) == 1
+            assert "post-only cannot be combined" in rejected[0].reason
+            assert not env.perp.called("create_order")
+        finally:
+            env.close()
+
+    def test_options_limit_is_refused(self):
+        """Options reject FOK first, so IOC is what exercises this path there."""
+        env = ExecHarness(products=(GateioProductType.OPT,))
+        try:
+            order = env.order_factory.limit(
+                OPT_BTC_USDT,
+                OrderSide.BUY,
+                Quantity.from_int(1),
+                Price.from_str("25"),
+                time_in_force=TimeInForce.IOC,
+                post_only=True,
+            )
+            _submit(env, order)
+
+            rejected = _rejections(env)
+            assert len(rejected) == 1
+            assert "post-only cannot be combined" in rejected[0].reason
+            assert not env.options.called("create_order")
+        finally:
+            env.close()
+
+    def test_post_only_gtc_is_still_sent_as_poc(self, harness):
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+            post_only=True,
+        )
+        body = harness.run(
+            harness.client._build_spot_order(order, harness.instruments[0], "BTC_USDT"),
+        )
+
+        assert body["time_in_force"] == "poc"
+
+
+# -- off-tick prices: the grid is not implied by the precision ----------------
+
+
+ODD_TICK_PERP_PAYLOAD: dict[str, Any] = {
+    **PERP_CONTRACT_PAYLOAD,
+    "name": "BNB_USDT",
+    "quanto_multiplier": "0.001",
+    "order_price_round": "0.05",
+    "mark_price_round": "0.05",
+}
+
+ODD_TICK_PERP_ID = InstrumentId.from_str("BNB_USDT-PERP.GATE_IO")
+
+
+def _odd_tick_harness() -> ExecHarness:
+    instrument = parse_perpetual_instrument(ODD_TICK_PERP_PAYLOAD, GateioProductType.PERP)
+    assert instrument is not None
+    return ExecHarness(products=(GateioProductType.PERP,), instruments=[instrument])
+
+
+class TestOffTickPrices:
+    """Regression: BNB_USDT quotes two decimals but ticks in 0.05.
+
+    ``make_price`` rounds to the precision only, and the ``RiskEngine`` compares
+    precisions rather than increments, so four of every five two-decimal prices
+    used to reach the venue and come back as an opaque parameter error.
+    """
+
+    def test_make_price_alone_is_not_enough(self):
+        """The premise: the platform's own factory method still returns off-tick."""
+        env = _odd_tick_harness()
+        try:
+            instrument = env.instruments[0]
+            assert instrument.make_price(Decimal("612.33")) == Price.from_str("612.33")
+            assert instrument.next_bid_price(612.33) == Price.from_str("612.30")
+        finally:
+            env.close()
+
+    def test_an_off_tick_limit_price_is_refused(self):
+        env = _odd_tick_harness()
+        try:
+            order = env.order_factory.limit(
+                ODD_TICK_PERP_ID,
+                OrderSide.BUY,
+                Quantity.from_int(10),
+                Price.from_str("612.33"),
+            )
+            _submit(env, order)
+
+            rejected = _rejections(env)
+            assert len(rejected) == 1
+            assert "not a multiple of" in rejected[0].reason
+            assert not env.perp.called("create_order")
+        finally:
+            env.close()
+
+    def test_an_on_tick_limit_price_is_sent(self):
+        env = _odd_tick_harness()
+        try:
+            order = env.order_factory.limit(
+                ODD_TICK_PERP_ID,
+                OrderSide.BUY,
+                Quantity.from_int(10),
+                Price.from_str("612.35"),
+            )
+            _submit(env, order)
+
+            assert _rejections(env) == []
+            assert env.perp.calls_named("create_order")[0].body["price"] == "612.35"
+        finally:
+            env.close()
+
+    def test_an_off_tick_trigger_price_is_refused(self):
+        env = _odd_tick_harness()
+        try:
+            order = env.order_factory.stop_market(
+                ODD_TICK_PERP_ID,
+                OrderSide.SELL,
+                Quantity.from_int(10),
+                Price.from_str("600.02"),
+            )
+            _submit(env, order)
+
+            rejected = _rejections(env)
+            assert len(rejected) == 1
+            assert "trigger price" in rejected[0].reason
+            assert not env.perp.called("create_price_order")
+        finally:
+            env.close()
+
+    def test_an_off_tick_amend_price_is_refused(self):
+        from nautilus_trader.core.uuid import UUID4
+        from nautilus_trader.execution.messages import ModifyOrder
+        from nautilus_trader.model.events import OrderModifyRejected
+
+        env = _odd_tick_harness()
+        try:
+            order = env.accepted(
+                env.order_factory.limit(
+                    ODD_TICK_PERP_ID,
+                    OrderSide.BUY,
+                    Quantity.from_int(10),
+                    Price.from_str("612.35"),
+                ),
+                venue_order_id="5001",
+            )
+            env.run(
+                env.client._modify_order(
+                    ModifyOrder(
+                        trader_id=env.trader_id,
+                        strategy_id=env.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=VenueOrderId("5001"),
+                        quantity=None,
+                        price=Price.from_str("612.33"),
+                        trigger_price=None,
+                        command_id=UUID4(),
+                        ts_init=env.clock.timestamp_ns(),
+                    ),
+                ),
+            )
+
+            rejected = env.events_of(OrderModifyRejected)
+            assert len(rejected) == 1
+            assert "not a multiple of" in rejected[0].reason
+            assert not env.perp.called("amend_order")
+        finally:
+            env.close()
+
+    def test_a_power_of_ten_grid_never_trips_the_guard(self, harness):
+        """Any price of the right precision is already on a power-of-ten grid."""
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.07"),
+        )
+        _submit(harness, order)
+
+        assert _rejections(harness) == []
+        assert harness.spot.called("create_order")

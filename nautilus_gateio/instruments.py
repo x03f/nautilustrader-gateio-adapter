@@ -43,6 +43,18 @@ represent (``None`` plus a warning) instead of clamping it. The same guard
 covers contract products, whose tick comes from ``order_price_round``: a tick
 that rounds away to zero is rejected rather than published.
 
+Tick schemes
+------------
+Every instrument built here carries a ``tick_scheme_name``, so
+``Instrument.next_bid_price`` / ``next_ask_price`` work instead of raising. Most
+Gate.io grids are a plain power of ten and use the platform's pre-registered
+``FIXED_PRECISION_{n}``. A few contracts do not: ``BNB_USDT`` perpetuals and the
+longer-dated ``ETH_USDT`` delivery contracts publish ``order_price_round`` of
+``0.05``, so their valid prices are 2-decimal *and* multiples of ``0.05``.
+Precision alone cannot express that, and ``make_price`` only quantises to the
+precision, so those grids get a registered ``FixedTickScheme`` with the venue
+increment (see :func:`_tick_scheme_name`).
+
 Margins
 -------
 Gate.io's contract payloads publish no initial-margin *rate*. ``leverage_max``
@@ -83,6 +95,12 @@ from nautilus_trader.model.objects import (
     Price,
     Quantity,
 )
+from nautilus_trader.model.tick_scheme import (
+    FixedTickScheme,
+    get_tick_scheme,
+    register_tick_scheme,
+)
+from nautilus_trader.model.tick_scheme.base import list_tick_schemes
 
 from nautilus_gateio.common.enums import GateioProductType
 from nautilus_gateio.common.parsing import (
@@ -118,6 +136,9 @@ INVERSE_CONTRACT_FACE_VALUE: Final[Decimal] = Decimal(1)
 #: the account leverage, so the full notional is reserved at 1x.
 CONTRACT_MARGIN_INIT: Final[Decimal] = Decimal(1)
 
+#: Prefix of the tick schemes this module registers for Gate.io's non-decimal grids.
+TICK_SCHEME_PREFIX: Final[str] = "GATEIO_TICK"
+
 _LOG: Final[Logger] = Logger(name="GateioInstruments")
 
 
@@ -134,6 +155,58 @@ class _ContractSpec(NamedTuple):
     taker_fee: Decimal
     margin_init: Decimal
     margin_maint: Decimal
+
+
+# -- tick schemes --------------------------------------------------------------
+
+
+def _tick_scheme_name(price_precision: int, price_increment: Price) -> str:
+    """Return the registered tick scheme describing this instrument's price grid.
+
+    NautilusTrader pre-registers a ``FIXED_PRECISION_{n}`` scheme for every
+    representable precision (``model/tick_scheme/implementations/fixed.pyx``),
+    whose increment is ``10**-n``. That is the correct scheme for the ~3,100
+    Gate.io instruments whose ``order_price_round`` is a power of ten, and it is
+    what the in-tree Tardis adapter uses for every instrument it builds.
+
+    It is the *wrong* scheme for a contract that ticks in ``0.05``: it would walk
+    the price in ``0.01`` steps and hand back prices Gate.io refuses. Naming the
+    precision alone cannot express such a grid, so those instruments get their
+    own ``FixedTickScheme`` carrying the venue increment — the platform type that
+    exists for exactly this, rather than a rounding helper of our own. The bounds
+    are borrowed from the stock scheme of the same precision so that the grid is
+    the only thing that differs.
+
+    Lookup precedes registration because registration is process-global and
+    ``register_tick_scheme`` refuses a duplicate name: the providers re-parse
+    every instrument on each load, and a reload must not raise.
+    """
+    increment = price_increment.as_decimal()
+    if increment == Decimal(1).scaleb(-price_precision):
+        return f"FIXED_PRECISION_{price_precision}"
+
+    # The precision belongs in the name as well as the increment: a scheme
+    # returns its prices at its own precision, so two grids sharing an increment
+    # but not a precision are not the same scheme.
+    name = f"{TICK_SCHEME_PREFIX}_{increment:f}_P{price_precision}"
+    if name not in list_tick_schemes():
+        stock = get_tick_scheme(f"FIXED_PRECISION_{price_precision}")
+        register_tick_scheme(
+            FixedTickScheme(
+                name=name,
+                price_precision=price_precision,
+                min_tick=stock.min_price,
+                max_tick=stock.max_price,
+                # `increment` is documented as a float, and the scheme parses it
+                # back with `Price.from_str(str(increment))`. A `Decimal` happens
+                # to survive that too and would avoid the binary round-trip, but
+                # relying on an unenforced annotation is not worth it: every tick
+                # the venue publishes has few enough significant digits that the
+                # float representation is exact.
+                increment=float(increment),
+            ),
+        )
+    return name
 
 
 # -- public parsers ------------------------------------------------------------
@@ -177,6 +250,7 @@ def parse_spot_instrument(
         size_precision = _representable_precision(payload["amount_precision"], "size precision")
 
         maker, taker = _spot_fees(payload, fee_maker, fee_taker)
+        price_increment = _increment_price(price_precision, "price precision")
 
         return CurrencyPair(
             instrument_id=gateio_to_instrument_id(GateioProductType.SPOT, raw_symbol),
@@ -185,8 +259,9 @@ def parse_spot_instrument(
             quote_currency=quote,
             price_precision=price_precision,
             size_precision=size_precision,
-            price_increment=_increment_price(price_precision, "price precision"),
+            price_increment=price_increment,
             size_increment=_increment_quantity(size_precision),
+            tick_scheme_name=_tick_scheme_name(price_precision, price_increment),
             ts_event=ts_init,
             ts_init=ts_init,
             lot_size=None,
@@ -249,6 +324,7 @@ def parse_perpetual_instrument(
             size_precision=0,
             price_increment=spec.price_increment,
             size_increment=spec.size_increment,
+            tick_scheme_name=_tick_scheme_name(spec.price_precision, spec.price_increment),
             ts_event=_contract_ts_event(contract_payload, ts_init),
             ts_init=ts_init,
             multiplier=spec.multiplier,
@@ -306,6 +382,7 @@ def parse_delivery_instrument(
             size_precision=0,
             price_increment=spec.price_increment,
             size_increment=spec.size_increment,
+            tick_scheme_name=_tick_scheme_name(spec.price_precision, spec.price_increment),
             ts_event=_contract_ts_event(contract_payload, ts_init),
             ts_init=ts_init,
             multiplier=spec.multiplier,
@@ -391,6 +468,7 @@ def parse_option_instrument(
             size_precision=0,
             price_increment=price_increment,
             size_increment=size_increment,
+            tick_scheme_name=_tick_scheme_name(price_precision, price_increment),
             ts_event=_contract_ts_event(contract_payload, ts_init),
             ts_init=ts_init,
             multiplier=multiplier,

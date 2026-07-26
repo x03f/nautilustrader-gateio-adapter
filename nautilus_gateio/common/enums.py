@@ -11,6 +11,7 @@ from nautilus_trader.model.enums import (
     OrderStatus,
     OrderType,
     TimeInForce,
+    time_in_force_to_str,
 )
 
 
@@ -154,11 +155,29 @@ def time_in_force_to_gateio(
 ) -> GateioTimeInForce:
     """Map a Nautilus time in force onto Gate.io's vocabulary.
 
-    ``post_only`` takes precedence and maps to ``poc``. Raises ``ValueError`` for
-    values Gate.io cannot express, so the caller can reject the order explicitly
-    instead of silently downgrading it.
+    Gate.io has no separate post-only flag: the constraint is expressed by the
+    time-in-force value ``poc``, a maker-only order that *rests* until it is
+    cancelled. A post-only GTC order is therefore ``poc``, and nothing is lost.
+
+    IOC and FOK are a different matter. NautilusTrader models post-only as a
+    liquidity constraint orthogonal to the time in force (concepts/orders,
+    "Post-only" and "Time in force"), so ``LIMIT``/``IOC``/``post_only`` asks for
+    an order that is maker-only *and* gone within milliseconds. Sending ``poc``
+    would keep the first half and discard the second, leaving a resting order the
+    caller expects to have self-cancelled — the kind of substitution the platform
+    tells an adapter not to make ("If an order includes an instruction or option
+    the target venue does not support, the system does not submit it"). Both
+    combinations therefore raise, like every other value Gate.io cannot express.
     """
     if post_only:
+        if time_in_force in (TimeInForce.IOC, TimeInForce.FOK):
+            raise ValueError(
+                f"post-only cannot be combined with {time_in_force_to_str(time_in_force)} on "
+                f"Gate.io: post-only is the `poc` time in force, a maker-only order that rests "
+                f"until cancelled, so the immediacy of "
+                f"{time_in_force_to_str(time_in_force)} cannot survive. Submit the order either "
+                f"post-only (GTC) or immediate, not both"
+            )
         return GateioTimeInForce.POC
     if time_in_force == TimeInForce.GTC:
         return GateioTimeInForce.GTC
@@ -167,7 +186,7 @@ def time_in_force_to_gateio(
     if time_in_force == TimeInForce.FOK:
         return GateioTimeInForce.FOK
     raise ValueError(
-        f"time in force {time_in_force!r} is not supported by Gate.io "
+        f"time in force {time_in_force_to_str(time_in_force)} is not supported by Gate.io "
         f"(supported: GTC, IOC, FOK, and post-only via POC)"
     )
 

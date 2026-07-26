@@ -151,7 +151,7 @@ venue trade id that de-duplication depends on.
 | MARKET, spot BUY with a base quantity | aggressive IOC `limit` priced by the pair's published `slippage` cap |
 | MARKET, futures and delivery | `price="0"` with `tif=ioc` (`fok` honoured) |
 | MARKET, options | `price="0"` with `tif=ioc`; `fok` is rejected |
-| LIMIT | `price`, `tif` `gtc`/`ioc`/`fok`; post-only maps to `poc` |
+| LIMIT | `price`, `tif` `gtc`/`ioc`/`fok`; post-only GTC maps to `poc` |
 | STOP_MARKET, STOP_LIMIT, MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED | the product's price-triggered ("auto order") endpoint |
 
 Supported order types are exactly:
@@ -165,11 +165,23 @@ MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED. Anything else is **denied** before a
 network call, with the reason on the `OrderDenied` event.
 `CONDITIONAL_ORDER_TYPES` is the subset routed to the price-triggered endpoint.
 
-Time in force: GTC, IOC and FOK, plus post-only through `poc`. Flags honoured:
-`reduce_only` (derivatives only), `display_qty` (iceberg, regular orders only),
-`quote_quantity` (spot market buy only). Sizes on futures, delivery and options
-are **contract counts**, sent as a signed integer — positive for a buy, negative
-for a sell.
+Time in force: GTC, IOC and FOK, plus post-only through `poc`. Post-only is
+Gate.io's `poc` time in force — a maker-only order that *rests* — so it composes
+with GTC and is refused, not substituted, when it is combined with IOC or FOK.
+Flags honoured: `reduce_only` (derivatives only), `display_qty` (iceberg, regular
+orders only, and never zero — see below), `quote_quantity` (spot market buy
+only). Sizes on futures, delivery and options are **contract counts**, sent as a
+signed integer — positive for a buy, negative for a sell.
+
+Order prices must sit on the instrument's tick grid. On almost every Gate.io
+instrument the tick is a power of ten and any price of the right precision
+qualifies, but a few contracts quote two decimals and tick in `0.05` (the
+`BNB_USDT` perpetual and the longer-dated `ETH_USDT` delivery contracts).
+`Instrument.make_price()` rounds to the *precision*, not to the tick, so it can
+return an off-grid price on those; every instrument this adapter builds carries a
+tick scheme, so use `instrument.next_bid_price()` / `next_ask_price()` to price
+on the grid. An off-grid price is rejected before the request, on submit and on
+amend.
 
 One translation is worth singling out because it is not literal:
 
@@ -196,8 +208,12 @@ being changed into something the venue does accept:
 | `quote_quantity=True` anywhere but a spot market buy | rejected |
 | `quote_quantity=True` on a spot market **sell** | rejected — Gate.io market sells take a base amount |
 | post-only on a market order | rejected |
+| post-only combined with IOC or FOK | rejected — `poc` is a resting maker-only order, so the immediacy could not survive the substitution |
 | FOK on an options order | rejected — the venue offers `gtc`, `ioc` and `poc` there |
 | Fractional contract quantity on a derivative | rejected — contracts are whole |
+| `display_qty=0` (a fully hidden order) | rejected — Gate.io reads `iceberg=0` as a normal, fully displayed order and does not support hiding the whole amount |
+| A fractional `display_qty` on a derivative | rejected — the iceberg quantity is a contract count, and truncating it to zero would display the whole order |
+| A price or trigger price off the instrument's tick grid | rejected — the venue accepts on-tick prices only, and moving the price to the nearest tick would submit a different order |
 | Price-triggered order on options | unsupported — the venue has no such endpoint for options |
 | Price-triggered spot order under `CROSS_MARGIN` | rejected — the venue's spot price-trigger endpoint has no cross-margin ledger |
 | post-only or `display_qty` on a price-triggered order | rejected — the fired order accepts neither, and dropping the flag would submit a materially different order |
@@ -205,8 +221,8 @@ being changed into something the venue does accept:
 | A base-denominated spot market buy with no reference price available | rejected, suggesting `quote_quantity=True` |
 | Amending the trigger price of a working order | rejected — the venue cannot do it |
 
-Four exceptions to the rule, stated here rather than buried. The first is by
-design; the last three are places where the client currently does adjust the
+Three exceptions to the rule, stated here rather than buried. The first is by
+design; the other two are places where the client currently does adjust the
 order, and you should know which:
 
 * **GTD is accepted on a conditional order**, where it describes how long the
@@ -221,11 +237,6 @@ order, and you should know which:
   so AT_THE_OPEN and AT_THE_CLOSE are accepted there and silently sent as `ioc`
   rather than rejected. Treat the spot market path as accepting IOC and FOK
   only.
-* **`post_only=True` overrides the time in force.** It maps to `poc`, which is
-  Gate.io's maker-only *resting* order. A post-only limit order submitted with
-  IOC or FOK is therefore sent as `poc` and rests until cancelled instead of
-  terminating immediately. Do not combine post-only with an immediate time in
-  force and expect the immediacy to survive.
 * **A spot conditional order ignores `trigger_type`.** Gate.io's spot
   price-order endpoint takes only a comparison rule against the last traded
   price, so there is no field to carry a mark- or index-price trigger. A
@@ -269,8 +280,12 @@ support amendment: the amend addresses the fired id, not the armed one.
   id, rather than bulk-disarming both sides of the book.
 * `batch_cancel_orders` — batched in groups of 20 where the venue supports it
   (spot only), falling back to individual cancels elsewhere and for armed
-  trigger orders. Per-item failures are reported as individual
-  `OrderCancelRejected` events with the venue's own label and message.
+  trigger orders. Per-item failures — the `succeeded=false` entries of a
+  successful response — are reported as individual `OrderCancelRejected` events
+  with the venue's own label and message. A failure of the whole request carries
+  no per-order result, so it is reported for none of them: unless the venue
+  refused the request outright, every order in the chunk stays `PENDING_CANCEL`
+  (see [Unknown outcomes](#unknown-outcomes)).
 
 A bulk price-order cancel answers with price-order objects, not regular orders.
 Those are matched back to this client's armed orders and closed explicitly,
@@ -283,8 +298,9 @@ understood.
 |---|---|
 | Unsupported order type, unknown instrument, unconfigured product | `OrderDenied`, before any network call |
 | Validation failure while building the request body | `OrderRejected` after `OrderSubmitted` |
-| Venue error on submission | `OrderRejected`, carrying the venue's label and message |
+| Venue **refusal** on submission (a 4xx answer) | `OrderRejected`, carrying the venue's label and message |
 | Post-only order that would have taken liquidity | `OrderRejected` with `due_post_only=True` |
+| Submission whose outcome the venue never confirmed | nothing — see [Unknown outcomes](#unknown-outcomes) |
 | `finish_as=expired` | `OrderExpired` |
 | `finish_as=cancelled`, `reduce_only`, `reduce_out`, `position_closed` | `OrderCanceled` |
 | Unfilled remainder of an `ioc`, `fok` or self-trade-prevention order | `OrderCanceled` (`OrderFilled` if it in fact filled completely) |
@@ -301,6 +317,51 @@ so a duplicate terminal message from the venue cannot drive the order's state
 machine twice. The per-order bookkeeping (the `text` alias, the applied trade
 ids and the trigger link) is dropped at the same point.
 
+### Unknown outcomes
+
+A rejection event states a fact about the venue: it refused the command.
+NautilusTrader therefore allows `OrderRejected`, `OrderCancelRejected` and
+`OrderModifyRejected` only where the venue's answer proves that refusal
+(concepts/live.md, "Order command outcome policy"). Everything else is
+*ambiguous*, and an ambiguous command is logged and left in flight — `SUBMITTED`,
+`PENDING_CANCEL` or `PENDING_UPDATE` — for the execution engine's in-flight
+check, open-order poll or reconciliation to resolve. This client emits no event
+at all in that case.
+
+| Failure | Classified as | Why |
+|---|---|---|
+| A 4xx answer from Gate.io (including 429) | definitive | the venue answered, and the answer is a refusal |
+| A failure before any byte was sent (`NETWORK_ERROR`) | definitive | the venue cannot have seen the request |
+| The adapter's own pre-flight refusal | definitive | nothing was sent |
+| `GateioRequestAmbiguousError` — sent and unanswered, replayed or not | ambiguous | the venue may have applied it |
+| A 5xx answer | ambiguous | Gate.io can raise it before or after applying the request |
+| A whole-batch failure with no per-order results | ambiguous | it says nothing about the individual cancels |
+| Anything the client could not read after the request went out | ambiguous | including a price order the venue armed without returning its id |
+
+The distinction is not caution, it is recoverability. `OrderRejected` is
+terminal, so an order Gate.io is actually holding could never be represented
+locally again — reconciliation's `OrderAccepted` is refused by the order's state
+machine — and the position would drift for the life of the process.
+`OrderCancelRejected` and `OrderModifyRejected` are not terminal but revert the
+order to `ACCEPTED` carrying state the venue no longer has, and nothing later
+re-compares price or quantity: the open-order poll reconciles an order only when
+its open state or filled quantity disagrees with the venue.
+
+What the engine then does with a `PENDING_CANCEL` or `PENDING_UPDATE` order it
+cannot confirm is the engine's decision, and the platform's own sources differ:
+live.md's in-flight timeout table leaves both unresolved, while the installed
+1.230.0 generates `OrderCanceled` for both once `inflight_check_retries` is
+spent. The installed behaviour is what runs. Either way that decision is taken
+after querying the venue, which is more than this client knows when the request
+fails.
+
+This client does not query the venue itself after an ambiguous failure.
+`LiveExecutionEngine` already re-queries every in-flight order through
+`generate_order_status_report`, bounded by `inflight_check_retries`; a second
+poll here would race it. Spot submissions are resolvable that way even before a
+venue order id is known, because the `text` alias is registered while the request
+body is built, not when the response arrives.
+
 ## Fills
 
 * The Nautilus `TradeId` is the **venue trade id** from `*.usertrades` /
@@ -315,12 +376,17 @@ ids and the trigger link) is dropped at the same point.
   side, and the order closes when the venue's own accounting says it is complete.
 * A zero-quantity fill, or one with no venue trade id, is discarded with a log
   line rather than being turned into an event with an invented identity.
-* On spot, a fee charged in the currency being received is netted off the fill
-  quantity when `fee_currency == base_currency`, following the same convention as
-  other NautilusTrader crypto adapters. The reports do the same netting on
-  cumulative filled quantity, because a report that claimed more filled quantity
-  than its own fills can reach would leave reconciliation with an order it can
-  never close.
+* On spot, a fee charged in the currency being received is **not** netted off the
+  fill quantity, and the order status reports do not net it either. Gate.io does
+  credit `amount - fee` base units for a match of `amount`, but NautilusTrader
+  accounts for that itself: `Position.apply` raises a
+  `PositionAdjusted(COMMISSION, -commission)` for every fill on a `CurrencyPair`
+  commissioned in its base currency, and subtracts it from the position. An
+  adapter that also nets it off `last_qty` has the fee taken off twice, and every
+  spot BUY position ends short by the cumulative fee. `last_qty` and `commission`
+  are two independent facts and are reported as two independent facts; the report
+  states the same gross quantities, so reconciliation never has to square the two
+  accounts of one order against each other.
 * Fee amount and currency are reported exactly as the venue returns them. Spot
   fees are usually charged in the received currency and may be charged in GT when
   GT-fee deduction is enabled on the account. A derivative fill is commissioned in
@@ -452,25 +518,47 @@ Two cases, and neither one drops the fill:
   happens once; if no armed order matches, the order genuinely is external and is
   reported as such, with a warning. If there are no armed candidates at all, no
   re-read is scheduled and the fill goes down the external-order path
-  immediately.
-* **An identity that cannot be reconciled.** The fill names an order the client
-  knows, but with a venue order id that is neither its current one nor one this
-  client can explain. Emitting the fill would have it rejected and dropped, so it
-  is routed through **reconciliation** instead — where an id mismatch is expected
-  and resolved against the venue — and logged at ERROR, loudly enough to act on.
-  The trade id is recorded, so a replay of the same fill does not produce a
-  second report.
+  immediately — which asks the venue for the order the trade belongs to and hands
+  the two over together as an `ExecutionMassStatus`. A `FillReport` on its own
+  would not survive: `LiveExecutionEngine._reconcile_fill_report_single` resolves
+  the order only through `cache.client_order_id(report.venue_order_id)`, and on an
+  id that index has never seen it logs "deferring reconciliation" and drops the
+  trade, with no deferral queue and no retry behind it.
+* **An identity this client cannot explain.** The fill names an order the client
+  knows — through the `text` alias registered for it — but carries a venue order
+  id that order does not hold. That is the venue speaking about a replacement
+  object it created, so the identity is **rebased** onto it through
+  `OrderUpdated`, with a warning, and the fill is then emitted normally.
+  Reconciliation is not an option here and never was: `create_order_filled_event`
+  stamps the reconciled fill with `report.venue_order_id`, so `Order.apply`
+  refuses it there for exactly the same reason, and `_reconcile_fill_report` turns
+  the resulting `ValueError` into a log line.
 
-A fill that arrives after its order has already been reported closed is handled
-the same way: `Order.apply` refuses an `OrderFilled` on a closed order, so the
-fill goes through the reconciliation path, which knows how to apply it to an
-order that has already finished.
+### A fill that arrives after the order was closed
+
+`Order.apply` refuses an `OrderFilled` on a closed order, so a late fill can only
+be booked through reconciliation — and only from a status NautilusTrader's own
+order state table can still leave. Among the terminal statuses it holds exactly
+two such entries, `(CANCELED, PARTIALLY_FILLED)` and `(CANCELED, FILLED)`, both
+annotated "Real world possibility". That covers the ordinary case, an IOC/FOK
+cancellation whose `*.orders` message beats its `*.usertrades` message.
+
+There is no transition out of EXPIRED, REJECTED or DENIED for a fill. Handing one
+of those to reconciliation raises `InvalidStateTrigger` inside
+`_reconcile_fill_report`, which catches it, logs it and returns False — the
+execution is discarded either way, but through reconciliation it is discarded
+under a generic error against a report nobody reads. Those are reported by the
+client instead, at ERROR, naming the trade id, quantity, price and commission, so
+the position can be squared. This is a real gap, not a handled case: the venue
+traded, and NautilusTrader cannot be told about it on this version.
 
 Status: implemented and mock-tested. The regression suite is
 `TestFillBeforeOrderUpdate` in `tests/test_execution_events.py`, which covers a
 fill before any order message, several fills before it, a late order message
 (idempotent), a duplicate fill after the rebase, a reconnect between the fill and
-the order message, and a restart between them. Mainnet validation pending.
+the order message, and a restart between them; `TestFillOnClosedOrder` covers the
+late fill on a canceled and on an expired order and holds the fillable-terminal
+status set against the platform's own state machine. Mainnet validation pending.
 
 ## Balances, positions and funding
 
@@ -642,7 +730,9 @@ execution tests.
   Order-mutating requests are **never** replayed automatically unless the venue
   has stated that the request was rejected before it was processed; when the
   outcome is genuinely unknown the error raised says so, and the remedy is to
-  query the order rather than to resubmit it.
+  query the order rather than to resubmit it. The execution client acts on that
+  distinction rather than reporting every failure as a rejection — see
+  [Unknown outcomes](#unknown-outcomes).
 * One bad payload never kills the stream or the batch: a message that cannot be
   parsed is logged and skipped, and a report that cannot be built is dropped with
   a warning naming the order.

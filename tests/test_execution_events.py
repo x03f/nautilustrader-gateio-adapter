@@ -9,11 +9,17 @@ sequence.
 from __future__ import annotations
 
 import asyncio
+import time
 from decimal import Decimal
 from typing import Any
 
 import pytest
-from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
+from nautilus_trader.model.enums import (
+    OrderSide,
+    OrderStatus,
+    PositionAdjustmentType,
+    TimeInForce,
+)
 from nautilus_trader.model.events import (
     OrderCanceled,
     OrderFilled,
@@ -21,9 +27,11 @@ from nautilus_trader.model.events import (
     OrderUpdated,
 )
 from nautilus_trader.model.identifiers import TradeId, VenueOrderId
-from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.objects import Currency, Money, Price, Quantity
+from nautilus_trader.model.position import Position
 
 from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
+from nautilus_gateio.common.errors import GateioClientError
 
 try:  # pytest inserts the tests directory on the path; support both layouts
     from tests.test_execution_orders import (
@@ -53,6 +61,29 @@ def spot_harness():
     env.close()
 
 
+async def _drain_tasks(env: ExecHarness) -> None:
+    """Run every task the client scheduled to completion.
+
+    Hand-overs that have to ask the venue something are scheduled rather than
+    awaited, because the private WebSocket callback that starts them is
+    synchronous.
+    """
+    del env  # the tasks belong to the running loop, not to the harness
+    current = asyncio.current_task()
+    pending = [task for task in asyncio.all_tasks() if task is not current and not task.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+#: A venue timestamp the reconnect re-query window can still reach.
+#:
+#: `_reconcile_after_reconnect` anchors its window on the wall clock and looks
+#: back `DEFAULT_LOOKBACK_SECS`, so a fixed epoch second in these payloads ages
+#: out of the window on its own and the recovery tests quietly stop exercising
+#: anything.
+RECENT_SECS = int(time.time()) - 60
+
+
 def _futures_order_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": 900001,
@@ -63,8 +94,8 @@ def _futures_order_payload(**overrides: Any) -> dict[str, Any]:
         "price": "59000.0",
         "tif": "gtc",
         "status": "open",
-        "create_time": 1785000000,
-        "update_time": 1785000001,
+        "create_time": RECENT_SECS,
+        "update_time": RECENT_SECS + 1,
     }
     payload.update(overrides)
     return payload
@@ -79,7 +110,7 @@ def _futures_fill_payload(trade_id: str, size: int, **overrides: Any) -> dict[st
         "price": "59000.0",
         "role": "taker",
         "fee": "0.05",
-        "create_time": 1785000002,
+        "create_time": RECENT_SECS + 2,
     }
     payload.update(overrides)
     return payload
@@ -441,6 +472,102 @@ class TestFillOnClosedOrder:
         assert reports[0].trade_id == TradeId("T-LATE")
         assert reports[0].venue_order_id == VenueOrderId("900001")
 
+    def test_a_fill_after_an_expired_order_is_not_routed_where_it_dies(self, perp_harness):
+        """CANCELED can take a late fill; EXPIRED cannot, and pretending hides it.
+
+        The platform's order state table has ``(CANCELED, PARTIALLY_FILLED)`` and
+        ``(CANCELED, FILLED)`` and nothing at all out of EXPIRED
+        (model/orders/base.pyx:132-163). A fill handed to reconciliation for an
+        EXPIRED order therefore raises ``InvalidStateTrigger`` inside
+        ``_reconcile_fill_report``, which catches it, logs it and returns False:
+        the execution is discarded, and the only trace is a generic
+        reconciliation error against a report nobody is looking at. The loss is
+        reported here instead, where the trade, its quantity and its commission
+        are still to hand.
+        """
+        from nautilus_trader.execution.reports import FillReport
+
+        env = perp_harness
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "900001")
+        text = f"t-{order.client_order_id.value}"
+        env.client._register_text(order.client_order_id, text)
+
+        env.client._handle_order_payload(
+            GateioProductType.PERP,
+            _futures_order_payload(status="finished", finish_as="expired", text=text),
+        )
+        env.drain(order)
+        assert order.status == OrderStatus.EXPIRED
+
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-LATE", -4, text=text),
+        )
+
+        assert env.events_of(OrderFilled) == []
+        assert [report for report in env.reports if isinstance(report, FillReport)] == []
+
+    def test_the_late_fill_routing_matches_the_platforms_state_table(self, perp_harness):
+        """`FILLABLE_TERMINAL_STATUSES` is a claim about the FSM; hold it to it.
+
+        The set decides whether a late fill is handed over or written off, so it
+        is checked against the platform rather than against this client's idea of
+        it: each terminal status is reached with the client's own events, and the
+        same fill is offered to ``Order.apply``.
+        """
+        from nautilus_trader.core.fsm import InvalidStateTrigger
+
+        from nautilus_gateio.execution import FILLABLE_TERMINAL_STATUSES
+
+        accepted_from = set()
+        for finish_as, status in (
+            ("cancelled", OrderStatus.CANCELED),
+            ("expired", OrderStatus.EXPIRED),
+        ):
+            env = ExecHarness(products=(GateioProductType.PERP,))
+            try:
+                order = env.order_factory.limit(
+                    PERP_BTC_USDT,
+                    OrderSide.SELL,
+                    Quantity.from_int(10),
+                    Price.from_str("59000.0"),
+                )
+                env.accepted(order, "900001")
+                text = f"t-{order.client_order_id.value}"
+                env.client._register_text(order.client_order_id, text)
+
+                # Take the fill event first, while the order can still produce one.
+                env.client._handle_fill_payload(
+                    GateioProductType.PERP,
+                    _futures_fill_payload("T-LATE", -4, text=text),
+                )
+                fill = env.events_of(OrderFilled)[0]
+
+                env.client._handle_order_payload(
+                    GateioProductType.PERP,
+                    _futures_order_payload(status="finished", finish_as=finish_as, text=text),
+                )
+                for event in env.drain():
+                    if not isinstance(event, OrderFilled):
+                        order.apply(event)
+                assert order.status == status
+
+                try:
+                    order.apply(fill)
+                except InvalidStateTrigger:
+                    continue
+                accepted_from.add(status)
+            finally:
+                env.close()
+
+        assert accepted_from == set(FILLABLE_TERMINAL_STATUSES)
+
     def test_a_duplicate_late_fill_is_not_reported_twice(self, perp_harness):
         from nautilus_trader.execution.reports import FillReport
 
@@ -469,6 +596,79 @@ class TestFillOnClosedOrder:
 
         reports = [report for report in env.reports if isinstance(report, FillReport)]
         assert len(reports) == 1
+
+
+# -- a fill for an order this client has never seen ---------------------------
+
+
+class TestUnattributedFill:
+    """A trade whose order is unknown must reach the engine by a route it implements.
+
+    ``LiveExecutionEngine._reconcile_fill_report_single`` resolves the order a
+    lone ``FillReport`` belongs to only through
+    ``cache.client_order_id(report.venue_order_id)`` (1.230.0,
+    live/execution_engine.py:2183-2200). An id that index has never seen is
+    logged as "deferring reconciliation" and dropped — there is no deferral queue
+    on this version, and the one retry loop that exists is driven by
+    ``position_check_interval_secs``, which defaults to ``None``. So the order is
+    re-read from the venue and handed over with its trade, which is the path
+    ``_reconcile_execution_mass_status`` does implement.
+    """
+
+    @staticmethod
+    def _capture_mass_status(env: ExecHarness) -> list[Any]:
+        captured: list[Any] = []
+        env.msgbus.register(
+            endpoint="ExecEngine.reconcile_execution_mass_status",
+            handler=captured.append,
+        )
+        return captured
+
+    def test_an_external_fill_is_handed_over_with_the_order_it_belongs_to(self, perp_harness):
+        from nautilus_trader.execution.reports import FillReport
+
+        env = perp_harness
+        mass_statuses = self._capture_mass_status(env)
+        env.perp.responses["get_order"] = _futures_order_payload(left=-6, status="open")
+
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-EXT", -4),
+        )
+        env.run(_drain_tasks(env))
+
+        # Nothing was offered on the single-report endpoint, where it would have
+        # been dropped for want of an indexed venue order id.
+        assert [report for report in env.reports if isinstance(report, FillReport)] == []
+        assert [call.args[0] for call in env.perp.calls_named("get_order")] == ["900001"]
+        assert len(mass_statuses) == 1
+        assert VenueOrderId("900001") in mass_statuses[0].order_reports
+        assert [
+            fill.trade_id for fill in mass_statuses[0].fill_reports[VenueOrderId("900001")]
+        ] == [TradeId("T-EXT")]
+
+    def test_a_venue_that_cannot_name_the_order_loses_nothing_silently(self, perp_harness):
+        """The venue not answering is the one case with nowhere left to go.
+
+        Handing the trade over on its own would have the engine drop it with a
+        log line about a deferral that never happens, so it is reported here
+        instead, with the quantity, price and commission needed to account for
+        it.
+        """
+        from nautilus_trader.execution.reports import FillReport
+
+        env = perp_harness
+        mass_statuses = self._capture_mass_status(env)
+        env.perp.responses["get_order"] = GateioClientError(404, "ORDER_NOT_FOUND", "not found")
+
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-EXT", -4),
+        )
+        env.run(_drain_tasks(env))
+
+        assert mass_statuses == []
+        assert [report for report in env.reports if isinstance(report, FillReport)] == []
 
 
 # -- MANDATORY TEST 4: per-wallet balances aggregate without corruption -------
@@ -651,45 +851,83 @@ class TestUnifiedAccountDoubleCounting:
             env.close()
 
 
-# -- spot fee netting on the event stream ------------------------------------
+# -- spot base-currency fees on the event stream -----------------------------
 
 
-class TestSpotBaseFeeNetting:
-    def test_base_currency_fee_is_netted_off_the_fill_quantity(self, spot_harness):
+class TestSpotBaseFeeReporting:
+    """A spot fill states what the venue matched; the fee is a separate fact.
+
+    Gate.io deducts a spot BUY fee from the currency being bought, so the wallet
+    is credited ``amount - fee`` base units for a match of ``amount``. It is the
+    platform, not the adapter, that reflects that in the position:
+    ``Position.apply`` raises a ``PositionAdjusted(COMMISSION, -commission)`` for
+    every fill on a ``CurrencyPair`` commissioned in its base currency
+    (model/position.pyx:591-612), and ``apply_adjustment`` takes it off
+    ``signed_qty``. An adapter that also nets the fee off ``last_qty`` has the
+    same fee subtracted twice.
+    """
+
+    def test_the_fill_states_the_matched_quantity_and_the_fee_apart(self, spot_harness):
         env = spot_harness
-        order = env.order_factory.limit(
-            SPOT_BTC_USDT,
-            OrderSide.BUY,
-            Quantity.from_str("0.010000"),
-            Price.from_str("60000.00"),
-            time_in_force=TimeInForce.GTC,
-        )
-        env.accepted(order, "778899")
-        env.client._register_text(order.client_order_id, f"t-{order.client_order_id.value}")
+        order = _accepted_spot_buy(env)
 
         env.client._handle_fill_payload(
             GateioProductType.SPOT,
-            {
-                "id": "TS-1",
-                "currency_pair": "BTC_USDT",
-                "order_id": "778899",
-                "side": "buy",
-                "amount": "0.010000",
-                "price": "60000.00",
-                "fee": "0.000010",
-                "fee_currency": "BTC",
-                "role": "taker",
-                "create_time_ms": "1785000000000",
-                "text": f"t-{order.client_order_id.value}",
-            },
+            _spot_fill_payload(env, order, "TS-1"),
         )
         env.drain(order)
 
         fill = env.events_of(OrderFilled)[0]
-        assert fill.last_qty == Quantity.from_str("0.009990")
-        assert fill.commission.currency.code == "BTC"
+        assert fill.last_qty == Quantity.from_str("0.010000")
+        assert fill.commission == Money(Decimal("0.000010"), Currency.from_str("BTC"))
 
-    def test_quote_currency_fee_is_not_netted(self, spot_harness):
+    @staticmethod
+    def _position(env: ExecHarness, *fills: Any) -> Position:
+        """Build the position these fills produce, as the execution engine would.
+
+        The engine stamps a position id onto every fill before opening a position
+        with it (`ExecutionEngine._determine_position_id`), and `Position`
+        refuses a fill without one. The attribute is not writable from Python, so
+        the events are round-tripped through the platform's own serialisation
+        rather than rebuilt field by field here.
+        """
+        identified = []
+        for fill in fills:
+            values = OrderFilled.to_dict(fill)
+            values["position_id"] = "P-1"
+            identified.append(OrderFilled.from_dict(values))
+        position = Position(instrument=env.instruments[0], fill=identified[0])
+        for fill in identified[1:]:
+            position.apply(fill)
+        return position
+
+    def test_the_position_is_short_by_the_fee_exactly_once(self, spot_harness):
+        """The double count is only visible on a `Position`, so build one.
+
+        The venue matched 0.010000 BTC and kept 0.000010 as its fee, so the
+        wallet was credited 0.009990. With the fee netted off `last_qty` as well,
+        the position came out at 0.009980 — a full fee short, compounding over
+        every fill of every spot buy.
+        """
+        env = spot_harness
+        order = _accepted_spot_buy(env)
+
+        env.client._handle_fill_payload(
+            GateioProductType.SPOT,
+            _spot_fill_payload(env, order, "TS-1"),
+        )
+        env.drain(order)
+
+        position = self._position(env, env.events_of(OrderFilled)[0])
+
+        assert position.quantity == Quantity.from_str("0.009990")
+        assert [adjustment.adjustment_type for adjustment in position.adjustments] == [
+            PositionAdjustmentType.COMMISSION,
+        ]
+        assert position.adjustments[0].quantity_change == Decimal("-0.000010")
+
+    def test_a_quote_currency_fee_leaves_the_position_whole(self, spot_harness):
+        """A sell is commissioned in quote, so nothing is taken off the quantity."""
         env = spot_harness
         order = env.order_factory.limit(
             SPOT_BTC_USDT,
@@ -702,35 +940,33 @@ class TestSpotBaseFeeNetting:
 
         env.client._handle_fill_payload(
             GateioProductType.SPOT,
-            {
-                "id": "TS-2",
-                "currency_pair": "BTC_USDT",
-                "order_id": "778900",
-                "side": "sell",
-                "amount": "0.010000",
-                "price": "60000.00",
-                "fee": "0.6",
-                "fee_currency": "USDT",
-                "role": "taker",
-                "create_time_ms": "1785000000000",
-                "text": f"t-{order.client_order_id.value}",
-            },
+            _spot_fill_payload(
+                env,
+                order,
+                "TS-2",
+                side="sell",
+                fee="0.6",
+                fee_currency="USDT",
+                order_id="778900",
+            ),
         )
         env.drain(order)
 
         fill = env.events_of(OrderFilled)[0]
         assert fill.last_qty == Quantity.from_str("0.010000")
+        position = self._position(env, fill)
+        assert position.quantity == Quantity.from_str("0.010000")
+        assert position.adjustments == []
 
-    def test_the_withheld_base_shrinks_the_order_so_the_venue_can_close_it(self, spot_harness):
-        """Regression for the other half of EXEC-4.
+    def test_a_fully_matched_buy_closes_without_restating_the_order(self, spot_harness):
+        """Gross fills add up to the order's own quantity, so it closes by itself.
 
-        The venue credits ``amount - fee`` base units, so the fills of a fully
-        matched buy add up to less than the quantity the order was submitted
-        with. Nothing restated that quantity, so the order ended with zero
-        remaining quantity and status PARTIALLY_FILLED and never left
-        ``cache.orders_open()``. The restatement has to precede the closing fill:
-        ``Order.apply(OrderUpdated)`` never triggers a terminal status, so an
-        update applied afterwards leaves the order open forever.
+        This is what makes the second netting unnecessary rather than merely
+        redundant: while the fills were published net of the fee they could never
+        reach the quantity the order was submitted with, the order came to rest
+        at PARTIALLY_FILLED with nothing left to fill, and it stayed in
+        ``cache.orders_open()`` for the rest of the session — which is why a
+        second netting was applied to the order's quantity in the first place.
         """
         env = spot_harness
         order = _accepted_spot_buy(env)
@@ -741,20 +977,15 @@ class TestSpotBaseFeeNetting:
         )
         env.drain(order)
 
-        assert order.quantity == Quantity.from_str("0.009990")
-        assert order.filled_qty == Quantity.from_str("0.009990")
+        assert env.events_of(OrderUpdated) == []
+        assert order.quantity == Quantity.from_str("0.010000")
+        assert order.filled_qty == Quantity.from_str("0.010000")
         assert order.leaves_qty == Quantity.from_str("0.000000")
         assert order.status == OrderStatus.FILLED
         assert env.cache.orders_open() == []
 
     def test_a_partial_fill_leaves_the_unmatched_quantity_working(self, spot_harness):
-        """The shrink must not close an order the venue has not matched in full.
-
-        After the first fill the order's quantity reads ``submitted - withheld``
-        and its filled quantity ``matched - withheld``, so what is left is the
-        gross quantity still working at the venue: 0.004 of the 0.01 submitted,
-        not 0.004 minus a fee that has not been charged yet.
-        """
+        """What is left is what the venue is still working, fees notwithstanding."""
         env = spot_harness
         order = _accepted_spot_buy(env)
 
@@ -765,8 +996,8 @@ class TestSpotBaseFeeNetting:
         env.drain(order)
 
         assert order.status == OrderStatus.PARTIALLY_FILLED
-        assert order.quantity == Quantity.from_str("0.009994")
-        assert order.filled_qty == Quantity.from_str("0.005994")
+        assert order.quantity == Quantity.from_str("0.010000")
+        assert order.filled_qty == Quantity.from_str("0.006000")
         assert order.leaves_qty == Quantity.from_str("0.004000")
 
         env.client._handle_fill_payload(
@@ -776,18 +1007,10 @@ class TestSpotBaseFeeNetting:
         env.drain(order)
 
         assert order.status == OrderStatus.FILLED
-        assert order.quantity == Quantity.from_str("0.009990")
         assert order.leaves_qty == Quantity.from_str("0.000000")
 
-    def test_two_fills_in_one_frame_both_shrink_the_order(self, spot_harness):
-        """Gate.io delivers several trades in one frame; each one withholds a fee.
-
-        ``OrderUpdated`` reaches the order through the engine's event queue, so
-        ``order.quantity`` still reads its pre-update value while the frame is
-        being walked. Restating against the order rather than against the last
-        restatement would discard every reduction but the last, and the order
-        would come to rest one fee short of closing.
-        """
+    def test_two_fills_in_one_frame_close_the_order(self, spot_harness):
+        """Gate.io delivers several trades in one frame; both must land whole."""
         env = spot_harness
         order = _accepted_spot_buy(env)
 
@@ -805,40 +1028,29 @@ class TestSpotBaseFeeNetting:
         )
         env.drain(order)
 
-        assert order.quantity == Quantity.from_str("0.009990")
-        assert order.filled_qty == Quantity.from_str("0.009990")
+        assert order.quantity == Quantity.from_str("0.010000")
+        assert order.filled_qty == Quantity.from_str("0.010000")
         assert order.status == OrderStatus.FILLED
 
-    def test_a_quote_currency_fee_does_not_restate_the_quantity(self, spot_harness):
-        """A sell is paid in quote, so nothing is withheld from the base quantity."""
+    def test_the_cumulative_fee_is_taken_off_the_position_once_per_fill(self, spot_harness):
+        """Two fills, two adjustments, and the position is short exactly both fees."""
         env = spot_harness
-        order = env.order_factory.limit(
-            SPOT_BTC_USDT,
-            OrderSide.SELL,
-            Quantity.from_str("0.010000"),
-            Price.from_str("60000.00"),
-        )
-        env.accepted(order, "778901")
-        env.client._register_text(order.client_order_id, f"t-{order.client_order_id.value}")
+        order = _accepted_spot_buy(env)
 
         env.client._handle_fill_payload(
             GateioProductType.SPOT,
-            _spot_fill_payload(
-                env,
-                order,
-                "TS-8",
-                amount="0.010000",
-                fee="0.6",
-                side="sell",
-                fee_currency="USDT",
-                order_id="778901",
-            ),
+            _spot_fill_payload(env, order, "TS-6", amount="0.006000", fee="0.000006"),
+        )
+        env.drain(order)
+        env.client._handle_fill_payload(
+            GateioProductType.SPOT,
+            _spot_fill_payload(env, order, "TS-7", amount="0.004000", fee="0.000004"),
         )
         env.drain(order)
 
-        assert env.events_of(OrderUpdated) == []
-        assert order.quantity == Quantity.from_str("0.010000")
-        assert order.status == OrderStatus.FILLED
+        position = self._position(env, *env.events_of(OrderFilled))
+
+        assert position.quantity == Quantity.from_str("0.009990")
 
 
 def _spot_amend_payload(order: Any, amount: str, left: str, filled: str) -> dict[str, Any]:
@@ -868,19 +1080,16 @@ def _spot_amend_payload(order: Any, amount: str, left: str, filled: str) -> dict
 
 
 class TestSpotQuantityAmends:
-    """Regression: the base-currency fee and a venue amend have to compose.
+    """A venue amend is the venue's own size, and it is passed on untouched.
 
     What is still working at the venue is ``amended amount - matched amount``,
-    and no arithmetic over fees may change that. Netting the fee off a *shadow
-    copy* of the order's quantity gets this wrong in both directions, because the
-    shadow is never invalidated when the venue moves the quantity for its own
-    reasons: amended down the order stays open after the venue has matched it in
-    full, amended up it closes while the venue is still working the balance. The
-    second is the more dangerous of the two — the strategy is told the order is
-    done and stops tracking exposure that is still live.
-
-    Keeping the venue's gross size and the cumulative withheld fee apart is what
-    makes them compose, because each is moved only by the thing that owns it.
+    and no arithmetic over fees may change that. The fee belongs to the position,
+    not to the order: netting it off the order's quantity gets this wrong in both
+    directions once the venue moves that quantity for its own reasons — amended
+    down the order stays open after the venue has matched it in full, amended up
+    it closes while the venue is still working the balance. The second is the
+    more dangerous of the two: the strategy is told the order is done and stops
+    tracking exposure that is still live.
     """
 
     def test_an_amend_down_still_closes_when_the_venue_has_matched_it_all(self, spot_harness):
@@ -897,7 +1106,7 @@ class TestSpotQuantityAmends:
             _spot_amend_payload(order, "0.008000", "0.004000", "0.004000"),
         )
         env.drain(order)
-        assert order.quantity == Quantity.from_str("0.007996")
+        assert order.quantity == Quantity.from_str("0.008000")
 
         env.client._handle_fill_payload(
             GateioProductType.SPOT,
@@ -905,7 +1114,7 @@ class TestSpotQuantityAmends:
         )
         env.drain(order)
 
-        assert order.filled_qty == Quantity.from_str("0.007992")
+        assert order.filled_qty == Quantity.from_str("0.008000")
         assert order.leaves_qty == Quantity.from_str("0.000000")
         assert order.status == OrderStatus.FILLED
         assert env.cache.orders_open() == []
@@ -931,22 +1140,18 @@ class TestSpotQuantityAmends:
         )
         env.drain(order)
 
-        assert order.filled_qty == Quantity.from_str("0.009990")
+        assert order.filled_qty == Quantity.from_str("0.010000")
         # The venue amended to 0.020 and has matched 0.010 of it.
         assert order.leaves_qty == Quantity.from_str("0.010000")
         assert order.status == OrderStatus.PARTIALLY_FILLED
         assert order in env.cache.orders_open()
 
-    def test_a_venue_update_restating_the_same_size_does_not_undo_the_netting(
-        self,
-        spot_harness,
-    ):
-        """Every ``spot.orders`` frame carries the gross size, amend or not.
+    def test_a_venue_update_restating_the_same_size_emits_nothing(self, spot_harness):
+        """Every ``spot.orders`` frame carries the order's size, amend or not.
 
-        Restating the order to it would undo the netting the last fill applied,
-        and the next fill would redo it — leaving the end state decided by
-        whichever message happened to arrive last, which for a REST-reconciled
-        order is the update.
+        The order already holds it, so there is nothing to restate and no
+        ``OrderUpdated`` to publish — a strategy is told about quantity changes
+        the venue made, not about every frame it sent.
         """
         env = spot_harness
         order = _accepted_spot_buy(env)
@@ -956,8 +1161,7 @@ class TestSpotQuantityAmends:
             _spot_fill_payload(env, order, "TA-1", amount="0.006000", fee="0.000006"),
         )
         env.drain(order)
-        assert order.quantity == Quantity.from_str("0.009994")
-        updates_before = len(env.events_of(OrderUpdated))
+        assert order.quantity == Quantity.from_str("0.010000")
 
         env.client._handle_order_payload(
             GateioProductType.SPOT,
@@ -965,17 +1169,16 @@ class TestSpotQuantityAmends:
         )
         env.drain(order)
 
-        assert len(env.events_of(OrderUpdated)) == updates_before
-        assert order.quantity == Quantity.from_str("0.009994")
+        assert env.events_of(OrderUpdated) == []
+        assert order.quantity == Quantity.from_str("0.010000")
 
-    def test_the_fee_netting_keeps_a_converted_quantity_in_base_units(self, spot_harness):
+    def test_a_converted_quote_quantity_stays_in_base_units(self, spot_harness):
         """Regression: ``is_quote_quantity`` must be stated, not inherited.
 
         ``generate_order_updated`` resolves ``is_quote_quantity=None`` from the
         cached order, which still reads ``True`` while the conversion's own
         ``OrderUpdated`` sits in the engine's queue. Inheriting it re-flags a
-        base-denominated quantity as quote, undoing the conversion that ran one
-        line earlier.
+        base-denominated quantity as quote, undoing the conversion.
         """
         env = spot_harness
         order = env.order_factory.market(
@@ -993,10 +1196,10 @@ class TestSpotQuantityAmends:
         )
         env.drain(order)
 
-        assert [event.is_quote_quantity for event in env.events_of(OrderUpdated)] == [False, False]
+        assert [event.is_quote_quantity for event in env.events_of(OrderUpdated)] == [False]
         assert order.is_quote_quantity is False
-        assert order.quantity == Quantity.from_str("0.009990")
-        assert order.filled_qty == Quantity.from_str("0.009990")
+        assert order.quantity == Quantity.from_str("0.010000")
+        assert order.filled_qty == Quantity.from_str("0.010000")
         assert order.status == OrderStatus.FILLED
 
 
@@ -1122,15 +1325,29 @@ class TestReconnectReconciliation:
         catches it is checking the outcome instead of predicting it: whatever is
         not on its order after the grouped hand-over goes through the
         single-report path, which has no status gate.
+
+        The grouped pass runs first and synchronously, so by the time the sweep
+        looks the engine has already created the external order and indexed its
+        venue order id — which is the only thing that makes a lone `FillReport`
+        resolvable at all (`_reconcile_fill_report_single`). The index is seeded
+        here because this harness carries no execution engine to do it.
         """
         env = perp_harness
         self._capture_mass_status(env)
         self._wire_gap(env)
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "900001")
 
         env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
 
         assert [report.trade_id for report in env.reports] == [TradeId("T-GAP")]
         assert [report.venue_order_id for report in env.reports] == [VenueOrderId("900001")]
+        assert not env.perp.called("get_order")
 
     def test_a_trade_already_on_its_order_is_not_reported_a_second_time(self, perp_harness):
         """The sweep is a repair, not a second delivery.
@@ -1163,27 +1380,41 @@ class TestReconnectReconciliation:
 
         assert env.reports == []
 
-    def test_a_fill_with_no_order_of_its_own_is_still_reported(self, perp_harness):
+    def test_a_fill_with_no_order_of_its_own_is_requeried_and_handed_over(self, perp_harness):
         """A trade the order listing does not cover must not be dropped silently.
 
         The grouped hand-over walks the order reports, so a fill whose venue
         order id is not among them has nobody to be grouped with — an order that
         finished outside the window its trade falls inside, or one the venue
-        answered for on only one of the two endpoints. Those keep going through
-        the single-report path.
+        answered for on only one of the two endpoints.
+
+        Reporting it on its own does not work: nothing has ever put that venue
+        order id in the cache, and `_reconcile_fill_report_single` resolves the
+        order through that index alone, so the engine logs "deferring
+        reconciliation" and drops it with no retry. The order it belongs to is
+        re-read from the venue instead, and the two are handed over together.
         """
         env = perp_harness
         mass_statuses = self._capture_mass_status(env)
         self._wire_gap(env, fill_order_id="900777")
+        env.perp.responses["get_order"] = _futures_order_payload(
+            id=900777,
+            id_string="900777",
+            left=-7,
+            status="open",
+        )
 
         env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
+        env.run(_drain_tasks(env))
 
-        assert len(mass_statuses) == 1
-        # The mass status carries it, but nothing walks it there: the engine
-        # iterates the order reports and picks up their trades, so this one would
-        # go unreconciled without the single-report fallback.
-        assert VenueOrderId("900777") not in mass_statuses[0].order_reports
-        assert [report.trade_id for report in env.reports] == [TradeId("T-GAP")]
+        assert env.reports == []
+        assert [call.args[0] for call in env.perp.calls_named("get_order")] == ["900777"]
+        assert len(mass_statuses) == 2
+        recovered = mass_statuses[1]
+        assert VenueOrderId("900777") in recovered.order_reports
+        assert [fill.trade_id for fill in recovered.fill_reports[VenueOrderId("900777")]] == [
+            TradeId("T-GAP")
+        ]
 
     def test_reconnect_still_refreshes_the_account_state(self, perp_harness):
         env = perp_harness
@@ -1356,12 +1587,17 @@ class TestFillBeforeOrderUpdate:
         assert replayed == []
         assert order.filled_qty == Quantity.from_int(4)
 
-    def test_a_mismatched_identity_without_a_trigger_link_reconciles(self, perp_harness):
-        """An id that cannot be reconciled inline goes to reconciliation, not to /dev/null.
+    def test_a_mismatched_identity_without_a_trigger_link_is_rebased(self, perp_harness):
+        """An identity this client does not model is still the venue's own.
 
-        This is the safety net for identity transitions this client does not
-        model. Emitting the fill would have it rejected and dropped; reporting it
-        keeps it recoverable and says why.
+        The fill names one of this client's orders through the `text` alias it
+        registered for it, and carries a venue order id that order does not hold:
+        the venue has replaced the object it is working under. Handing that to
+        reconciliation cannot help — `create_order_filled_event` stamps the fill
+        with `report.venue_order_id`, so `Order.apply` refuses it there for
+        exactly the same reason and `_reconcile_fill_report` logs it away.
+        `OrderUpdated` is the one event allowed to move a venue order id, so the
+        identity is rebased and the fill applies.
         """
         env = perp_harness
         order = env.order_factory.limit(
@@ -1374,20 +1610,20 @@ class TestFillBeforeOrderUpdate:
         text = f"t-{order.client_order_id.value}"
         env.client._register_text(order.client_order_id, text)
 
-        before = len(env.reports)
         env.client._handle_fill_payload(
             GateioProductType.PERP,
             _futures_fill_payload("T-9", -4, text=text),
         )
         events = env.drain(order)
 
-        assert events == []
-        assert len(env.reports) == before + 1
-        assert order.venue_order_id == VenueOrderId("555000")
-        assert order.filled_qty == Quantity.from_int(0)
+        assert [type(event).__name__ for event in events] == ["OrderUpdated", "OrderFilled"]
+        assert events[0].venue_order_id == VenueOrderId("900001")
+        assert env.reports == []
+        assert order.venue_order_id == VenueOrderId("900001")
+        assert order.filled_qty == Quantity.from_int(4)
 
-    def test_that_reconciled_fill_is_not_reported_twice(self, perp_harness):
-        """A replay of the unreconcilable fill must not produce a second report."""
+    def test_the_rebased_fill_is_not_applied_twice(self, perp_harness):
+        """A replay of it must not rebase again or fill again."""
         env = perp_harness
         order = env.order_factory.limit(
             PERP_BTC_USDT,
@@ -1401,10 +1637,13 @@ class TestFillBeforeOrderUpdate:
         payload = _futures_fill_payload("T-9", -4, text=text)
 
         env.client._handle_fill_payload(GateioProductType.PERP, payload)
-        after_first = len(env.reports)
+        env.drain(order)
         env.client._handle_fill_payload(GateioProductType.PERP, dict(payload))
+        replayed = env.drain(order)
 
-        assert len(env.reports) == after_first
+        assert replayed == []
+        assert env.reports == []
+        assert order.filled_qty == Quantity.from_int(4)
 
     def test_an_unknown_order_id_is_scheduled_for_resolution(self, perp_harness):
         """A fill with no text at all cannot name its order; resolve it from REST."""

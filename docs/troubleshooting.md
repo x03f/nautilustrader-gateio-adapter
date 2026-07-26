@@ -119,6 +119,31 @@ full list of rejection cases is in
 * FOK on an options order;
 * a price-triggered order on options, or on a cross-margin spot ledger.
 
+## An order sits in `SUBMITTED`, `PENDING_CANCEL` or `PENDING_UPDATE`
+
+Look for a warning naming the order and ending in `is unresolved`. Gate.io did
+not answer the command, so the client cannot say whether it was applied and does
+not guess: it leaves the order in flight, which is the state NautilusTrader's
+in-flight check reads. That check queries the venue every
+`inflight_check_interval_ms`, and after `inflight_check_retries` unanswered
+queries resolves the order itself — a `SUBMITTED` order to `REJECTED`, and (in
+1.230.0) a `PENDING_CANCEL` or `PENDING_UPDATE` order to `CANCELED`. The
+reasoning behind leaving it to the engine is in
+[execution.md](execution.md#unknown-outcomes).
+
+If such orders stay in flight:
+
+* the engine's in-flight check must be running — it is on by default, but
+  `inflight_check_interval_ms=0` disables it;
+* on futures, delivery and options a submission is only queryable once the venue
+  order id is known, so an unanswered submit there resolves by timeout rather
+  than by lookup. Spot submissions are queryable immediately, by client order id;
+* enabling `open_check_interval_secs` adds the open-order poll, a second source
+  of truth for orders whose state the in-flight query could not settle.
+
+Never resubmit such an order by hand before the venue state is known. That is
+the one action the whole policy exists to prevent.
+
 ## `OrderDenied: ... is not supported by Gate.io`
 
 The order type is outside `SUPPORTED_ORDER_TYPES` (MARKET, LIMIT, STOP_MARKET,

@@ -96,6 +96,28 @@ Because every derivative has `size_precision = 0`, a fractional contract
 quantity cannot be expressed. The adapter rejects it rather than truncating it,
 on submission and on amendment alike (*implemented and mock-tested*).
 
+### Price grids and tick schemes
+
+`price_precision` says how many decimals a price may carry; it does **not** say
+which of those prices the venue accepts. Gate.io publishes the real grid as
+`order_price_round`, and for three of its ~3,100 instruments that is not a power
+of ten: the `BNB_USDT` perpetual and the `ETH_USDT_20260925` and
+`ETH_USDT_20261225` delivery contracts quote two decimals but tick in `0.05`.
+
+Every instrument the adapter builds therefore carries a `tick_scheme_name`
+(*implemented and mock-tested*):
+
+| Grid | Scheme |
+|---|---|
+| A power of ten (everything else) | NautilusTrader's pre-registered `FIXED_PRECISION_{n}` |
+| Anything else | a `FixedTickScheme` registered by the adapter as `GATEIO_TICK_{increment}_P{precision}`, carrying the venue increment |
+
+Use `instrument.next_bid_price()` / `next_ask_price()` to produce an order price.
+`instrument.make_price()` rounds to the precision only, so on an off-decimal grid
+it can return a price the venue refuses; such a price is rejected by the adapter
+before the request rather than sent (see [what is rejected rather than
+translated](#what-is-rejected-rather-than-translated)).
+
 Instruments the venue reports as untradable are not published at all: spot pairs
 marked `untradable` or currently one-sided around a listing or delisting window,
 futures and delivery contracts that are delisting or inactive, and expired
@@ -182,13 +204,16 @@ mock-tested*.
 | `GTD` | rejected | rejected | rejected |
 | `DAY` | rejected | rejected | rejected |
 | `AT_THE_OPEN`, `AT_THE_CLOSE` | rejected | rejected | rejected |
-| any of the above with `post_only=True` | `poc` | `poc` | `poc`, except `FOK`, which is rejected first |
+| `GTC` with `post_only=True` | `poc` | `poc` | `poc` |
+| `IOC` or `FOK` with `post_only=True` | rejected | rejected | rejected |
 
-Post-only overrides the time in force, because `poc` is how Gate.io expresses
-the maker-only constraint. That override is unconditional on spot, futures and
-delivery: a `GTD` or `FOK` limit order that also sets `post_only=True` is sent as
-`poc` and loses its expiry or its fill-or-kill guarantee rather than being
-refused — see [substitutions](#where-the-adapter-substitutes-rather-than-refuses).
+Gate.io has no separate post-only flag: the constraint *is* the `poc` time in
+force, a maker-only order that rests until it is cancelled. A post-only `GTC`
+order is therefore exactly `poc`, and nothing is lost. An `IOC` or `FOK` order
+that also sets `post_only=True` asks for maker-only *and* immediate, which `poc`
+cannot express — sending `poc` anyway would leave an order resting that the
+strategy expects to have self-cancelled — so it is refused. Every other time in
+force is already refused on its own.
 
 A post-only order the venue would have crossed comes back as `OrderRejected`
 with `due_post_only=True`, both when the venue answers with a post-only error
@@ -227,11 +252,12 @@ and lets the *fired* order carry its own `gtc` or `ioc`. The `GTC` rows and the
 
 | Instruction | Spot | Perpetual / Inverse | Delivery | Options | Status |
 |---|---|---|---|---|---|
-| `post_only` (regular orders) | `poc` | `poc` | `poc` | `poc` | Implemented and mock-tested (the mapping); implemented, mainnet validation pending (the request bodies) |
+| `post_only` (regular orders) | `poc`; rejected with IOC or FOK | as spot | as spot | as spot | Implemented and mock-tested (the mapping and the refusal); implemented, mainnet validation pending (the request bodies) |
 | `post_only` (conditional orders) | rejected | rejected | rejected | Not applicable | Implemented and mock-tested |
 | `reduce_only` (regular orders) | rejected — spot has no such flag | `reduce_only=true` | `reduce_only=true` | `reduce_only=true` | Implemented, mainnet validation pending |
 | `reduce_only` (conditional orders) | rejected | `initial.reduce_only=true` | as perpetual | Not applicable | Implemented and mock-tested |
-| `display_qty` / iceberg (regular orders) | `iceberg` (decimal string) | `iceberg` (contracts) | `iceberg` (contracts) | `iceberg` (contracts) | Implemented, mainnet validation pending |
+| `display_qty` / iceberg (regular orders) | `iceberg` (decimal string) | `iceberg` (whole contracts) | `iceberg` (whole contracts) | `iceberg` (whole contracts) | Implemented and mock-tested (the refusals); implemented, mainnet validation pending (the request bodies) |
+| `display_qty=0` (fully hidden) | rejected | rejected | rejected | rejected | Implemented and mock-tested |
 | `display_qty` (conditional orders) | rejected | rejected | rejected | Not applicable | Implemented and mock-tested |
 | `quote_quantity` | market buy only; rejected on a market sell and on any limit order | rejected | rejected | rejected | Implemented and mock-tested (the spot market buy); implemented, mainnet validation pending (the refusals) |
 | Trigger reference price | last price only; `trigger_type` is not consulted | `LAST_PRICE`/`DEFAULT`, `MARK_PRICE`, `INDEX_PRICE`; anything else rejected | as perpetual | Not applicable | Implemented and mock-tested (last price); implemented, mainnet validation pending (mark and index, and the refusal) |
@@ -261,8 +287,12 @@ suite also pins the behaviour.
 | `GTD`, `DAY`, `AT_THE_OPEN`, `AT_THE_CLOSE` on any limit order | `OrderRejected` | Implemented and mock-tested (the mapping raises); implemented, mainnet validation pending (the resulting event) |
 | `FOK` on a conditional order | `OrderRejected` | Implemented and mock-tested |
 | `DAY`, `AT_THE_OPEN`, `AT_THE_CLOSE` on a conditional order | `OrderRejected` | Implemented, mainnet validation pending |
+| `post_only` combined with `IOC` or `FOK` on a limit order | `OrderRejected` — `poc` rests until cancelled, so the immediacy cannot survive the substitution | Implemented and mock-tested |
 | `post_only` on a conditional order | `OrderRejected` — the fired order cannot carry `poc` | Implemented and mock-tested |
 | `display_qty` on a conditional order | `OrderRejected` — the price-order endpoints have no iceberg field | Implemented and mock-tested |
+| `display_qty=0` on any regular order | `OrderRejected` — Nautilus means "fully hidden", Gate.io reads `iceberg=0` as "normal order" and does not support hiding the whole amount | Implemented and mock-tested |
+| A fractional `display_qty` on any derivative | `OrderRejected` — the iceberg quantity is a contract count, and truncating it would display the whole order | Implemented and mock-tested |
+| A price or trigger price off the instrument's tick grid | `OrderRejected` on submit, `OrderModifyRejected` on amend — Gate.io accepts on-tick prices only | Implemented and mock-tested |
 | `reduce_only` on a conditional spot order | `OrderRejected` | Implemented and mock-tested |
 | `reduce_only` on a regular spot order | `OrderRejected` | Implemented, mainnet validation pending |
 | Any conditional order on options | `OrderRejected` — Gate.io publishes no options price-order endpoint | Implemented and mock-tested |
@@ -280,27 +310,22 @@ suite also pins the behaviour.
 
 ## Where the adapter substitutes rather than refuses
 
-Four known cases do not follow the rule above. They are listed because a page
-that only advertised the rule would be misleading. All four are *implemented,
+Three known cases do not follow the rule above. They are listed because a page
+that only advertised the rule would be misleading. All three are *implemented,
 mainnet validation pending*: they were established by reading and exercising the
 code, and no test currently pins them.
 
-1. **Post-only wins over the time in force.** A limit order with
-   `post_only=True` is sent as `poc` whatever its time in force, so a `GTD` order
-   loses its expiry and a `FOK` order loses its fill-or-kill guarantee instead of
-   being refused. Options are the exception, and only by accident: the
-   options-specific `FOK` check runs first and rejects that combination.
-2. **Spot market orders accept any time in force.** On spot, anything that is
+1. **Spot market orders accept any time in force.** On spot, anything that is
    not `FOK` becomes `ioc`, including `AT_THE_OPEN` and `AT_THE_CLOSE`, which
    the futures, delivery and options paths reject. The resulting execution is
    the same immediate-or-cancel market order either way, but the refusal is
    inconsistent across products.
-3. **Spot conditional orders ignore `trigger_type`.** The Gate.io spot
+2. **Spot conditional orders ignore `trigger_type`.** The Gate.io spot
    price-order endpoint triggers on the last price and has no price-type field,
    so a spot `STOP_MARKET` submitted with `MARK_PRICE` or `INDEX_PRICE` is
    accepted and armed against the last price instead. The futures path rejects
    unsupported trigger types explicitly.
-4. **Options cancel-all ignores the order side.** A side-scoped
+3. **Options cancel-all ignores the order side.** A side-scoped
    `CancelAllOrders` on an option contract cancels every resting order on that
    contract, both sides. Spot and futures honour the side (see below).
 

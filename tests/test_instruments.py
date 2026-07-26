@@ -21,6 +21,7 @@ from nautilus_trader.model.instruments import (
     CurrencyPair,
 )
 from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.tick_scheme.base import get_tick_scheme, list_tick_schemes
 
 import nautilus_gateio.instruments as instruments
 from nautilus_gateio.common.enums import GateioProductType
@@ -246,6 +247,114 @@ class TestPrecisionDerivation:
         assert instrument.size_precision == 0
         assert instrument.size_increment == Quantity.from_int(1)
         assert instrument.min_quantity == Quantity.from_int(1)
+
+
+# -- tick schemes -------------------------------------------------------------
+
+
+class TestTickSchemes:
+    """Every instrument must carry a tick scheme, and it must be the right grid.
+
+    ``Instrument.next_bid_price`` / ``next_ask_price`` raise ``ValueError`` when
+    an instrument has no ``tick_scheme_name``, and the platform's stock
+    ``FIXED_PRECISION_{n}`` scheme walks the price in ``10**-n`` steps — wrong for
+    the Gate.io contracts that quote two decimals but tick in ``0.05``.
+    """
+
+    def _build(self, product, spot_payload, perp_payload, delivery_payload, option_payload):
+        return {
+            "spot": lambda: parse_spot_instrument(spot_payload),
+            "perp": lambda: parse_perpetual_instrument(perp_payload, GateioProductType.PERP),
+            "delivery": lambda: parse_delivery_instrument(delivery_payload),
+            "option": lambda: parse_option_instrument(option_payload),
+        }[product]()
+
+    @pytest.mark.parametrize("product", ["spot", "perp", "delivery", "option"])
+    def test_every_product_carries_a_tick_scheme(
+        self,
+        product,
+        spot_payload,
+        perp_payload,
+        delivery_payload,
+        option_payload,
+    ):
+        instrument = self._build(
+            product, spot_payload, perp_payload, delivery_payload, option_payload
+        )
+
+        assert instrument.tick_scheme_name is not None
+        # Regression: without a scheme both of these raise ValueError.
+        assert instrument.next_bid_price(100.0) is not None
+        assert instrument.next_ask_price(100.0) is not None
+        assert len(instrument.next_bid_prices(100.0, num_ticks=3)) == 3
+
+    @pytest.mark.parametrize("product", ["spot", "perp", "delivery", "option"])
+    def test_a_power_of_ten_grid_uses_the_platform_scheme(
+        self,
+        product,
+        spot_payload,
+        perp_payload,
+        delivery_payload,
+        option_payload,
+    ):
+        """No bespoke scheme is registered where the platform already has one."""
+        instrument = self._build(
+            product, spot_payload, perp_payload, delivery_payload, option_payload
+        )
+
+        assert instrument.tick_scheme_name == f"FIXED_PRECISION_{instrument.price_precision}"
+
+    def test_an_off_decimal_tick_gets_its_own_registered_scheme(self, perp_odd_tick_payload):
+        """Regression: BNB_USDT ticks in 0.05 with a price precision of 2.
+
+        ``FIXED_PRECISION_2`` would step the price by 0.01 and hand back prices
+        Gate.io refuses, so the venue increment needs a scheme of its own.
+        """
+        instrument = parse_perpetual_instrument(perp_odd_tick_payload, GateioProductType.PERP)
+
+        assert instrument.tick_scheme_name == "GATEIO_TICK_0.05_P2"
+        assert instrument.tick_scheme_name.startswith(instruments.TICK_SCHEME_PREFIX)
+        assert get_tick_scheme(instrument.tick_scheme_name).increment == Price.from_str("0.05")
+
+    def test_an_off_decimal_grid_snaps_prices_to_the_venue_tick(self, perp_odd_tick_payload):
+        instrument = parse_perpetual_instrument(perp_odd_tick_payload, GateioProductType.PERP)
+
+        # 612.33 is a legal 2-decimal price and an illegal Gate.io price.
+        assert instrument.next_bid_price(612.33) == Price.from_str("612.30")
+        assert instrument.next_ask_price(612.33) == Price.from_str("612.35")
+        assert instrument.next_bid_prices(612.33, num_ticks=3) == [
+            Price.from_str("612.30"),
+            Price.from_str("612.25"),
+            Price.from_str("612.20"),
+        ]
+
+    def test_the_bespoke_scheme_keeps_the_bounds_of_the_stock_one(self, perp_odd_tick_payload):
+        """Only the grid differs from ``FIXED_PRECISION_2``, not the price range."""
+        instrument = parse_perpetual_instrument(perp_odd_tick_payload, GateioProductType.PERP)
+
+        scheme = get_tick_scheme(instrument.tick_scheme_name)
+        stock = get_tick_scheme("FIXED_PRECISION_2")
+        assert scheme.min_price == stock.min_price
+        assert scheme.max_price == stock.max_price
+
+    def test_reparsing_does_not_re_register_the_scheme(self, perp_odd_tick_payload):
+        """Providers re-parse every instrument on each load; registration is global."""
+        first = parse_perpetual_instrument(perp_odd_tick_payload, GateioProductType.PERP)
+        second = parse_perpetual_instrument(perp_odd_tick_payload, GateioProductType.PERP)
+
+        assert first is not None
+        assert second is not None
+        assert first.tick_scheme_name == second.tick_scheme_name
+        assert list_tick_schemes().count(second.tick_scheme_name) == 1
+
+    def test_a_delivery_contract_can_tick_off_decimal_too(self, delivery_payload):
+        """ETH_USDT_20261225 and ETH_USDT_20260925 tick in 0.05 as well."""
+        payload = {**delivery_payload, "name": "ETH_USDT_20261225", "order_price_round": "0.05"}
+
+        instrument = parse_delivery_instrument(payload)
+
+        assert instrument.tick_scheme_name == "GATEIO_TICK_0.05_P2"
+        assert instrument.next_ask_price(3011.02) == Price.from_str("3011.05")
 
 
 # -- GIO-DOM-3: the standard-precision guard ----------------------------------
