@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 
 
 @lru_cache(1)
-def get_cached_gateio_http_client(
+def _cached_gateio_http_client(
     api_key: str = "",
     api_secret: str = "",
     base_url: str = GATEIO_HTTP_MAINNET,
@@ -83,6 +83,47 @@ def get_cached_gateio_http_client(
         timeout_secs=timeout_secs,
         max_retries=max_retries,
     )
+
+
+def get_cached_gateio_http_client(
+    api_key: str = "",
+    api_secret: str = "",
+    base_url: str = GATEIO_HTTP_MAINNET,
+    timeout_secs: float = DEFAULT_HTTP_TIMEOUT_SECS,
+    max_retries: int = 3,
+) -> GateioHttpClient:
+    """Return the shared :class:`GateioHttpClient`, rebuilding a closed one.
+
+    The transport is shared and reference counted, so it is closed when the last
+    client releases it on shutdown. Within one process a second trading node can
+    then ask for it again; handing back the closed instance would fail on its
+    first request, so a closed entry is dropped and rebuilt instead.
+
+    See :func:`_cached_gateio_http_client` for the parameters.
+    """
+    client = _cached_gateio_http_client(
+        api_key=api_key,
+        api_secret=api_secret,
+        base_url=base_url,
+        timeout_secs=timeout_secs,
+        max_retries=max_retries,
+    )
+    if client.is_closed:
+        _cached_gateio_http_client.cache_clear()
+        client = _cached_gateio_http_client(
+            api_key=api_key,
+            api_secret=api_secret,
+            base_url=base_url,
+            timeout_secs=timeout_secs,
+            max_retries=max_retries,
+        )
+    return client
+
+
+# The wrapper, not the cached function, is the public entry point, so it carries
+# the cache introspection API that callers and test fixtures already rely on.
+get_cached_gateio_http_client.cache_clear = _cached_gateio_http_client.cache_clear
+get_cached_gateio_http_client.cache_info = _cached_gateio_http_client.cache_info
 
 
 @lru_cache(1)
@@ -167,7 +208,9 @@ class GateioLiveDataClientFactory(LiveDataClientFactory):
         GateioDataClient
 
         """
-        http_client = _build_http_client(config)
+        # One acquire per client the factory hands the transport to; each
+        # releases it in `_disconnect`, and the last release closes it.
+        http_client = _build_http_client(config).acquire()
         provider = get_cached_gateio_instrument_provider(
             http_client=http_client,
             products=tuple(config.products),
@@ -224,7 +267,9 @@ class GateioLiveExecClientFactory(LiveExecClientFactory):
         # client usable) independently of the execution module.
         from nautilus_gateio.execution import GateioExecutionClient
 
-        http_client = _build_http_client(config)
+        # One acquire per client the factory hands the transport to; each
+        # releases it in `_disconnect`, and the last release closes it.
+        http_client = _build_http_client(config).acquire()
         provider = get_cached_gateio_instrument_provider(
             http_client=http_client,
             products=tuple(config.products),

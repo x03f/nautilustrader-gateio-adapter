@@ -55,9 +55,12 @@ TESTNET_PRODUCTS: tuple[GateioProductType, ...] = (
     GateioProductType.PERP,
 )
 
-#: Order book update intervals (milliseconds) Gate.io accepts. Verified live:
-#: spot and perpetual futures accept all three; delivery and options accept
-#: ``100`` and ``1000`` only.
+#: Every order book update interval (milliseconds) Gate.io accepts on some
+#: product, used to validate a configured value before it reaches the venue.
+#: Which of them a *given* product accepts differs: spot and the perpetuals take
+#: ``20`` and ``100``, delivery and options take ``100`` and ``1000``. The
+#: per-product table in ``nautilus_gateio.websocket.public.BOOK_INTERVALS_MS``
+#: is authoritative and a configured interval is clamped against it.
 ORDER_BOOK_UPDATE_INTERVALS_MS: tuple[int, ...] = (20, 100, 1000)
 
 
