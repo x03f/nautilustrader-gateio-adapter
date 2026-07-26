@@ -40,11 +40,36 @@ instrument ids and the execution environment default all changed.
 
 ## Status
 
-**Alpha.** The package is complete and unit-tested, but **no mainnet validation
-has been recorded for 0.2.0**. Nothing in the matrix below is marked *Stable*,
-because the project reserves that label for features that have been both
-unit-tested and exercised against the real venue — see
-[docs/validation.md](docs/validation.md), which is where results get recorded.
+**Alpha — `0.2.0a1`.** An external community adapter, written in pure Python,
+built against NautilusTrader 1.230.0. Not an official NautilusTrader
+integration, and not affiliated with Gate.io.
+
+The package is complete and covered by an extensive offline test suite, but a
+passing suite is evidence about the code, not about the exchange. **No mainnet
+validation has been recorded yet**, so nothing in the matrix below is marked
+*Stable* — the project reserves that label for behaviour that has been both
+unit-tested and exercised against the real venue, with the result written down
+in [docs/validation.md](docs/validation.md).
+
+Use it for evaluation and controlled use. Start on the testnet, then start
+small, and verify anything you are about to trust with money.
+
+NautilusTrader prefers a Rust core with a thin PyO3 layer for adapters it ships
+in-tree. This one is Python throughout. That is a deliberate, stated deviation
+for an external package rather than an oversight, and it does not exempt the
+adapter from any behavioural requirement — see
+[docs/architecture.md](docs/architecture.md). A Rust migration is a possible
+future project and is not being promised.
+
+`0.1.0` was the previous experimental, primarily spot-oriented implementation.
+`0.2.0a1` is a substantial redesign rather than an incremental patch; the
+upgrade path is in
+[docs/migration-0.1-to-0.2.md](docs/migration-0.1-to-0.2.md). The old release
+remains available: its tag is untouched and its code is preserved on the
+`legacy/v0.1.0` branch.
+
+What was audited during the rework, and what remains, is published in
+[docs/review-matrix.md](docs/review-matrix.md).
 
 Interfaces may change between 0.x releases. Correct operation is the goal;
 economic results are never guaranteed — see the [Disclaimer](#disclaimer).
@@ -153,7 +178,7 @@ instrument's `multiplier`.
 
 | Adapter | nautilus_trader | Python | Gate.io API |
 |---|---|---|---|
-| 0.2.x | >=1.230.0,<2 | >=3.12,<3.15 | v4 |
+| 0.2.0a1 | >=1.230.0,<2 | >=3.12,<3.15 | v4 |
 
 Developed against Python 3.13 and `nautilus_trader` 1.230.0.
 
