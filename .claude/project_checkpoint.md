@@ -1,5 +1,38 @@
 # Project checkpoint
 
+## Global objective
+
+Build and maintain a complete, independent Gate.io adapter for NautilusTrader: one that lets an
+outside user obtain market data and trade Gate.io's main products safely, through Nautilus' standard
+interfaces, without any knowledge of how it was developed.
+
+The measure is not that a stranger can install it. It is that Gate.io is properly integrated into
+NautilusTrader's model — data, execution, order and account state, recovery, across products and
+account modes. The adapter must behave correctly not only on the happy path but after dropped
+connections, restarts, missed events, and disagreement between REST, the private WebSocket and
+Nautilus' own state.
+
+Every product and account mode carries an explicit, earned status: implemented, mock-tested,
+testnet-validated, or mainnet-confirmed. A capability is never described as more proven than it is.
+
+**Where this release sits.** `v0.2.0a1` is the first publicly verifiable pre-release, not the
+destination: close the remaining mechanisms, pass every release gate, run the bounded mainnet
+validation, verify the installed wheel and a TradingNode, publish the documentation and the known
+limitations.
+
+**After it.** Real use by first users drives the path to beta, then a release candidate, then a
+stable community release — widening live validation and fixing operational defects as they surface.
+Paths that cannot be exercised within the current accounts, limits and release cycle are not closed
+questions; they are scheduled for a cycle that can reach them.
+
+**Rust.** Migrating individual components is a separate decision, taken only on a clear practical
+benefit. It is not on this path and is not promised.
+
+The sequence is: a provable Python alpha, then real operation and beta, then a stable community
+release, and only then a decision about Rust.
+
+---
+
 Written from the repository and from executable evidence, not from conversation memory. Where a
 tracking file and the code disagreed, the code decided and the disagreement is recorded.
 
@@ -19,7 +52,7 @@ outside the package; conditional orders keep both venue identities via `GateioTr
 The Python-only architecture is a deliberate, stated deviation from the preferred in-tree Rust/PyO3
 shape. A Rust migration is a separate future decision and is not being pursued.
 
-## Completed since the verification audit
+## Landed since the verification audit (the implementation is not finished until the gate passes)
 
 - **EXEC-1 fixed** (`c56882d`). The fill path now reconciles the venue order identity before
   emitting, so a fill arriving before the order message is no longer refused by `Order.apply` and
