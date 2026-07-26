@@ -763,3 +763,250 @@ class TestReconnectReconciliation:
         env.run(asyncio.gather(*pending)) if pending else None
 
         assert env.perp.called("list_orders")
+
+
+# -- EXEC-1: the fill-before-order race --------------------------------------
+
+
+class TestFillBeforeOrderUpdate:
+    """Regression for EXEC-1: a fill can arrive before the order that explains it.
+
+    Gate.io publishes ``*.orders`` and ``*.usertrades`` on independent channels
+    with no ordering between them, so the first message mentioning a fired
+    conditional order is frequently its fill. Until this was fixed the fill was
+    emitted against the armed venue order id, ``Order.apply`` refused it, and the
+    execution engine swallowed the resulting ``ValueError`` into a log line — the
+    fill was simply gone, and the position silently disagreed with the venue.
+
+    Every test here drives the client through ``ExecHarness.drain``, which applies
+    each generated event to a real ``Order``. A sequence the FSM rejects therefore
+    fails the test rather than being quietly accepted.
+    """
+
+    def test_fill_before_any_order_message_is_not_lost(self, perp_harness):
+        """The whole point: no order payload has been seen, only the fill."""
+        env = perp_harness
+        order = _arm_futures_stop_limit(env)
+        text = f"t-{order.client_order_id.value}"
+
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-1", -4, text=text),
+        )
+        events = env.drain(order)
+
+        assert [type(event).__name__ for event in events] == [
+            "OrderUpdated",
+            "OrderTriggered",
+            "OrderFilled",
+        ]
+        assert order.venue_order_id == VenueOrderId("900001")
+        assert order.filled_qty == Quantity.from_int(4)
+        assert order.status == OrderStatus.PARTIALLY_FILLED
+
+    def test_the_rebase_precedes_the_fill(self, perp_harness):
+        """Ordering is the fix. `OrderUpdated` must carry the new identity first."""
+        env = perp_harness
+        order = _arm_futures_stop_limit(env)
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-1", -4, text=f"t-{order.client_order_id.value}"),
+        )
+        events = env.drain(order)
+
+        updated = next(event for event in events if isinstance(event, OrderUpdated))
+        filled = next(event for event in events if isinstance(event, OrderFilled))
+        assert updated.venue_order_id == VenueOrderId("900001")
+        assert filled.venue_order_id == VenueOrderId("900001")
+        assert events.index(updated) < events.index(filled)
+
+    def test_the_armed_identity_is_kept_after_the_rebase(self, perp_harness):
+        """Both identities survive: the armed id still addresses the price order."""
+        env = perp_harness
+        order = _arm_futures_stop_limit(env, "AUTO-77")
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-1", -4, text=f"t-{order.client_order_id.value}"),
+        )
+        env.drain(order)
+
+        link = env.client._trigger_links[order.client_order_id]
+        assert link.armed_id == "AUTO-77"
+        assert link.fired_id == "900001"
+
+    def test_several_fills_before_the_order_message(self, perp_harness):
+        """The rebase happens once; every subsequent fill applies normally."""
+        env = perp_harness
+        order = _arm_futures_stop_limit(env)
+        text = f"t-{order.client_order_id.value}"
+
+        for index, size in enumerate((-3, -3, -4), start=1):
+            env.client._handle_fill_payload(
+                GateioProductType.PERP,
+                _futures_fill_payload(f"T-{index}", size, text=text),
+            )
+        events = env.drain(order)
+
+        assert len([e for e in events if isinstance(e, OrderUpdated)]) == 1
+        assert len([e for e in events if isinstance(e, OrderFilled)]) == 3
+        assert order.filled_qty == Quantity.from_int(10)
+        assert order.status == OrderStatus.FILLED
+
+    def test_the_order_message_after_the_fill_is_idempotent(self, perp_harness):
+        """The late order payload must not rebase or re-trigger a second time."""
+        env = perp_harness
+        order = _arm_futures_stop_limit(env)
+        text = f"t-{order.client_order_id.value}"
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-1", -4, text=text),
+        )
+        env.drain(order)
+
+        env.client._handle_order_payload(
+            GateioProductType.PERP,
+            _futures_order_payload(left=-6, status="open", text=text),
+        )
+        events = env.drain(order)
+
+        assert not [e for e in events if isinstance(e, OrderTriggered)]
+        assert order.venue_order_id == VenueOrderId("900001")
+        assert order.filled_qty == Quantity.from_int(4)
+
+    def test_a_duplicate_fill_after_the_rebase_is_ignored(self, perp_harness):
+        """Replay after a recovery must not double-count."""
+        env = perp_harness
+        order = _arm_futures_stop_limit(env)
+        text = f"t-{order.client_order_id.value}"
+        payload = _futures_fill_payload("T-1", -4, text=text)
+
+        env.client._handle_fill_payload(GateioProductType.PERP, payload)
+        env.drain(order)
+        env.client._handle_fill_payload(GateioProductType.PERP, dict(payload))
+        replayed = env.drain(order)
+
+        assert replayed == []
+        assert order.filled_qty == Quantity.from_int(4)
+
+    def test_a_mismatched_identity_without_a_trigger_link_reconciles(self, perp_harness):
+        """An id that cannot be reconciled inline goes to reconciliation, not to /dev/null.
+
+        This is the safety net for identity transitions this client does not
+        model. Emitting the fill would have it rejected and dropped; reporting it
+        keeps it recoverable and says why.
+        """
+        env = perp_harness
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "555000")
+        text = f"t-{order.client_order_id.value}"
+        env.client._register_text(order.client_order_id, text)
+
+        before = len(env.reports)
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-9", -4, text=text),
+        )
+        events = env.drain(order)
+
+        assert events == []
+        assert len(env.reports) == before + 1
+        assert order.venue_order_id == VenueOrderId("555000")
+        assert order.filled_qty == Quantity.from_int(0)
+
+    def test_that_reconciled_fill_is_not_reported_twice(self, perp_harness):
+        """A replay of the unreconcilable fill must not produce a second report."""
+        env = perp_harness
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "555000")
+        text = f"t-{order.client_order_id.value}"
+        env.client._register_text(order.client_order_id, text)
+        payload = _futures_fill_payload("T-9", -4, text=text)
+
+        env.client._handle_fill_payload(GateioProductType.PERP, payload)
+        after_first = len(env.reports)
+        env.client._handle_fill_payload(GateioProductType.PERP, dict(payload))
+
+        assert len(env.reports) == after_first
+
+    def test_an_unknown_order_id_is_scheduled_for_resolution(self, perp_harness):
+        """A fill with no text at all cannot name its order; resolve it from REST."""
+        env = perp_harness
+        _arm_futures_stop_limit(env)
+
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-1", -4),
+        )
+
+        assert "900001" in env.client._trigger_resolution_attempts
+        pending = [task for task in asyncio.all_tasks(env.loop) if not task.done()]
+        assert pending, "a resolution task must have been scheduled"
+        for task in pending:
+            task.cancel()
+        # Let the cancellation reach the coroutine: a task cancelled but never
+        # awaited leaves the loop holding a coroutine that never started.
+        env.run(asyncio.gather(*pending, return_exceptions=True))
+
+    def test_reconnect_between_the_fill_and_the_order_message(self, perp_harness):
+        """A reconnect must not undo the identity the fill established."""
+        env = perp_harness
+        order = _arm_futures_stop_limit(env)
+        text = f"t-{order.client_order_id.value}"
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-1", -4, text=text),
+        )
+        env.drain(order)
+
+        env.perp.responses["list_orders"] = lambda **kwargs: []
+        env.perp.responses["my_trades"] = lambda **kwargs: []
+        env.perp.responses["accounts"] = {
+            "currency": "USDT",
+            "total": "1000",
+            "available": "1000",
+            "unrealised_pnl": "0",
+        }
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
+        env.drain(order)
+
+        assert order.venue_order_id == VenueOrderId("900001")
+        assert order.filled_qty == Quantity.from_int(4)
+        link = env.client._trigger_links[order.client_order_id]
+        assert (link.armed_id, link.fired_id) == ("AUTO-77", "900001")
+
+    def test_restart_between_the_fill_and_the_order_message(self, perp_harness):
+        """After a restart the link is rebuilt from the venue, not from memory.
+
+        A restart loses `_trigger_links` and `_applied_trade_ids`. The order is
+        restored from the Nautilus cache already rebased onto the fired id, so a
+        replayed fill must be recognised as belonging to it and must not be
+        applied twice.
+        """
+        env = perp_harness
+        order = _arm_futures_stop_limit(env)
+        text = f"t-{order.client_order_id.value}"
+        payload = _futures_fill_payload("T-1", -4, text=text)
+        env.client._handle_fill_payload(GateioProductType.PERP, payload)
+        env.drain(order)
+
+        # Restart: in-memory state is gone, the cached order survives.
+        env.client._trigger_links.clear()
+        env.client._applied_trade_ids.clear()
+        env.client._trigger_resolution_attempts.clear()
+
+        env.client._handle_fill_payload(GateioProductType.PERP, dict(payload))
+        replayed = env.drain(order)
+
+        assert replayed == []
+        assert order.filled_qty == Quantity.from_int(4)
+        assert order.venue_order_id == VenueOrderId("900001")

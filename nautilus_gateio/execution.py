@@ -2119,7 +2119,7 @@ class GateioExecutionClient(LiveExecutionClient):
         order: Order,
         venue_order_id: VenueOrderId,
         ts_event: int,
-    ) -> None:
+    ) -> bool:
         """Follow a price-triggered order onto the real order the venue fired.
 
         Gate.io arms a price-triggered order under one id and, when the trigger
@@ -2136,12 +2136,30 @@ class GateioExecutionClient(LiveExecutionClient):
         The armed id is **kept**, not discarded: it remains the only handle that
         identifies this order in the venue's price-order listings, which is what
         makes the identity rebuildable after a restart.
+
+        Returns whether an event carrying ``venue_order_id`` can now be applied
+        to ``order``. Callers on the fill path need that answer: Gate.io orders
+        ``*.orders`` and ``*.usertrades`` independently, so a fill can arrive
+        before the order message that would have rebased the identity, and
+        emitting it against a stale identity gets it rejected and dropped.
         """
-        link = self._trigger_links.get(order.client_order_id)
-        if link is None or venue_order_id.value == link.armed_id:
-            return
         if order.venue_order_id is not None and order.venue_order_id == venue_order_id:
-            return  # Already rebased onto this order
+            return True  # Already rebased onto this order
+        link = self._trigger_links.get(order.client_order_id)
+        if link is None:
+            # Not a conditional order. The identity is reconcilable only while
+            # the order carries none of its own, which the framework permits.
+            return order.venue_order_id is None
+        if venue_order_id.value == link.armed_id:
+            return True  # The event carries the armed id the order already holds
+        if self._cache.venue_order_id(order.client_order_id) == venue_order_id:
+            # The rebase was already emitted. `order.venue_order_id` may still
+            # read as the armed id here, because the order object is only updated
+            # once the execution engine applies the `OrderUpdated` — and several
+            # fills for a freshly fired order can be handled before that happens.
+            # The cache mapping is written synchronously by the rebase itself, so
+            # it is the one signal that does not depend on event delivery.
+            return True
         self._attach_fired_order_id(link, venue_order_id.value)
         self._cache.add_venue_order_id(
             client_order_id=order.client_order_id,
@@ -2169,6 +2187,7 @@ class GateioExecutionClient(LiveExecutionClient):
                 venue_order_id=venue_order_id,
                 ts_event=ts_event,
             )
+        return True
 
     def _schedule_fired_order_resolution(
         self,
@@ -2430,6 +2449,26 @@ class GateioExecutionClient(LiveExecutionClient):
             )
             or self._clock.timestamp_ns()
         )
+
+        if not self._maybe_swap_trigger_venue_order_id(order, venue_order_id, ts_event):
+            # Gate.io orders `*.orders` and `*.usertrades` independently, so this
+            # fill can be the first message that mentions the fired order at all.
+            # The identity could not be reconciled inline, and `Order.apply`
+            # refuses an `OrderFilled` whose venue order id differs from the one
+            # already on the order — the exception is swallowed by the execution
+            # engine, which is how a fill goes missing silently. Report it
+            # through reconciliation instead, where an id mismatch is expected
+            # and resolved against the venue, and say so loudly enough to act on.
+            self._log.error(
+                f"Fill {trade_id.value} carries venue order id {venue_order_id.value}, but "
+                f"{order.client_order_id!r} holds {order.venue_order_id}; the identity could not "
+                f"be reconciled from this event. Routing the fill through reconciliation.",
+            )
+            applied.add(trade_id.value)
+            report = self._parse_fill_report(product, payload, instrument)
+            if report is not None:
+                self._send_fill_report(report)
+            return
 
         self._maybe_convert_quote_quantity(order, instrument, venue_order_id, last_px, ts_event)
 
