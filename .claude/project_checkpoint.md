@@ -139,6 +139,55 @@ past the closed-check and awaiting the rate limiter then surfaces a raw httpx `R
 of the adapter's own `GateioError(CLIENT_CLOSED)`. Cancelling tasks before releasing the transport
 closes that window. Found by the TradingNode smoke harness.
 
+## Plan from here to a stable release
+
+Blocks, in dependency order. A block does not start until the one before it has evidence, not
+intent.
+
+### A — Correctness debt (blocks the alpha)
+
+| | Work | State |
+|---|---|---|
+| A1 | Adversarially verify the round-two fixes. They pass their harnesses; round one did too and was refuted on all three | not run — session limit |
+| A2 | Map the 90 numbered upstream test cases (`spec_exec_testing.md`, `spec_data_testing.md`) onto this suite. Nothing here references them, so coverage is unknown | not run — session limit |
+| A3 | Replace the duplicated platform facilities. `secs_to_nanos`, `millis_to_nanos`, `nanos_to_secs` all exist in `nautilus_trader.core.datetime`; `data.py` already imports from that module, so these were written beside the originals | open |
+| A4 | Audit the whole package for the same class of duplication, against `docs/concepts/` (30 docs), `docs/integrations/` (20 adapter pages) and the in-tree adapter source — none of which has been read | open |
+| A5 | Run the TradingNode smoke from the INSTALLED wheel. It currently runs from the source tree, which is the arrangement that once hid a wheel built without its sub-packages | open |
+
+### B — Gate
+
+All ten conditions, with the extended harness scenarios. No condition is weakened to obtain a pass.
+
+### C — Bounded live validation
+
+Preflight, then the smallest orders that prove submission, acknowledgement, fill handling,
+cancellation, the trigger transition, balance and position convergence, and restart recovery.
+Preflight again between products and after any interrupted scenario. What the account and limits
+cannot reach is classified, not simulated by proving an adjacent endpoint.
+
+### D — Release v0.2.0a1
+
+Packaging verified from the installed artefact, secret scans, documentation carrying the real
+validation results, tag on the exact validated commit, report.
+
+### E — Alpha to beta
+
+Driven by what first users hit. Also the deferred technical decisions:
+
+- Evaluate moving to `nautilus_pyo3.HttpClient` / `WebSocketClient` / `Quota` and
+  `live.retry.RetryManagerPool`. The in-tree reference adapter uses all four; this package
+  reimplemented each on `httpx` and `websockets`. Those platform clients are Rust behind PyO3, so a
+  large part of what a "Rust migration" would buy is available without writing any Rust. Changing
+  transport mid-release-cycle is a risk out of proportion to the benefit right now, which is why it
+  is here and not in block A — deferred deliberately, not overlooked.
+- Evaluate `test_kit.stubs` and `test_kit.mocks` in place of hand-built fixtures.
+
+### F — Stable
+
+Sustained live operation, the upstream case coverage closed, operational defects fixed. Only then
+is a Rust decision worth taking, on demonstrated need.
+
+
 ## Next steps, in order
 
 1. Land and independently verify the three blocker fixes.
