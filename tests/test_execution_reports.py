@@ -17,11 +17,22 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
 )
-from nautilus_trader.model.enums import OrderSide, OrderStatus, PositionSide
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.enums import (
+    LiquiditySide,
+    OmsType,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    PositionSide,
+)
+from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.identifiers import PositionId, TradeId, VenueOrderId
+from nautilus_trader.model.objects import Money, Quantity
+from nautilus_trader.model.position import Position
 
 from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.execution import REPORT_PAGE_LIMIT
+from nautilus_gateio.common.errors import WalletNotProvisionedError
+from nautilus_gateio.execution import REPORT_PAGE_LIMIT, PositionStatusUnavailable
 
 try:  # pytest inserts the tests directory on the path; support both layouts
     from tests.test_execution_orders import (
@@ -437,6 +448,229 @@ class TestMissingInstrumentHandling:
             assert reports[0].quantity == Quantity.from_int(20)
         finally:
             env.close()
+
+
+# -- positions the venue does not keep ----------------------------------------
+
+
+def _position_command(instrument_id: Any) -> GeneratePositionStatusReports:
+    return GeneratePositionStatusReports(
+        instrument_id=instrument_id,
+        start=None,
+        end=None,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def _open_futures_orders() -> list[dict[str, Any]]:
+    """One resting perpetual order, as the venue lists it."""
+    return [
+        {
+            "id": 900001,
+            "contract": "BTC_USDT",
+            "size": -10,
+            "left": -10,
+            "price": "60000",
+            "status": "open",
+            "create_time": INSIDE_SECS,
+            "text": "t-O-1",
+        },
+    ]
+
+
+def _cache_open_position(env: ExecHarness, instrument_id: Any, quantity: Quantity) -> Position:
+    """Leave an open Nautilus position on ``instrument_id`` in the cache.
+
+    Nautilus opens a position from a fill on any instrument, spot included, so
+    this is the state the engine's periodic position check walks — the reason the
+    account-wide answer is read as a claim about every instrument it omits.
+    """
+    instrument = env.cache.instrument(instrument_id)
+    order = env.order_factory.market(instrument_id, OrderSide.BUY, quantity)
+    env.accepted(order, "P-1")
+    env.client.generate_order_filled(
+        strategy_id=order.strategy_id,
+        instrument_id=instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("P-1"),
+        venue_position_id=PositionId(f"{instrument_id}-POS"),
+        trade_id=TradeId("P-T-1"),
+        order_side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        last_qty=quantity,
+        last_px=instrument.make_price(Decimal("60000")),
+        quote_currency=instrument.quote_currency,
+        commission=Money(0, instrument.quote_currency),
+        liquidity_side=LiquiditySide.TAKER,
+        ts_event=env.clock.timestamp_ns(),
+    )
+    env.drain(order)
+    fill = env.events_of(OrderFilled)[-1]
+    position = Position(instrument=instrument, fill=fill)
+    env.cache.add_position(position, OmsType.NETTING)
+    return position
+
+
+class TestSpotPositionsAreNotReported:
+    """Regression: a FLAT report is a claim about the venue, and spot has none.
+
+    Startup reconciliation asks this client, one instrument at a time, about
+    every open position the cache holds — and Nautilus opens a position from a
+    spot fill like any other. Answering FLAT made the engine square the book with
+    a reconciliation order and an inferred fill: an execution that never
+    happened. Gate.io has no spot position endpoint and a spot balance is not a
+    position, so there is nothing to report and nothing to be flat about.
+    """
+
+    def test_a_spot_position_query_is_answered_as_not_applicable(self, spot_env):
+        env = spot_env
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(SPOT_BTC_USDT)),
+        )
+
+        assert reports == []
+
+    def test_a_futures_position_query_is_still_answered_flat(self, perp_env):
+        """The FLAT answer stays where the venue really can say "no position".
+
+        Without it a futures position closed at the venue could never be closed
+        locally, which is why the fallback exists at all.
+        """
+        env = perp_env
+        env.perp.responses["position"] = {}
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.FLAT]
+        assert reports[0].instrument_id == PERP_BTC_USDT
+
+    def test_an_account_wide_query_reports_no_spot_position(self, spot_env):
+        """The same rule with no instrument named: spot is skipped, not flattened."""
+        env = spot_env
+
+        reports = env.run(env.client.generate_position_status_reports(_position_command(None)))
+
+        assert reports == []
+
+    def test_an_instrument_this_client_does_not_route_is_not_reported_flat(self, spot_env):
+        """A FLAT answer needs a question, and an unrouted product was never asked.
+
+        The product loop only queries the configured products, so for anything
+        else the fallback would answer FLAT off the back of no venue call at all
+        — the same claim-without-an-answer as the spot case, one product wider.
+        """
+        env = spot_env  # spot only; the perpetual is not routed here
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert reports == []
+
+
+class TestUnansweredPositionQueries:
+    """Regression: "the venue did not answer" may not become "the venue is flat".
+
+    A raise is the only way this client can tell ``LiveExecutionEngine`` that a
+    position query went unanswered — ``_did_position_status_query_fail`` skips a
+    venue whose query raised, and the startup path counts the raise as a failed
+    reconciliation. Swallowing the error and falling through to FLAT closes a
+    position that is still open at the venue, with a RECONCILIATION order and an
+    inferred fill: an execution that never happened, on the product where it does
+    the most damage.
+    """
+
+    def test_a_failed_per_instrument_query_raises_instead_of_answering_flat(self, perp_env):
+        env = perp_env
+        env.perp.responses["position"] = RuntimeError("502 Bad Gateway from the venue")
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_a_failed_account_wide_query_raises_instead_of_answering_nothing(self, perp_env):
+        """An incomplete sweep is not an answer either.
+
+        The engine's periodic check reads omission from an account-wide answer as
+        flatness, so half a sweep is a claim about the half that is missing.
+        """
+        env = perp_env
+        env.perp.responses["positions"] = RuntimeError("502 Bad Gateway from the venue")
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(env.client.generate_position_status_reports(_position_command(None)))
+
+    def test_an_unprovisioned_wallet_is_an_answer_and_stays_one(self, perp_env):
+        """Gate.io says USER_NOT_FOUND until a product wallet exists.
+
+        That is a definite "there is no position here", not an unanswered
+        question, so it must not be turned into a failure — an account trading
+        only spot has to be able to start.
+        """
+        env = perp_env
+        env.perp.responses["position"] = WalletNotProvisionedError("no futures wallet yet")
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.FLAT]
+
+    def test_an_account_wide_sweep_refuses_to_omit_a_position_it_cannot_report(self, spot_env):
+        """The periodic check builds the FLAT report itself for anything omitted.
+
+        ``LiveExecutionEngine._process_cached_position_discrepancies`` walks its
+        own cached open positions and, for each one the account-wide answer did
+        not mention, calls ``_create_flat_position_report`` and squares the book
+        against it. To that caller an empty answer and a FLAT report are the same
+        answer, so silence is only honest while there is nothing to be silent
+        about.
+        """
+        env = spot_env
+        _cache_open_position(env, SPOT_BTC_USDT, Quantity.from_str("0.010000"))
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(env.client.generate_position_status_reports(_position_command(None)))
+
+    def test_an_account_wide_sweep_answers_when_it_can_speak_for_every_position(self, perp_env):
+        """The refusal is scoped to what this client cannot report on.
+
+        A derivatives-only account keeps a fully working periodic check: the
+        venue really can answer for every open position, so an empty answer means
+        flat and the engine is right to act on it.
+        """
+        env = perp_env
+        _cache_open_position(env, PERP_BTC_USDT, Quantity.from_int(4))
+
+        reports = env.run(env.client.generate_position_status_reports(_position_command(None)))
+
+        assert reports == []
+
+    def test_the_startup_mass_status_survives_an_unanswerable_position_query(self, perp_env):
+        """One 502 on the position endpoint may not cost the order recovery.
+
+        The inherited ``generate_mass_status`` returns ``None`` — no orders, no
+        fills, no reconciliation at all — if any of its three queries raises, and
+        the position query now raises by design. Positions lose nothing by being
+        left out: startup reconciliation queries them per instrument straight
+        afterwards, where "the venue did not answer" is handled correctly.
+        """
+        env = perp_env
+        env.perp.responses["positions"] = RuntimeError("502 Bad Gateway from the venue")
+        env.perp.responses["list_orders"] = lambda **kwargs: (
+            _open_futures_orders() if kwargs.get("status") == "open" else []
+        )
+
+        mass_status = env.run(env.client.generate_mass_status())
+
+        assert mass_status is not None
+        assert [str(key) for key in mass_status.order_reports] == ["900001"]
+        assert mass_status.position_reports == {}
 
 
 # -- contract report parsing --------------------------------------------------

@@ -89,7 +89,8 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from typing import Any, Final
@@ -111,6 +112,7 @@ from nautilus_trader.execution.messages import (
     SubmitOrder,
 )
 from nautilus_trader.execution.reports import (
+    ExecutionMassStatus,
     FillReport,
     OrderStatusReport,
     PositionStatusReport,
@@ -187,6 +189,61 @@ from nautilus_gateio.http.options import GateioOptionsHttpAPI
 from nautilus_gateio.http.spot import GateioSpotHttpAPI
 from nautilus_gateio.http.wallet import GateioWalletHttpAPI
 from nautilus_gateio.websocket.private import ALL, GateioPrivateWebSocket
+
+
+@dataclass
+class SpotQuantity:
+    """What a live spot order's quantity is made of, tracked apart from the order.
+
+    A Gate.io spot BUY is charged its fee in the currency being bought, so the
+    venue credits ``amount - fee`` base units for a match of ``amount``. The
+    fills this client publishes are netted of that fee (EXEC-4), so a fully
+    matched order's fills add up to less than the quantity it was submitted with,
+    and the order has to be restated or it never leaves ``cache.orders_open()``.
+
+    The restatement is *not* a second opinion about the order's quantity: it is
+    ``gross - withheld``, and the two move for entirely unrelated reasons.
+    ``gross`` is the venue's own order size and changes only when the venue says
+    so — a spot amend, which ``_modify_order`` supports and another session can
+    make at any time. ``withheld`` only ever grows, by whatever the venue kept on
+    each fill. Keeping them apart is what lets an amend and the fee compose:
+    what is still working at the venue is ``gross - matched``, and no arithmetic
+    over fees may change that.
+
+    They are held here rather than read back off the order because
+    ``OrderUpdated`` reaches the order through the execution engine's event
+    queue, so ``order.quantity`` still reads its pre-update value for as long as
+    the queue is undrained — and Gate.io delivers several fills in one frame,
+    which the fill handler walks synchronously. A shadow of the *result*, though,
+    is what refuted the first attempt at this: it went stale the moment anyone
+    else restated the order, and silently discarded the amend. These three
+    numbers cannot go stale that way, because every source that changes the
+    order's quantity updates the one it owns.
+    """
+
+    #: The order size as the venue states it, in base units.
+    gross: Decimal
+    #: Cumulative base currency the venue has kept as its fee.
+    withheld: Decimal = Decimal(0)
+    #: Cumulative base currency actually credited by fills (net of the fee).
+    matched: Decimal = Decimal(0)
+
+
+class PositionStatusUnavailable(Exception):
+    """The venue was asked about a position and no answer came back.
+
+    Raised rather than returned, because a returned list cannot say this.
+    NautilusTrader distinguishes "the venue says flat" from "the venue did not
+    answer" only by whether
+    :meth:`GateioExecutionClient.generate_position_status_reports` raises:
+    ``LiveExecutionEngine._did_position_status_query_fail`` skips a venue whose
+    query raised, and the startup path counts the raise as a failed
+    reconciliation rather than reconciling against nothing. Swallowing the
+    failure and answering with silence — or worse, with FLAT — hands the engine a
+    claim the venue never made, and the engine squares the book against it with a
+    RECONCILIATION order and an inferred fill.
+    """
+
 
 #: Order types this client can express on Gate.io.
 SUPPORTED_ORDER_TYPES: Final[frozenset[OrderType]] = frozenset(
@@ -505,6 +562,8 @@ class GateioExecutionClient(LiveExecutionClient):
 
         # Fills already applied, so a replayed usertrade cannot fill twice
         self._applied_trade_ids: dict[ClientOrderId, set[str]] = {}
+        #: What each live spot order's quantity is made of (see `SpotQuantity`).
+        self._spot_quantities: dict[ClientOrderId, SpotQuantity] = {}
 
         # Last known wallet state per currency: {currency: (total, free)}
         self._balances: dict[str, tuple[Decimal, Decimal]] = {}
@@ -705,6 +764,38 @@ class GateioExecutionClient(LiveExecutionClient):
         same REST queries reconciliation uses and feeds the results back through
         the execution engine, which de-duplicates them by venue order id and
         venue trade id.
+
+        The results are handed over as **one** ``ExecutionMassStatus`` rather
+        than as a stream of individual reports. That is not a cosmetic choice.
+        ``ExecEngine.reconcile_execution_report`` reconciles each report against
+        the local order *in isolation*, and neither report is self-sufficient:
+
+        * an order status report alone states a filled quantity without the
+          trades that produced it, so the engine closes the difference with an
+          **inferred** fill carrying a synthetic trade id. The venue's own trade
+          then arrives with the real id, which the engine cannot recognise as the
+          same execution: it is either applied on top (4 lots recorded as 8) or,
+          when the inferred fill is stamped later than the real one, discarded —
+          and with it the only key by which any later replay could be matched;
+        * a fill report alone cannot restate the order's quantity, so a spot buy
+          whose base-currency fee shrinks the quantity the venue can ever credit
+          (EXEC-4) is applied as a fill against a quantity it can never reach.
+          ``Order.apply(OrderUpdated)`` never triggers a terminal status, so the
+          restatement that follows leaves the order at zero remaining quantity
+          and permanently PARTIALLY_FILLED.
+
+        Merely sending the fills before the orders fixes the first half and
+        creates the second. ``_reconcile_execution_mass_status`` takes an order
+        report *together with* its trades: it restates the quantity first,
+        applies the venue's own trades under their own ids next, and only then
+        infers anything for a residual difference. That is exactly the order
+        these two failure modes require, and it is the same path startup
+        reconciliation already uses.
+
+        Grouping alone is not enough, though, because it makes delivery of a
+        trade *conditional on the status of the order report it was grouped
+        under* — see :meth:`_hand_over_unapplied_fills` for what that costs and
+        how the sweep afterwards repairs it.
         """
         await self._update_account_state()
 
@@ -726,9 +817,6 @@ class GateioExecutionClient(LiveExecutionClient):
                     log_receipt_level=LogLevel.DEBUG,
                 ),
             )
-            for order_report in order_reports:
-                self._send_order_status_report(order_report)
-
             fill_reports = await self.generate_fill_reports(
                 GenerateFillReports(
                     instrument_id=None,
@@ -739,17 +827,90 @@ class GateioExecutionClient(LiveExecutionClient):
                     ts_init=self._clock.timestamp_ns(),
                 ),
             )
-            for fill_report in fill_reports:
-                self._send_fill_report(fill_report)
         except Exception as e:  # noqa: BLE001 - a failed re-query must not kill the client
             self._log.error(f"Cannot reconcile after the {product.value} reconnect: {e}")
             return
+
+        mass_status = ExecutionMassStatus(
+            client_id=self.id,
+            account_id=self.account_id,
+            venue=self.venue,
+            report_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+        )
+        mass_status.add_order_reports(reports=order_reports)
+        mass_status.add_fill_reports(reports=fill_reports)
+
+        self._send_mass_status_report(mass_status)
+        self._hand_over_unapplied_fills(fill_reports)
 
         self._log.info(
             f"Reconciled {len(order_reports)} order and {len(fill_reports)} fill reports after "
             f"the {product.value} reconnect",
             LogColor.GREEN,
         )
+
+    def _hand_over_unapplied_fills(self, fill_reports: list[FillReport]) -> None:
+        """Re-offer, one by one, every recovered trade the grouped pass did not book.
+
+        Grouping a trade under its order report is what lets the engine restate
+        the order's quantity before applying the trade, but it also routes the
+        trade through ``LiveExecutionEngine._reconcile_order_report``, which asks
+        ``_handle_order_status_transitions`` about the *order report* first. That
+        returns "reconciled" — before the ``for trade in trades`` loop is ever
+        reached — for every one of:
+
+        * ``ACCEPTED``: the ordinary reconnect race. This method queries the
+          order listing and the trade listing as two sequential paginated REST
+          sweeps, so a match landing between them appears in the trade listing
+          while the order snapshot still reads ``left == size``, which parses to
+          ACCEPTED with ``filled_qty=0``;
+        * ``TRIGGERED``: a conditional order that fired and matched before its
+          own listing caught up;
+        * ``REJECTED``;
+        * ``CANCELED`` and ``EXPIRED`` *when the local order already holds that
+          status* — the stream delivered the terminal message and the fill that
+          preceded it went missing, which is the exact gap this recovery exists
+          to close.
+
+        The mass-status loop drops trades in two further places that have
+        nothing to do with status: a report whose reconciliation raises
+        ``InvalidStateTrigger`` (caught per order, remaining trades abandoned),
+        and a fill whose venue order id has no order report at all (an order that
+        finished outside the window its trade falls inside, or one the venue
+        answered for on only one of the two endpoints).
+
+        Rather than predict which of those applies — the CANCELED and EXPIRED
+        branches depend on local order state, so no static rule can — this
+        checks the outcome. ``_send_mass_status_report`` dispatches synchronously
+        over the message bus and the engine applies reconciliation fills
+        immediately, so by the time it returns the cache already shows which
+        trade ids were booked. Anything missing goes through
+        ``_reconcile_fill_report_single``, which has no status gate. A trade the
+        grouped pass *did* book is skipped, and a replay of one is refused by the
+        engine's own trade-id de-duplication, so no execution can be counted
+        twice.
+        """
+        for report in fill_reports:
+            if self._fill_is_booked(report):
+                continue
+            self._log.warning(
+                f"Recovered trade {report.trade_id.value} was not booked by the grouped "
+                f"hand-over for {report.venue_order_id!r}; reporting it on its own",
+            )
+            self._send_fill_report(report)
+
+    def _fill_is_booked(self, report: FillReport) -> bool:
+        """Return whether this venue trade is already on the order it belongs to."""
+        client_order_id = report.client_order_id
+        if client_order_id is None and report.venue_order_id is not None:
+            client_order_id = self._cache.client_order_id(report.venue_order_id)
+        if client_order_id is None:
+            return False
+        order = self._cache.order(client_order_id)
+        if order is None:
+            return False
+        return report.trade_id in order.trade_ids
 
     def _credentials(self) -> tuple[str, str]:
         from nautilus_gateio.common.credentials import resolve_credentials
@@ -960,6 +1121,7 @@ class GateioExecutionClient(LiveExecutionClient):
         if text is not None:
             self._client_order_id_by_text.pop(text, None)
         self._applied_trade_ids.pop(client_order_id, None)
+        self._spot_quantities.pop(client_order_id, None)
         link = self._trigger_links.pop(client_order_id, None)
         if link is not None:
             self._trigger_by_armed_id.pop(link.armed_id, None)
@@ -2065,6 +2227,7 @@ class GateioExecutionClient(LiveExecutionClient):
                 )
             else:
                 self._maybe_generate_order_updated(
+                    product,
                     order,
                     payload,
                     instrument,
@@ -2275,13 +2438,25 @@ class GateioExecutionClient(LiveExecutionClient):
 
     def _maybe_generate_order_updated(
         self,
+        product: GateioProductType,
         order: Order,
         payload: dict[str, Any],
         instrument: Instrument | None,
         venue_order_id: VenueOrderId,
         ts_event: int,
     ) -> None:
-        """Emit ``OrderUpdated`` when the venue reports an amended order."""
+        """Emit ``OrderUpdated`` when the venue reports an amended order.
+
+        The payload's quantity is the venue's *gross* order size, which is what
+        a Gate.io amend restates and what another session's amend restates too —
+        nothing in the payload distinguishes the two, and nothing should. On spot
+        it is recorded as ``SpotQuantity.gross`` and the order is asked for
+        ``gross - withheld``, so an amend and the base-currency fee compose
+        instead of overwriting each other. Without that, every venue update
+        during a partially filled spot buy would restate the order back to gross
+        and undo the netting — which the next fill would redo, leaving the final
+        state decided by whichever message happened to arrive last.
+        """
         if order.order_type == OrderType.MARKET:
             # A market order has no resting price or quantity to amend on
             # Gate.io, and its payload quantity is denominated differently
@@ -2303,8 +2478,23 @@ class GateioExecutionClient(LiveExecutionClient):
         )
         if quantity is None:
             return
+
+        if product.is_spot:
+            state = self._spot_quantities.get(order.client_order_id)
+            if state is None:
+                state = SpotQuantity(
+                    gross=quantity.as_decimal(),
+                    matched=order.filled_qty.as_decimal(),
+                )
+                self._spot_quantities[order.client_order_id] = state
+            else:
+                state.gross = quantity.as_decimal()
+            restated = instrument.make_qty(max(state.gross - state.withheld, state.matched))
+        else:
+            restated = quantity
+
         order_price = getattr(order, "price", None)
-        if quantity == order.quantity and (price is None or price == order_price):
+        if restated == order.quantity and (price is None or price == order_price):
             return
 
         self.generate_order_updated(
@@ -2312,10 +2502,11 @@ class GateioExecutionClient(LiveExecutionClient):
             instrument_id=order.instrument_id,
             client_order_id=order.client_order_id,
             venue_order_id=venue_order_id,
-            quantity=quantity,
+            quantity=restated,
             price=price,
             trigger_price=getattr(order, "trigger_price", None),
             ts_event=ts_event,
+            is_quote_quantity=False if product.is_spot else None,
         )
 
     @staticmethod
@@ -2474,6 +2665,15 @@ class GateioExecutionClient(LiveExecutionClient):
             return
 
         self._maybe_convert_quote_quantity(order, instrument, venue_order_id, last_px, ts_event)
+        self._net_withheld_base(
+            product,
+            order,
+            instrument,
+            payload,
+            venue_order_id,
+            last_qty,
+            ts_event,
+        )
 
         applied.add(trade_id.value)
         self.generate_order_filled(
@@ -2540,12 +2740,22 @@ class GateioExecutionClient(LiveExecutionClient):
         the venue's own fill price before the first fill is applied, so that
         position and PnL arithmetic downstream works in one unit.
         """
+        if order.client_order_id in self._spot_quantities:
+            # This order's quantity is already tracked in base units, so the
+            # conversion has either happened or is not needed. Both guards below
+            # read the order, which still carries its pre-update state while the
+            # engine's queue is undrained, so a second fill in the same frame
+            # would otherwise convert a second time.
+            return
         if not order.is_quote_quantity or order.filled_qty.as_decimal() > 0:
             return
         price = last_px.as_decimal()
         if price <= 0:
             return
         base_quantity = instrument.make_qty(order.quantity.as_decimal() / price)
+        self._spot_quantities[order.client_order_id] = SpotQuantity(
+            gross=base_quantity.as_decimal(),
+        )
         self.generate_order_updated(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -2554,6 +2764,127 @@ class GateioExecutionClient(LiveExecutionClient):
             quantity=base_quantity,
             price=getattr(order, "price", None),
             trigger_price=None,
+            ts_event=ts_event,
+            is_quote_quantity=False,
+        )
+
+    def _net_withheld_base(
+        self,
+        product: GateioProductType,
+        order: Order,
+        instrument: Instrument,
+        payload: dict[str, Any],
+        venue_order_id: VenueOrderId,
+        last_qty: Quantity,
+        ts_event: int,
+    ) -> None:
+        """Fold one spot fill into the order's quantity bookkeeping and restate it.
+
+        Gate.io charges a spot BUY fee in the currency being bought, so it
+        credits ``amount - fee`` base units for a match of ``amount``.
+        ``_fill_quantity_and_commission`` nets that off ``last_qty`` (EXEC-4), so
+        the order's fills can never add up to the quantity it was submitted with:
+        the shortfall is exactly the cumulative fee, and it is not a quantity
+        still working at the venue. Left alone, a fully matched buy ends with
+        zero remaining quantity and status PARTIALLY_FILLED, and stays in
+        ``cache.orders_open()`` for the rest of the session.
+
+        Restating the order is the only way out, and it has to happen *before*
+        the closing fill: ``Order.apply(OrderUpdated)`` never triggers a terminal
+        status, so an update that arrives after the last fill lands leaves the
+        order at zero remaining quantity and still open — which is precisely what
+        the REST report path does when the stream applied the fill first. The
+        same reasoning already governs ``_maybe_convert_quote_quantity``.
+
+        What is recorded here is the fee itself, not the quantity it implies:
+        ``SpotQuantity.withheld`` grows by this fill's withheld base and
+        ``gross`` is left alone, because only the venue moves ``gross``. The
+        target quantity is then always ``gross - withheld``, whoever last
+        amended the order — which is the difference between this and a shadow
+        copy of the order's quantity, and the reason an amend between two fills
+        now survives instead of being discarded.
+
+        The withheld amount is derived from ``last_qty`` rather than from the
+        payload's ``fee`` so that both sides carry the same rounding: netting the
+        raw fee here and a rounded fee into the fill would reintroduce the gap
+        this method exists to close, one dust unit at a time.
+        """
+        if not product.is_spot:
+            return  # Derivative fees are charged in the settlement currency
+
+        state = self._spot_quantities.get(order.client_order_id)
+        if state is None:
+            if order.is_quote_quantity:
+                # A quote-denominated spot market buy whose conversion could not
+                # run (the venue published no usable fill price). Its quantity is
+                # a cash amount, and netting base units off cash means nothing.
+                self._log.warning(
+                    f"Not restating {order.client_order_id!r}: its quantity is still "
+                    f"denominated in {instrument.quote_currency}, so the base-currency fee "
+                    f"withheld from fill {payload.get('id')!r} cannot be netted off it",
+                )
+                return
+            state = SpotQuantity(
+                gross=order.quantity.as_decimal(),
+                matched=order.filled_qty.as_decimal(),
+            )
+            self._spot_quantities[order.client_order_id] = state
+
+        state.matched += last_qty.as_decimal()
+        state.withheld += max(
+            Decimal(0),
+            to_decimal(payload.get("amount")) - last_qty.as_decimal(),
+        )
+        self._restate_spot_quantity(order, instrument, venue_order_id, ts_event, state)
+
+    def _restate_spot_quantity(
+        self,
+        order: Order,
+        instrument: Instrument,
+        venue_order_id: VenueOrderId,
+        ts_event: int,
+        state: SpotQuantity,
+    ) -> None:
+        """Ask the engine for ``gross - withheld``, the only quantity that composes.
+
+        ``gross - matched`` is what the venue is still working, and netting the
+        fee off the order's quantity has to leave that untouched: with the order
+        at ``gross - withheld`` and its fills summing to ``matched - withheld``,
+        the remaining quantity reads ``gross - matched`` exactly. It reaches zero
+        when the venue has matched the order in full and never before, whether or
+        not the venue amended the order along the way.
+
+        ``is_quote_quantity`` is stated rather than inherited: ``generate_order_updated``
+        resolves ``None`` from the *cached* order, which still reads ``True``
+        while the conversion's own ``OrderUpdated`` sits in the engine's queue, so
+        inheriting it would re-flag a base-denominated quantity as quote.
+        """
+        target = state.gross - state.withheld
+        if target < state.matched:
+            # The venue would have to have amended the order below what it has
+            # already matched. Nothing this client can express is below its own
+            # fills, so clamp and say so rather than emit a quantity that makes
+            # `leaves_qty` negative.
+            self._log.warning(
+                f"Clamping the restated quantity of {order.client_order_id!r} from {target} "
+                f"to {state.matched}: the venue's order size ({state.gross}) less the "
+                f"base-currency fees it withheld ({state.withheld}) is below what it has "
+                f"already credited",
+            )
+            target = state.matched
+
+        quantity = instrument.make_qty(target)
+        if quantity == order.quantity:
+            return
+
+        self.generate_order_updated(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=venue_order_id,
+            quantity=quantity,
+            price=getattr(order, "price", None),
+            trigger_price=getattr(order, "trigger_price", None),
             ts_event=ts_event,
             is_quote_quantity=False,
         )
@@ -2901,6 +3232,111 @@ class GateioExecutionClient(LiveExecutionClient):
         self._log.info(f"Transferred {amount} {currency} from {from_} to {to}")
         await self._update_account_state()
         return response
+
+    # -- reconciliation: startup mass status --------------------------------
+
+    async def generate_mass_status(
+        self,
+        lookback_mins: int | None = None,
+    ) -> ExecutionMassStatus | None:
+        """Assemble the startup mass status, surviving an unanswerable position query.
+
+        The inherited implementation gathers the three report sets together and
+        returns ``None`` — no orders, no fills, no reconciliation at all — if any
+        one of them raises. That is the wrong trade here, because
+        :meth:`generate_position_status_reports` raises *by design*: it is the
+        only way this client can tell the engine that a position query went
+        unanswered, and the engine's position paths depend on hearing it.
+        Inheriting the base behaviour would let one 502 on the position endpoint
+        throw away the order and fill recovery a restart exists to perform.
+
+        Positions lose nothing by being left out of the mass status when they
+        could not be read: ``reconcile_execution_state`` follows the mass status
+        by querying, per instrument, every open position the mass status did not
+        cover, and that path handles both "the venue says flat" and "the venue
+        did not answer" correctly.
+        """
+        self._log.info("Generating ExecutionMassStatus...")
+        self.reconciliation_active = True
+
+        since = (
+            self._clock.utc_now() - timedelta(minutes=lookback_mins)
+            if lookback_mins is not None
+            else None
+        )
+        ts_init = self._clock.timestamp_ns()
+
+        mass_status = ExecutionMassStatus(
+            client_id=self.id,
+            account_id=self.account_id,
+            venue=self.venue,
+            report_id=UUID4(),
+            ts_init=ts_init,
+        )
+
+        # Concurrent, as in the base class: the order listing and the trade
+        # listing are two separate venue answers, and every moment between them
+        # is a window in which a match can land in one and not the other.
+        orders, fills, positions = await asyncio.gather(
+            self.generate_order_status_reports(
+                GenerateOrderStatusReports(
+                    instrument_id=None,
+                    start=since,
+                    end=None,
+                    open_only=False,
+                    command_id=UUID4(),
+                    ts_init=ts_init,
+                ),
+            ),
+            self.generate_fill_reports(
+                GenerateFillReports(
+                    instrument_id=None,
+                    venue_order_id=None,
+                    start=since,
+                    end=None,
+                    command_id=UUID4(),
+                    ts_init=ts_init,
+                ),
+            ),
+            self.generate_position_status_reports(
+                GeneratePositionStatusReports(
+                    instrument_id=None,
+                    start=since,
+                    end=None,
+                    command_id=UUID4(),
+                    ts_init=ts_init,
+                ),
+            ),
+            return_exceptions=True,
+        )
+
+        for result in (orders, fills, positions):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+
+        if isinstance(orders, BaseException) or isinstance(fills, BaseException):
+            failure = orders if isinstance(orders, BaseException) else fills
+            self._log.exception("Cannot reconcile execution state", failure)
+            return None
+
+        mass_status.add_order_reports(reports=orders)
+        mass_status.add_fill_reports(reports=fills)
+
+        if isinstance(positions, PositionStatusUnavailable):
+            self._log.warning(
+                f"Startup mass status carries no position reports: {positions}. "
+                f"Open positions are reconciled per instrument straight after this",
+            )
+        elif isinstance(positions, BaseException):
+            self._log.exception(
+                "Cannot read position status for the startup mass status",
+                positions,
+            )
+        else:
+            mass_status.add_position_reports(reports=positions)
+
+        self.reconciliation_active = False
+        return mass_status
 
     # -- reconciliation: order status --------------------------------------
 
@@ -3839,37 +4275,153 @@ class GateioExecutionClient(LiveExecutionClient):
         self,
         command: GeneratePositionStatusReports,
     ) -> list[PositionStatusReport]:
-        """Generate position status reports for the derivative products."""
+        """Report the venue's positions, or say the venue did not answer.
+
+        Every branch below turns on one distinction: *did the venue make a
+        statement about this instrument?* NautilusTrader has exactly three ways
+        to hear an answer, and they are not interchangeable:
+
+        ``PositionStatusReport``
+            The venue says the position is this. The engine will square the local
+            book against it, minting a RECONCILIATION order and an inferred fill
+            if they disagree.
+        ``[]`` (this instrument omitted)
+            Nothing is claimed. On the per-instrument query the engine simply has
+            no report and leaves the position alone; in an *account-wide* answer,
+            though, the engine reads omission as flatness, which is why the
+            account-wide branch below refuses to omit silently.
+        raising
+            The venue was asked and did not answer. This is the only signal the
+            engine has for it — ``LiveExecutionEngine._did_position_status_query_fail``
+            skips the venue's cached positions entirely, and the startup path
+            counts the raise as a failed reconciliation rather than reconciling
+            against nothing.
+
+        Swallowing a query failure collapses the third case into the second, and
+        the second into the first wherever the FLAT fallback or the engine's own
+        ``_create_flat_position_report`` is reached — which is how "the venue was
+        unreachable" ends up closing a position that is still open, through an
+        execution that never happened.
+        """
         reports: list[PositionStatusReport] = []
         requested: InstrumentId | None = command.instrument_id
+        failures: list[BaseException] = []
 
         for product in self._products:
             if product.is_spot:
-                continue  # Spot balances are not positions
+                continue  # Spot balances are not positions; nothing to query
             try:
                 reports += await self._position_reports_for_product(product, requested)
             except WalletNotProvisionedError as e:
+                # Not a failure: Gate.io creates a product wallet on first use
+                # and says USER_NOT_FOUND until then, which is a definite "there
+                # is no position here" rather than an unanswered question.
                 self._log.warning(f"Skipping {product.value} position reports: {e}")
-            except (asyncio.CancelledError, Exception) as e:  # noqa: BLE001
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - re-raised below, after every product
                 self._log_report_error(e, f"{product.value} PositionStatusReports")
+                failures.append(e)
 
-        if requested is not None and not reports:
-            # An empty venue response for a specifically requested instrument must
-            # become an explicit FLAT report, or reconciliation cannot close a
-            # stale local position.
-            instrument = self._instrument(requested)
-            if instrument is not None:
-                reports.append(
-                    PositionStatusReport.create_flat(
-                        account_id=self.account_id,
-                        instrument_id=requested,
-                        size_precision=instrument.size_precision,
-                        ts_init=self._clock.timestamp_ns(),
-                    ),
+        if failures:
+            raise PositionStatusUnavailable(
+                f"Gate.io did not answer the position query"
+                f"{f' for {requested}' if requested is not None else ''}: "
+                f"{'; '.join(str(e) for e in failures)}",
+            ) from failures[0]
+
+        if requested is not None:
+            if not self._has_venue_positions(requested):
+                # Startup reconciliation asks this client, one instrument at a
+                # time, about every open position the cache holds — and Nautilus
+                # opens a position from a spot fill like any other. Answering
+                # FLAT would be a statement about the venue, and for spot there
+                # is no venue-side statement to make: Gate.io has no spot
+                # position endpoint, a spot balance is a balance and not a
+                # position, and the loop above queried nothing for it. Answering
+                # with nothing says "not applicable here" and leaves the position
+                # the venue's own fills produced alone.
+                self._log.debug(
+                    f"Not reporting a position for {requested}: Gate.io keeps no venue-side "
+                    f"position for this product, so this client claims no authority over it",
                 )
+            elif not reports:
+                # The venue really was asked and really did say "no position", so
+                # an explicit FLAT report is a statement it made. Without it a
+                # derivative position closed at the venue could never be closed
+                # locally.
+                instrument = self._instrument(requested)
+                if instrument is not None:
+                    reports.append(
+                        PositionStatusReport.create_flat(
+                            account_id=self.account_id,
+                            instrument_id=requested,
+                            size_precision=instrument.size_precision,
+                            ts_init=self._clock.timestamp_ns(),
+                        ),
+                    )
+        else:
+            self._refuse_incomplete_account_sweep()
 
         self._log_report_receipt(len(reports), "PositionStatusReport", command.log_receipt_level)
         return reports
+
+    def _refuse_incomplete_account_sweep(self) -> None:
+        """Raise rather than let omission be read as flatness on an account-wide query.
+
+        The engine's periodic position check
+        (``LiveExecEngineConfig.position_check_interval_secs``) asks account-wide
+        and then walks *its own* cached open positions: for any that the answer
+        did not mention it builds the FLAT report itself
+        (``LiveExecutionEngine._process_cached_position_discrepancies`` ->
+        ``_create_flat_position_report``) and squares the book against it. To
+        that caller "I returned no report for it" and "the venue says it is flat"
+        are the same answer, so returning a list that omits an instrument this
+        client cannot speak for hands the engine a claim nobody made.
+
+        A list cannot express partial authority, so the only honest answer is the
+        one Nautilus already understands: the query failed. It is deliberately
+        scoped to *open* positions this client cannot report on, so a
+        derivatives-only account — or a mixed one that holds no spot position at
+        the time — keeps a fully working periodic check. While a spot position is
+        open, the check pauses for this venue instead of destroying it; startup
+        reconciliation is unaffected, because it asks per instrument, where
+        omission means nothing.
+        """
+        unanswerable = sorted(
+            {
+                position.instrument_id.value
+                for position in self._cache.positions_open(venue=GATEIO_VENUE)
+                if not self._has_venue_positions(position.instrument_id)
+            },
+        )
+        if not unanswerable:
+            return
+        raise PositionStatusUnavailable(
+            f"This client cannot state an account-wide position for {', '.join(unanswerable)}: "
+            f"Gate.io publishes no venue-side position for them, and an answer that merely "
+            f"omitted them would be read as a claim that they are flat",
+        )
+
+    def _routable_product(self, instrument_id: InstrumentId) -> GateioProductType | None:
+        """Return the configured product that routes ``instrument_id``, if any."""
+        resolved = self._safe_resolve(instrument_id)
+        if resolved is None or resolved[0] not in self._products:
+            return None
+        return resolved[0]
+
+    def _has_venue_positions(self, instrument_id: InstrumentId) -> bool:
+        """Return whether Gate.io keeps a venue-side position for this instrument.
+
+        Only the derivative products do, and only when this client is configured
+        to route them. Spot is a cash ledger: buying credits base currency to a
+        wallet, and no endpoint will ever answer "your spot position in BTC_USDT
+        is X". An instrument this client does not route is treated the same way —
+        the product loop never queried anything for it, so a FLAT answer would be
+        a claim built on no question at all.
+        """
+        product = self._routable_product(instrument_id)
+        return product is not None and not product.is_spot
 
     async def _position_reports_for_product(
         self,
