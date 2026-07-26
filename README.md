@@ -143,7 +143,7 @@ coverage, not about test coverage.
 | Margin account (any other product combination) | Implemented — not mainnet-validated | One Nautilus account, wallets aggregated per currency |
 | Isolated margin ledger | Implemented — not mainnet-validated | `spot_account_mode=MARGIN` |
 | Cross margin ledger | Implemented — not mainnet-validated | Requires a unified account on the venue |
-| Unified account | Implemented — not mainnet-validated | `single_currency` mode validated by the venue's own minimums; `multi_currency` needs > 500 USDT, `portfolio` > 1000 USDT |
+| Unified account | Implemented — not mainnet-validated | `single_currency` has no balance minimum; per Gate.io's documentation `multi_currency` needs > 500 USDT and `portfolio` > 1000 USDT, which this adapter neither enforces nor checks |
 | Borrow / repay endpoints | Implemented — not mainnet-validated | Exposed because isolated and cross margin need them; every liability-creating method says so |
 | Withdrawals, sub-accounts, Earn, Gate Pay, P2P, Copy Trading, Bots | Unsupported | Out of scope: unrelated to trading, no code exists for them |
 
