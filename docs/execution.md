@@ -647,6 +647,24 @@ lookback) to now, and feeds the results back through the execution engine. The
 subscriptions themselves are replayed by the WebSocket layer; this is about the
 state that changed in between.
 
+The results go over as **one** `ExecutionMassStatus`, each recovered trade
+grouped under the order report it belongs to. That grouping is what lets the
+engine restate the order's quantity from the venue's own snapshot *before* the
+trade lands on it, which is the ordering both halves of the problem need: an
+order report reconciled alone makes the engine invent a fill to account for a
+quantity it cannot see, and a fill reconciled alone cannot restate anything.
+
+Grouping also makes delivery of a trade conditional on the report it travels
+with, so the client checks the outcome rather than trusting it: anything the
+grouped pass did not book is re-offered afterwards, still with the venue's
+statement of the order — either by handing that snapshot over first, or, when
+the sweep has no usable snapshot (Gate.io publishes no base-denominated quantity
+for a resting market buy, whose quantity is a quote cash amount), by re-reading
+the order and handing the two over together. A trade re-offered on its own would
+be applied against whatever quantity the local order still carries, and since
+`OrderUpdated` triggers no state transition, an order whose quantity the venue
+has moved on from could never reach a terminal status again.
+
 ### Duplicate suppression
 
 Everything above depends on the same fill being recognised as the same fill,

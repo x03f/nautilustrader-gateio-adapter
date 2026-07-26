@@ -130,6 +130,28 @@ def _accepted_spot_buy(env: ExecHarness, venue_order_id: str = "778899") -> Any:
     return order
 
 
+def _spot_order_payload(**overrides: Any) -> dict[str, Any]:
+    """One ``GET /spot/orders`` row for the resting buy the spot fixtures use."""
+    payload: dict[str, Any] = {
+        "id": 778899,
+        "id_string": "778899",
+        "currency_pair": "BTC_USDT",
+        "type": "limit",
+        "side": "buy",
+        "account": "spot",
+        "amount": "0.010000",
+        "left": "0.010000",
+        "filled_amount": "0",
+        "price": "60000.00",
+        "status": "open",
+        "time_in_force": "gtc",
+        "create_time": RECENT_SECS,
+        "update_time": RECENT_SECS + 1,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _spot_fill_payload(
     env: ExecHarness,
     order: Any,
@@ -1348,6 +1370,290 @@ class TestReconnectReconciliation:
         assert [report.trade_id for report in env.reports] == [TradeId("T-GAP")]
         assert [report.venue_order_id for report in env.reports] == [VenueOrderId("900001")]
         assert not env.perp.called("get_order")
+
+    def test_the_order_is_restated_before_its_recovered_trade_is_re_offered(self, perp_harness):
+        """Regression: a lone ``FillReport`` cannot restate what it is applied to.
+
+        The venue reduced this order to 6 lots during the outage and matched all
+        6. The order listing, read first, carries the reduced size and has not
+        caught up with the match; the trade listing, read second, has. The
+        grouped pass therefore short-circuits on the ACCEPTED snapshot (and the
+        engine's own ``_deduplicate_mass_status_orders`` drops the report and its
+        trades outright, because its exact-match test compares status, filled
+        quantity, instrument and side and never the quantity), so the sweep is
+        what delivers the trade.
+
+        Delivered on its own, the trade is applied against the 10 lots this
+        client still believes are working, leaving 4 lots that the venue will
+        never fill. ``Order.apply(OrderUpdated)`` triggers no state transition
+        (installed model/orders/base.pyx), so no later reconnect and no restart
+        can ever close that order — every one of them restates the quantity
+        *after* the fill. The venue's own snapshot therefore has to go over
+        first, and it has to go as a report: ``generate_order_updated`` publishes
+        to ``ExecEngine.process``, which ``LiveExecutionEngine`` enqueues, while
+        the report endpoints run inline.
+        """
+        env = perp_harness
+        self._capture_mass_status(env)
+        env.perp.responses["accounts"] = {
+            "currency": "USDT",
+            "total": "1000",
+            "available": "1000",
+            "unrealised_pnl": "0",
+        }
+        env.perp.responses["positions"] = []
+        env.perp.responses["list_orders"] = lambda **kwargs: (
+            [_futures_order_payload(size=-6, left=-6)] if kwargs.get("status") == "open" else []
+        )
+        env.perp.responses["my_trades"] = lambda **kwargs: (
+            [_futures_fill_payload("T-GAP", -6)] if kwargs.get("offset", 0) == 0 else []
+        )
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "900001")
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
+
+        assert [type(report).__name__ for report in env.reports] == [
+            "OrderStatusReport",
+            "FillReport",
+        ]
+        assert env.reports[0].quantity == Quantity.from_int(6)
+        assert env.reports[1].trade_id == TradeId("T-GAP")
+
+    def test_a_recovered_trade_is_regrouped_when_its_order_cannot_take_it(self, spot_harness):
+        """Regression: a quote-denominated order cannot hold a base-denominated fill.
+
+        Gate.io's own spot market buy is submitted as a quote-currency cash
+        amount and filled in base units, and the venue publishes no
+        base-denominated quantity for one until it has filled — so the order
+        listing carries no statement of it at all while it is still resting, and
+        the sweep has nothing to restate from. Re-offering the trade on its own
+        would leave 590 USDT 'working' against an order the venue has finished,
+        for ever. The order is re-read instead and the two are handed over
+        together, which is the one route that restates before it applies.
+        """
+        env = spot_harness
+        mass_statuses = self._capture_mass_status(env)
+        order = env.order_factory.market(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("590.00"),
+            quote_quantity=True,
+        )
+        env.accepted(order, "778899")
+        # The order has to be open in the cache: the spot fill sweep asks the
+        # venue only about the pairs this client is actually working.
+        env.drain(order)
+        env.client._register_text(order.client_order_id, f"t-{order.client_order_id.value}")
+        text = f"t-{order.client_order_id.value}"
+        resting = _spot_order_payload(
+            type="market",
+            side="buy",
+            amount="590.00",
+            left="590.00",
+            filled_amount="0",
+            price="0",
+            status="open",
+            text=text,
+        )
+        env.spot.responses["accounts"] = [{"currency": "USDT", "available": "1000", "locked": "0"}]
+        env.spot.responses["open_orders"] = lambda **kwargs: (
+            [{"currency_pair": "BTC_USDT", "orders": [resting]}]
+            if kwargs.get("page", 1) == 1
+            else []
+        )
+        env.spot.responses["list_orders"] = lambda *args, **kwargs: []
+        env.spot.responses["my_trades"] = lambda **kwargs: (
+            [
+                _spot_fill_payload(
+                    env,
+                    order,
+                    "TS-GAP",
+                    create_time_ms=str(RECENT_SECS * 1000),
+                ),
+            ]
+            if kwargs.get("page", 1) == 1
+            else []
+        )
+        env.spot.responses["get_order"] = _spot_order_payload(
+            type="market",
+            side="buy",
+            amount="590.00",
+            left="0",
+            filled_amount="0.010000",
+            price="0",
+            status="closed",
+            finish_as="filled",
+            text=text,
+        )
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.SPOT))
+
+        assert env.spot.called("get_order")
+        assert len(mass_statuses) == 2
+        regrouped = mass_statuses[1]
+        assert regrouped.order_reports[VenueOrderId("778899")].quantity == Quantity.from_str(
+            "0.010000",
+        )
+        assert [fill.trade_id for fill in regrouped.fill_reports[VenueOrderId("778899")]] == [
+            TradeId("TS-GAP")
+        ]
+        # The last-resort single report follows only because this harness has no
+        # execution engine behind the bus to book the grouped hand-over, so the
+        # sweep's outcome check still reads "not booked". What that route leaves
+        # behind with a real engine is settled by the release-gate scenario
+        # spot_market_buy_recovered_after_a_reconnect_is_not_left_open.
+        assert [report.trade_id for report in env.reports] == [TradeId("TS-GAP")]
+
+    def test_a_trade_is_still_booked_when_the_venue_will_not_state_its_order(self, spot_harness):
+        """An execution that happened is worse lost than recorded against a stale order.
+
+        The re-read is the preferred route because it restates before it applies,
+        but it depends on the venue answering. When it does not, the trade still
+        belongs on the order the cache already indexes: booking it leaves the
+        order possibly open, not booking it leaves the position wrong.
+        """
+        env = spot_harness
+        self._capture_mass_status(env)
+        order = env.order_factory.market(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("590.00"),
+            quote_quantity=True,
+        )
+        env.accepted(order, "778899")
+        env.drain(order)
+        env.client._register_text(order.client_order_id, f"t-{order.client_order_id.value}")
+        env.spot.responses["accounts"] = [{"currency": "USDT", "available": "1000", "locked": "0"}]
+        env.spot.responses["my_trades"] = lambda **kwargs: (
+            [
+                _spot_fill_payload(
+                    env,
+                    order,
+                    "TS-GAP",
+                    create_time_ms=str(RECENT_SECS * 1000),
+                ),
+            ]
+            if kwargs.get("page", 1) == 1
+            else []
+        )
+        env.spot.responses["get_order"] = GateioClientError(400, "INVALID_ORDER_ID", "unknown")
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.SPOT))
+
+        assert [report.trade_id for report in env.reports] == [TradeId("TS-GAP")]
+
+    def test_the_restatement_set_matches_the_platforms_state_table(self):
+        """``RESTATABLE_ORDER_STATUSES`` is a claim about the FSM; hold it to it.
+
+        Handing an ACCEPTED order status report over on its own is safe only
+        where the engine's ACCEPTED branch generates nothing the FSM would
+        refuse. It generates an ``OrderAccepted`` for every order not already
+        accepted, so the set is exactly: ACCEPTED, where it generates none, plus
+        every status from which ``Order.apply(OrderAccepted)`` is a legal
+        trigger. That is read off the platform here rather than off this
+        client's reading of it, and the statuses it excludes are exercised too,
+        so the set cannot quietly become "everything".
+        """
+        from nautilus_trader.core.fsm import InvalidStateTrigger
+        from nautilus_trader.core.uuid import UUID4
+        from nautilus_trader.model.events import OrderAccepted
+
+        from nautilus_gateio.execution import RESTATABLE_ORDER_STATUSES
+
+        def accepts_an_accepted_event(status: OrderStatus) -> bool:
+            env = ExecHarness(products=(GateioProductType.PERP,))
+            try:
+                order = env.order_factory.limit(
+                    PERP_BTC_USDT,
+                    OrderSide.SELL,
+                    Quantity.from_int(10),
+                    Price.from_str("59000.0"),
+                )
+                env.cache.add_order(order)
+                text = f"t-{order.client_order_id.value}"
+                env.client._register_text(order.client_order_id, text)
+                if status is not OrderStatus.INITIALIZED:
+                    env.client.generate_order_submitted(
+                        strategy_id=order.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        ts_event=env.clock.timestamp_ns(),
+                    )
+                if status in (
+                    OrderStatus.ACCEPTED,
+                    OrderStatus.PARTIALLY_FILLED,
+                    OrderStatus.CANCELED,
+                ):
+                    env.client.generate_order_accepted(
+                        strategy_id=order.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=VenueOrderId("900001"),
+                        ts_event=env.clock.timestamp_ns(),
+                    )
+                env.drain(order)
+                if status is OrderStatus.PARTIALLY_FILLED:
+                    env.client._handle_fill_payload(
+                        GateioProductType.PERP,
+                        _futures_fill_payload("T-PART", -4, text=text),
+                    )
+                    env.drain(order)
+                if status is OrderStatus.CANCELED:
+                    env.client._handle_order_payload(
+                        GateioProductType.PERP,
+                        _futures_order_payload(
+                            status="finished",
+                            finish_as="cancelled",
+                            text=text,
+                        ),
+                    )
+                    env.drain(order)
+                assert order.status == status, f"could not reach {status}"
+
+                accepted = OrderAccepted(
+                    trader_id=order.trader_id,
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=VenueOrderId("900001"),
+                    account_id=env.client.account_id,
+                    event_id=UUID4(),
+                    ts_event=env.clock.timestamp_ns(),
+                    ts_init=env.clock.timestamp_ns(),
+                    reconciliation=True,
+                )
+                try:
+                    order.apply(accepted)
+                except InvalidStateTrigger:
+                    return False
+                return True
+            finally:
+                env.close()
+
+        probed = (
+            OrderStatus.INITIALIZED,
+            OrderStatus.SUBMITTED,
+            OrderStatus.ACCEPTED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.CANCELED,
+        )
+        safe = {
+            status
+            for status in probed
+            # ACCEPTED is safe because the engine generates nothing there, not
+            # because the FSM would take the event.
+            if status is OrderStatus.ACCEPTED or accepts_an_accepted_event(status)
+        }
+
+        assert safe == set(RESTATABLE_ORDER_STATUSES)
+        assert OrderStatus.PARTIALLY_FILLED not in safe
+        assert OrderStatus.CANCELED not in safe
 
     def test_a_trade_already_on_its_order_is_not_reported_a_second_time(self, perp_harness):
         """The sweep is a repair, not a second delivery.
