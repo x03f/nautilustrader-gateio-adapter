@@ -1,0 +1,47 @@
+{
+ "_comment": "Relationships a parser cannot infer, written by whoever made the change. Merged by /opt/graphify/semantic_links.py; see .claude/project_rules.md section 4. Endpoints must resolve to exactly one graph node — run the merge and read its output, it names anything that does not.",
+ "edges": [
+  {
+   "from": "docs_review_matrix_critical_10",
+   "to": "nautilus_gateio/execution.py:_maybe_swap_trigger_venue_order_id",
+   "relation": "fixed_by",
+   "note": "EXEC-1. Gate.io publishes order and trade updates on independent channels, so a fill can be the first message naming a fired conditional order. The fill path reconciles the venue identity before emitting, instead of producing an event Order.apply refuses and the engine swallows."
+  },
+  {
+   "from": "TestFillBeforeOrderUpdate",
+   "to": "nautilus_gateio/execution.py:_maybe_swap_trigger_venue_order_id",
+   "relation": "tested_by",
+   "note": "EXEC-1 regression. Eleven scenarios, nine failing against the previous implementation: fill before any order message, several fills, duplicate replay, unreconcilable identity, reconnect and restart across the transition."
+  },
+  {
+   "from": "docs_execution_conditional_order_identity",
+   "to": "GateioTriggerLink",
+   "relation": "documented_by",
+   "note": "The dual identity: the venue arms an order under one id and creates another when it fires. Both are kept, because the armed id is what still addresses the price order after a restart. Undocumented anywhere until the graph showed this symbol had no documentation edge."
+  },
+  {
+   "from": "TestSingleCanonicalTimestampConversion",
+   "to": "nautilus_gateio/common/parsing.py:timestamp_to_nanos",
+   "relation": "tested_by",
+   "note": "seam-07 / SEAM-02. Asserts the package defines the conversion exactly once by walking the tree. A binary-float copy in data.py disagreed by 64 ns on millisecond timestamps, so one venue instant became two values depending on which path carried it."
+  },
+  {
+   "from": "TestSharedTransportLifecycle",
+   "to": "nautilus_gateio/factories.py:get_cached_gateio_http_client",
+   "relation": "tested_by",
+   "note": "seam-08. The factory registers one owner per client and a cached transport that has been closed is rebuilt, because closing it naively would hand a closed client to the next trading node in the process."
+  },
+  {
+   "from": "GateioExecutionClient",
+   "to": "nautilus_gateio/common/parsing.py:timestamp_to_nanos",
+   "relation": "depends_on",
+   "note": "The execution path and the data path must agree about the same venue instant; both resolve to one function object so they cannot drift apart again."
+  },
+  {
+   "from": "docs_execution_when_the_identity_cannot_be_resolved_inline",
+   "to": "nautilus_gateio/execution.py:_handle_fill_payload",
+   "relation": "documented_by",
+   "note": "A fill whose identity cannot be reconciled inline is routed through reconciliation with an error naming both ids, rather than emitted as an event the platform will refuse and drop."
+  }
+ ]
+}

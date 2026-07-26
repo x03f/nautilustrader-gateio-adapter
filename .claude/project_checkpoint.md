@@ -188,6 +188,52 @@ Sustained live operation, the upstream case coverage closed, operational defects
 is a Rust decision worth taking, on demonstrated need.
 
 
+## Reinvention audit — 50 duplications, 13 to replace now
+
+Full record: `scratchpad/reinvention_audit.json`. Read it before touching any of these areas.
+
+Verdicts: 13 REPLACE_NOW, 24 REPLACE_LATER, 8 KEEP_JUSTIFIED, 5 NOT_A_DUPLICATE, plus 35 places we
+diverge from a convention every in-tree adapter follows.
+
+The five found by hand were the visible part. Nothing in this package should be assumed original
+until it has been looked for in the platform first.
+
+### Replace now
+
+**`GateioDataClient._tasks`** -> `LiveMarketDataClient._tasks`
+
+This is not merely a duplicate, it silently breaks the base class. `LiveMarketDataClient.__init__` sets `self._tasks: WeakSet[asyncio.Task]`; our `__init__` runs `super().__init__(...)` first (data.py:296) and then overwrites the 
+
+**`logger = logging.getLogger(__name__)`** -> `nautilus_trader.common.component.Logger`
+
+The WebSocket transport is the noisiest component in the adapter (reconnects, subscription failures, malformed frames, service notifications) and none of it reaches the Nautilus log system: not the log file, not the log-level conf
+
+**`credentials.mask()`** -> `nautilus_trader.core.nautilus_pyo3.mask_api_key`
+
+Straight duplicate of a one-call platform function, differing only in the mask shape (`abcd...op` vs the platform's `abcd...mnop`). Nothing venue-specific. Note that `mask` is currently referenced only from tests/conftest.py and t
+
+**`datetime.fromtimestamp(start_ns / 1_000_000_000, tz=UTC)`** -> `nautilus_trader.core.datetime.unix_nanos_to_dt`
+
+One line, and it is the reconnect-reconciliation lookback anchor — the start of the window over which orders and fills that the private stream could not replay are re-queried. Dividing nanoseconds by 1e9 into a float loses sub-mic
+
+**`Plain `int`/`float` config fields plus hand-written validators`** -> `nautilus_trader.config.PositiveInt / PositiveFloat / NonNega`
+
+These are the platform's declarative bounds for exactly this kind of field, and they are carried on the msgspec Struct so a config decoded from JSON/YAML is rejected at the boundary with a proper message. Our config.py docstring a
+
+**`A second task set `self._tasks: set[asyncio.Task]` plus `_track()``** -> `nautilus_trader.live.data_client.LiveDataClient.create_task`
+
+`_track` calls `self.create_task(...)`, which has *already* added the task to the base class's `self._tasks` WeakSet. Our extra set is a pure second copy. And the base `disconnect()` (live/data_client.py:239-250, `_disconnect_with
+
+**`GateioWebSocketClient.disconnect() hand-rolled cancel-then-await loop`** -> `nautilus_trader.live.cancellation.cancel_tasks_with_timeout`
+
+This is the same cancel-all-and-await routine the platform ships, minus the timeout. Ours does `task.cancel()` then bare `await task` for each of the heartbeat, resubscribe and receive tasks. `cancel_tasks_with_timeout` does exact
+
+
+The worst of these is not a duplicate but a silent override: the data client replaces the base
+class's `WeakSet` of tasks with a plain `set`, so a long-running node holds a strong reference to
+every completed subscribe and request task, and the platform's bounded cancellation on shutdown
+finds nothing left to await.
+
 ## Next steps, in order
 
 1. Land and independently verify the three blocker fixes.
