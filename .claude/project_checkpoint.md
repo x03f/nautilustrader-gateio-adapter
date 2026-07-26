@@ -77,6 +77,35 @@ The graph found the duplicate `timestamp_to_nanos` (two nodes under one name) an
 `GateioTriggerLink` had no documentation edges at all — it is now documented in `docs/execution.md`.
 No unresolved graph/code discrepancy is outstanding. Regulation: `/opt/shnalytics/docs/GRAPHIFY.md`.
 
+## Raised during the documentation rewrite, not yet acted on
+
+Verifying documentation against the source surfaced five things. None blocks the alpha; all are
+recorded so they are not rediscovered later.
+
+1. `config.py` `GateioExecClientConfig` Notes claims the constructor cross-validates the spot
+   account mode against the configured products. It does not — only `validate_products` runs. The
+   public page describes the code, so the docstring is the outlier and is simply wrong.
+2. `AccountFactory.register_cash_borrowing(GATEIO)` is called when the spot mode is a margin mode,
+   but those configurations produce a MARGIN account, and `allow_borrowing` is only consulted when
+   constructing a `CashAccount`. The call appears to be a no-op and was left out of the docs rather
+   than described as having an effect nobody could observe.
+3. Two user-visible behaviours have no test: the hedge-mode refusal in
+   `_assert_one_way_position_mode`, and the execution client skipping a product whose wallet read
+   raises `WalletNotProvisionedError`. Both are cheap to cover with the existing harness.
+4. With `spot_account_mode=UNIFIED` against a classic account, the unified read raises inside
+   `_collect_spot_balances`, so the whole spot wallet is discarded for that cycle — including the
+   plain balances already read. Reporting those and warning only about the unified ledger would
+   degrade more gracefully.
+5. `sync_time()` is called by nothing, so the `x-gate-exptime` submission deadline is never attached
+   in the default configuration. Documented as such; if the deadline was meant to be active,
+   `_connect` should call it.
+
+Separately, and introduced by the seam-08 fix in this session: both clients close the shared
+transport as the FIRST action of `_disconnect` and cancel their tasks afterwards. A request already
+past the closed-check and awaiting the rate limiter then surfaces a raw httpx `RuntimeError` instead
+of the adapter's own `GateioError(CLIENT_CLOSED)`. Cancelling tasks before releasing the transport
+closes that window. Found by the TradingNode smoke harness.
+
 ## Next steps, in order
 
 1. Land and independently verify the three blocker fixes.
