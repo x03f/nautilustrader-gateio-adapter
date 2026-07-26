@@ -46,16 +46,27 @@ CHANGELOG = REPO / "CHANGELOG.md"
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 
 #: Pages that describe 0.1.0 on purpose, and so may name removed features.
-HISTORICAL_PAGES = {"migration-0.1-to-0.2.md"}
+#: Pages that describe what the project USED to do. They quote removed symbols
+#: and superseded claims on purpose, so the drift guards below would fail them
+#: for being accurate.
+HISTORICAL_PAGES = {"migration-0.1-to-0.2.md", "review-matrix.md"}
 
 #: The status vocabulary the feature matrix is allowed to use.
+#: The only status words a feature matrix may use. The vocabulary is closed on
+#: purpose: "mostly works" and "should be fine" are how a reader ends up trusting
+#: an untested path with money. Two shades of "implemented" are kept apart
+#: because they answer different questions — whether the behaviour is covered by
+#: tests at all, and whether the venue has ever agreed with those tests.
 STATUS_VOCABULARY = frozenset(
     {
         "Stable",
         "Experimental",
         "Partial",
+        "Implemented — mock-tested",
+        "Implemented — mainnet validation pending",
         "Implemented — not mainnet-validated",
         "Unsupported",
+        "Not applicable",
     },
 )
 
@@ -310,7 +321,10 @@ class TestMigrationGuide:
     )
     def test_changelog_lists_breaking_change(self, topic: str) -> None:
         text = CHANGELOG.read_text(encoding="utf-8")
-        section = text.split("## [0.2.0]", 1)
+        # Match the 0.2.0 line by prefix so a pre-release suffix such as
+        # `[0.2.0a1]` still resolves. Pinning the exact string made this test
+        # fail on the version bump rather than on anything about the content.
+        section = re.split(r"^## \[0\.2\.0[^\]]*\]", text, maxsplit=1, flags=re.MULTILINE)
         assert len(section) == 2, "CHANGELOG.md has no 0.2.0 section"
         body = section[1].split("## [0.1.0]", 1)[0]
         assert topic in body, f"the 0.2.0 changelog entry does not mention {topic!r}"
