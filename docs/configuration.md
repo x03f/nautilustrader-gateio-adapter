@@ -317,8 +317,15 @@ So the aggregation rule differs by mode, and the adapter implements both:
   per-product wallets for that currency instead of being added to them. Summing
   would multiply the account's equity by the number of enabled products.
 
+The unified ledger is what makes the second rule possible: it is the only
+statement that names the currencies whose per-product wallets are echoes. A poll
+that cannot read it therefore publishes nothing rather than fall back to summing,
+because falling back is exactly the arithmetic that doubles the account.
+
 This is *implemented and mock-tested*, including the case of a wallet stream
-update arriving after the aggregate was built (`tests/test_execution_events.py`).
+update arriving after the aggregate was built (`tests/test_execution_events.py`)
+and the case of the unified ledger failing mid-session
+(`tests/test_execution_accounting.py`).
 
 The adapter never changes the account's mode. `GET /unified/unified_mode` and
 `PUT /unified/unified_mode` exist in the REST namespace

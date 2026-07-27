@@ -38,8 +38,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already got. A spot pair is likewise refused when it carries no `fee` and the
   caller supplied no account fee tier.
 
+- **Margin is now reported in the scope the venue actually holds the collateral
+  in.** Every futures position produced a per-instrument `MarginBalance`,
+  whatever margin mode it was held under. NautilusTrader gives the two scopes
+  distinct meanings — per-instrument is isolated collateral, segregated to one
+  position; account-wide (`instrument_id=None`, keyed by collateral currency) is
+  what a cross-margin venue reports, because closing one position there frees
+  collateral for every other — and keeps them in separate stores, so the scope
+  decides which query answers at all. Gate.io marks the mode on the position:
+  `leverage="0"` is cross margin, any positive `leverage` is isolated at that
+  leverage. Cross positions are now summed per settlement currency into an
+  account-wide entry, isolated positions stay per instrument, and a strategy on
+  a cross-margined account gets an answer from `margin_init_for_currency()`
+  instead of `None`. Account-wide entries are keyed by currency throughout, so a
+  USDT-settled perpetual and the USDT options wallet add up rather than
+  overwrite one another.
+
 ### Fixed
 
+- **Unrealised PnL was counted twice in portfolio equity.** The futures wallet
+  total was published as `total + unrealised_pnl`, and the options wallet total
+  as `equity`, which Gate.io defines as balance plus position value. The
+  platform computes equity for a margin account as
+  `balances_total + Σ unrealized_pnl(open positions)`, so a 1000 USDT account
+  holding 100 USDT of unrealised profit reported 1200 USDT of equity — and the
+  unrealised profit was additionally published as *locked* collateral when
+  nothing was reserved. `AccountBalance.total` is now the wallet balance alone:
+  the figure Gate.io documents as excluding position PnL, and the one the
+  in-tree Binance adapter reports. This also stops the REST poll and the
+  `futures.balances` stream, which carries the wallet balance alone, from
+  contradicting each other on every tick.
+- **A position query the venue refused is no longer reported as FLAT.**
+  `USER_NOT_FOUND` (the product wallet has not been created yet) and `FORBIDDEN`
+  / `INVALID_UNIFIED_ACCOUNT` / `UNIFIED_ACCOUNT_NOT_ACTIVATED` (the key or the
+  account mode may not read that ledger) arrived as one exception type and were
+  both treated as "no position here". Only the first is a statement about
+  positions; the others say nothing about what is open, and reaching the FLAT
+  fallback with them handed the engine a claim the venue never made, which
+  reconciliation then acted on by closing a still-open position through an
+  inferred fill. The three refusal labels now raise `PositionStatusUnavailable`,
+  which is how this client tells the engine a query went unanswered.
+- **A poll that could not read every wallet no longer restates the whole
+  account.** Two failures came out of one assumption, that a partial read is a
+  snapshot. Under a Unified Account, a single failed read of the unified ledger
+  dropped the list of currencies whose per-product wallets are echoes of the
+  same funds, so the wallets were summed and a 1000 USDT account was published
+  as 2000 USDT with `reported=True` for the RiskEngine to size against; the
+  client now keeps the last unified snapshot it read, and publishes nothing at
+  all rather than a sum it knows is inflated. Separately, margins were rebuilt
+  from only the products that answered, and because `MarginAccount.apply`
+  replaces its stores from the event rather than merging, one failed futures
+  call deleted that wallet's margin from the platform's view; margins are now
+  tracked per wallet and every live entry is republished each time.
+- **`AccountState.ts_event` now carries the venue's timestamp** for a balance
+  that arrived on the stream, instead of the moment this client parsed it. Under
+  a reconnect burst the persisted account history could not be used to
+  reconstruct when a balance actually changed. A REST snapshot still uses the
+  local clock, because the venue attaches no time to one.
 - **A re-pushed `full` order book snapshot no longer rolls the book backwards.**
   Gate.io documents that a full depth snapshot may be pushed on the incremental
   channel at any time. One whose `u` was not newer than the local update id was

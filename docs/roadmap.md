@@ -46,7 +46,10 @@ Close what is already known to be wrong before adding anything.
 - Independently verify the recovery and reconciliation fixes. Four rounds have now passed their
   harnesses and none has survived an attempt to refute it; passing is not evidence. What the
   fourth leaves open is stated in [execution.md](execution.md): reconnect recovery of an order
-  that missed more than one fill, and a position query the venue refused being read as flat.
+  that missed more than one fill. A position query the venue *refused* being read as flat is
+  closed — `FORBIDDEN` and the two unified-account labels now raise
+  `PositionStatusUnavailable`, and only `USER_NOT_FOUND`, which means the wallet does not exist
+  yet, still answers FLAT.
 - Fix the defects an audit against the platform documentation found, starting with the ten that
   produce silently wrong behaviour rather than an error.
 - Replace the facilities reimplemented here that the platform already ships, where the replacement

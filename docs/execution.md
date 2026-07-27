@@ -58,7 +58,7 @@ routed through it.
 | OMS type | `NETTING` |
 | Hedge (dual) position mode | unsupported — detected at connect and refused with an explanatory error |
 | Balances | Aggregated per currency across the wallets of the enabled products |
-| Margins | `MarginBalance` per instrument on futures and delivery, one account-level `MarginBalance` on options; published only for a `MARGIN` account |
+| Margins | Scoped the way the venue holds the collateral: a cross-margined position (Gate.io `leverage="0"`) is reported account-wide, keyed by its settlement currency; an isolated position is reported per instrument. The options wallet reports one account-wide figure. Published only for a `MARGIN` account |
 
 Routing an order is a two-step lookup. The instrument id determines the product
 (see [symbology.md](symbology.md)), and the product determines both the REST
@@ -673,7 +673,7 @@ status set against the platform's own state machine. Mainnet validation pending.
 ## Balances, positions and funding
 
 **Balances** are aggregated per currency across the wallets of the enabled
-products, from the balance stream and from the REST poll. Three things about the
+products, from the balance stream and from the REST poll. Five things about the
 aggregation are worth stating:
 
 * A stream update for one wallet never overwrites another wallet's contribution;
@@ -684,9 +684,19 @@ aggregation are worth stating:
   multiply the account's equity by the number of enabled products, so a currency
   the unified wallet reports **replaces** the per-product wallets instead of
   being added to them.
-* Margin ledgers subtract borrowed principal and accrued interest from the total,
-  and the futures wallet total includes unrealised PnL. Free is clamped to total,
-  and the difference is published as locked.
+* A poll that could not read every wallet is not a snapshot. A wallet that
+  answered with an error keeps the balance and the margin it last reported, and
+  in unified mode a poll that could not read the unified ledger publishes
+  nothing at all rather than a sum it knows is inflated — on the first poll that
+  surfaces as a connect failure, which is the honest outcome.
+* `total` is the **wallet balance**, never the margin balance: unrealised PnL is
+  deliberately left out of it. NautilusTrader computes equity for a margin
+  account as `balances_total + Σ unrealized_pnl(open positions)`, so an adapter
+  that folds the venue's unrealised PnL into `total` makes the platform count it
+  twice. This also makes the REST poll and the `futures.balances` stream, which
+  carries the wallet balance alone, state the same number.
+* Margin ledgers subtract borrowed principal and accrued interest from the total.
+  Free is clamped to total, and the difference is published as locked.
 
 An account that has never been funded returns no rows at all. Rather than fail to
 register, the client warns and reports the settlement currency of each enabled
@@ -694,17 +704,18 @@ product as zero, which states exactly that.
 
 **Positions** are reconciled from REST only, for futures, delivery and options
 (netting). When a position report is requested for a specific instrument and the
-venue returns nothing, an explicit FLAT report is emitted — otherwise a stale
-local position could never be closed.
+venue answered that it holds nothing, an explicit FLAT report is emitted —
+otherwise a stale local position could never be closed.
 
-That rule is meant to cover only the case where the venue answered, and it
-currently reaches past it: a position query the venue refuses for a permission or
-account-mode reason (`FORBIDDEN`, `INVALID_UNIFIED_ACCOUNT`,
-`UNIFIED_ACCOUNT_NOT_ACTIVATED`) is folded into the same path as a wallet the
-account has never opened, and a refusal then reads as flat. A position the venue
-still holds can be closed locally that way, by an execution nobody made. Open and
-known; until it is fixed, give the API key its futures read permission before
-relying on position reconciliation.
+That rule covers only the case where the venue answered. Gate.io reports two very
+different things through the same error shape, and the client separates them:
+`USER_NOT_FOUND` means the product wallet has not been created yet, so there is
+definitely no position in it and FLAT is true; `FORBIDDEN`,
+`INVALID_UNIFIED_ACCOUNT` and `UNIFIED_ACCOUNT_NOT_ACTIVATED` mean the key or the
+account mode may not read that ledger, which says nothing about what is open. The
+second group raises `PositionStatusUnavailable`, because a report the venue never
+made would let the engine close a still-open position through an execution nobody
+performed.
 
 **Funding** is *not applicable* as an execution event: the client emits no
 funding cash-flow event. Realised funding is reflected in the futures wallet

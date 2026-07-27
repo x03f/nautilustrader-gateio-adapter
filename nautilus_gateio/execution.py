@@ -173,6 +173,7 @@ from nautilus_gateio.common.enums import (
     time_in_force_to_gateio,
 )
 from nautilus_gateio.common.errors import (
+    ACCOUNT_MODE_LABELS,
     GateioError,
     GateioServerError,
     OrderValidationError,
@@ -738,7 +739,14 @@ class GateioExecutionClient(LiveExecutionClient):
         # already subsumes the per-product wallets, so it replaces them in the
         # aggregate instead of being added to them.
         self._unified_balances: dict[str, tuple[Decimal, Decimal]] = {}
-        self._margins: dict[InstrumentId | None, MarginBalance] = {}
+        # Margins are kept per product for the same reason balances are: a poll
+        # that could not read one wallet must not delete that wallet's margin
+        # from the snapshot, because `MarginAccount.apply` replaces its stores
+        # from the event rather than merging with what it already held.
+        self._margins_by_product: dict[
+            GateioProductType,
+            dict[InstrumentId | Currency, MarginBalance],
+        ] = {}
 
         self._account_poll_task: asyncio.Task | None = None
         #: Last private-stream event per product, used as the reconciliation
@@ -3536,7 +3544,16 @@ class GateioExecutionClient(LiveExecutionClient):
             wallet[currency] = (total, max(Decimal(0), total - locked))
 
         self._rebuild_aggregate_balances()
-        self._publish_account_state(reported=True)
+        # `ts_event` is "when the event occurred" and `ts_init` "when the object
+        # was initialized" (concepts/events/account_state.md); the two parameters
+        # exist on `generate_account_state` (execution/client.pyx:329-364) so an
+        # adapter can report venue time. The balance stream carries it, so a
+        # burst replayed after a reconnect keeps the order in which the balances
+        # actually changed instead of collapsing onto the moment we parsed them.
+        self._publish_account_state(
+            reported=True,
+            ts_event=first_timestamp_ns(payload, "time_ms", "timestamp_ms", "time", "timestamp"),
+        )
 
     def _rebuild_aggregate_balances(self) -> dict[str, tuple[Decimal, Decimal]]:
         """Recompute the per-currency totals from the individual wallets.
@@ -3585,19 +3602,38 @@ class GateioExecutionClient(LiveExecutionClient):
     # -- account state -----------------------------------------------------
 
     async def _update_account_state(self) -> None:
-        """Refresh balances and margins from REST across every enabled product."""
-        margins: dict[InstrumentId | None, MarginBalance] = {}
-        self._unified_balances = {}
+        """Refresh balances and margins from REST across every enabled product.
+
+        A poll that could not read every wallet is a *partial* answer, and the
+        two things this method feeds treat a partial answer very differently.
+        ``MarginAccount.apply`` **replaces** both margin stores from the incoming
+        event rather than merging (accounting/accounts/margin.pyx:505-521, and
+        concepts/accounting.md, "Margin scopes": "Adapters that emit partial
+        snapshots must include every live margin entry on each update or those
+        entries will be dropped"), so rebuilding the margin set from only the
+        products that answered silently deletes the margin of the ones that did
+        not. And under a Unified Account the aggregate is only correct because
+        the unified ledger names the currencies whose per-product wallets are
+        echoes of the same funds; without that list, summing the wallets
+        multiplies the account's equity by the number of enabled products.
+
+        So a product that could not be read keeps its previous wallet *and* its
+        previous margins, and the unified ledger is replaced only when it was
+        actually read.
+        """
+        margins: dict[GateioProductType, dict[InstrumentId | Currency, MarginBalance]] = {}
+        unified: dict[str, tuple[Decimal, Decimal]] | None = None
 
         for product in self._products:
             wallet: dict[str, tuple[Decimal, Decimal]] = {}
+            product_margins: dict[InstrumentId | Currency, MarginBalance] = {}
             try:
                 if product.is_spot:
-                    await self._collect_spot_balances(wallet)
+                    unified = await self._collect_spot_balances(wallet)
                 elif product.is_option:
-                    await self._collect_options_balances(wallet, margins)
+                    await self._collect_options_balances(wallet, product_margins)
                 else:
-                    await self._collect_futures_balances(product, wallet, margins)
+                    await self._collect_futures_balances(product, wallet, product_margins)
             except WalletNotProvisionedError as e:
                 self._log.warning(f"Skipping the {product.value} wallet: {e}")
                 continue
@@ -3605,7 +3641,26 @@ class GateioExecutionClient(LiveExecutionClient):
                 self._log.error(f"Cannot read the {product.value} wallet: {e}")
                 continue
             self._wallet_balances[product] = wallet
+            margins[product] = product_margins
 
+        if unified is not None:
+            self._unified_balances = unified
+        elif self._spot_mode is GateioSpotAccountMode.UNIFIED and not self._unified_balances:
+            # Never state an aggregate already known to be inflated. Without the
+            # unified ledger there is no way to tell which currencies the
+            # per-product wallets are merely echoing, and summing them reports
+            # the same funds once per enabled product. Publishing nothing leaves
+            # the last state that could be stated; on the first poll it leaves
+            # the account unregistered, which `_await_account_registered` turns
+            # into an explicit connect failure (live/execution_client.py:534-567).
+            self._log.error(
+                "Cannot state the Gate.io account: the unified ledger could not be read, and "
+                "the per-product wallets echo the same funds, so their sum would overstate the "
+                "account by a factor of the number of enabled products",
+            )
+            return
+
+        self._margins_by_product.update(margins)
         balances = self._rebuild_aggregate_balances()
 
         if not balances:
@@ -3620,10 +3675,18 @@ class GateioExecutionClient(LiveExecutionClient):
                 balances.setdefault(product.settle.upper(), (Decimal(0), Decimal(0)))
 
         self._balances = balances
-        self._margins = margins
         self._publish_account_state(reported=True)
 
-    async def _collect_spot_balances(self, balances: dict[str, tuple[Decimal, Decimal]]) -> None:
+    async def _collect_spot_balances(
+        self,
+        balances: dict[str, tuple[Decimal, Decimal]],
+    ) -> dict[str, tuple[Decimal, Decimal]] | None:
+        """Read the spot ledger, returning the unified snapshot when there is one.
+
+        The return value is what tells the caller a Unified Account was read
+        successfully: ``None`` means this client is not in unified mode, and a
+        dict (possibly empty) means the unified ledger answered.
+        """
         accounts = await self._spot_http.accounts()
         for entry in accounts or []:
             currency = str(entry.get("currency") or "").upper()
@@ -3640,7 +3703,10 @@ class GateioExecutionClient(LiveExecutionClient):
         elif self._spot_mode is GateioSpotAccountMode.UNIFIED:
             # Collected apart from the spot wallet: the unified balance already
             # contains it, and every other product wallet as well.
-            await self._collect_unified_balances(self._unified_balances)
+            unified: dict[str, tuple[Decimal, Decimal]] = {}
+            await self._collect_unified_balances(unified)
+            return unified
+        return None
 
     async def _collect_isolated_margin_balances(
         self,
@@ -3696,13 +3762,27 @@ class GateioExecutionClient(LiveExecutionClient):
         self,
         product: GateioProductType,
         balances: dict[str, tuple[Decimal, Decimal]],
-        margins: dict[InstrumentId | None, MarginBalance],
+        margins: dict[InstrumentId | Currency, MarginBalance],
     ) -> None:
         api = self._futures_api(product)
         account = await require_wallet(api.accounts(), f"the {product.value} wallet")
         currency = str(account.get("currency") or product.settle).upper()
-        total = to_decimal(account.get("total")) + to_decimal(account.get("unrealised_pnl"))
+        # The wallet balance, deliberately *without* the venue's unrealised PnL.
+        # Gate.io says of `total`: "does not include upl of positions", and that
+        # is exactly the figure the platform wants: `Portfolio.equity()` for a
+        # margin account is `balances_total + sum(unrealized_pnl(open positions))`
+        # (portfolio/portfolio.pyx:1176-1243; concepts/portfolio.md, "Equity
+        # formula"), so folding the venue's unrealised PnL into `total` makes the
+        # platform count it a second time. In-tree Binance reports the same
+        # figure for the same reason — `walletBalance`, not `marginBalance`
+        # (adapters/binance/futures/schemas/account.py:75-88). It also makes the
+        # REST poll agree with the `futures.balances` stream, which carries the
+        # wallet balance alone and would otherwise contradict it every tick.
+        total = to_decimal(account.get("total"))
         free = to_decimal(account.get("available"))
+        # `available` can exceed the wallet balance when unrealised profit is
+        # spendable as collateral; clamping keeps `locked` non-negative, which is
+        # what the reference adapter does at this same point.
         _accumulate(balances, currency, total, min(free, total))
 
         positions = await require_wallet(
@@ -3713,7 +3793,7 @@ class GateioExecutionClient(LiveExecutionClient):
         for position in positions or []:
             margin = self._position_margin(product, position, currency_obj)
             if margin is not None:
-                margins[margin.instrument_id] = margin
+                _merge_margin(margins, margin)
 
     def _position_margin(
         self,
@@ -3721,6 +3801,26 @@ class GateioExecutionClient(LiveExecutionClient):
         position: dict[str, Any],
         currency: Currency,
     ) -> MarginBalance | None:
+        """Build the margin one venue position requires, in the scope it is held under.
+
+        The scope is not cosmetic. concepts/accounting.md, "Margin scopes",
+        defines the per-instrument scope (``instrument_id`` set) as *isolated*
+        collateral — segregated to one position — and the account-wide scope
+        (``instrument_id=None``, keyed by the collateral currency) as what a
+        cross-margin venue reports, because there the collateral is shared and
+        closing one position frees it for every other. Every in-tree crypto
+        adapter that runs cross margin reports account-wide, and
+        ``MarginAccount`` keeps the two in separate stores
+        (accounting/accounts/margin.pyx:511-521), so the choice decides which
+        query answers at all: ``margin_init_for_currency`` sees only the
+        account-wide store, ``margin_init(instrument_id)`` only the other.
+
+        Gate.io states which one a position uses in one field: ``leverage == "0"``
+        means cross margin (the cap then lives in ``cross_leverage_limit``), and
+        any positive ``leverage`` is isolated at that leverage. Reporting a cross
+        position per instrument would tell a strategy that each instrument has
+        its own collateral, which on this venue is not true.
+        """
         raw_symbol = venue_symbol_of(position)
         if not raw_symbol:
             return None
@@ -3738,33 +3838,49 @@ class GateioExecutionClient(LiveExecutionClient):
         return MarginBalance(
             initial=Money(max(Decimal(0), initial), currency),
             maintenance=Money(max(Decimal(0), maintenance), currency),
-            instrument_id=gateio_to_instrument_id(product, raw_symbol),
+            instrument_id=(
+                None if _is_cross_margin(position) else gateio_to_instrument_id(product, raw_symbol)
+            ),
         )
 
     async def _collect_options_balances(
         self,
         balances: dict[str, tuple[Decimal, Decimal]],
-        margins: dict[InstrumentId | None, MarginBalance],
+        margins: dict[InstrumentId | Currency, MarginBalance],
     ) -> None:
         account = await require_wallet(self._options_http.account(), "the options wallet")
         currency = str(account.get("currency") or "USDT").upper()
-        total = to_decimal(account.get("equity"))
+        # `total` is the options account balance; `equity` is "balance + position
+        # value" and therefore already carries the unrealised PnL the Portfolio
+        # adds itself (see `_collect_futures_balances`). Use the balance, and
+        # recover it from `equity` only when the venue omitted it.
+        total = to_decimal(account.get("total"))
         if total <= 0:
-            total = to_decimal(account.get("total"))
+            total = to_decimal(account.get("equity")) - to_decimal(account.get("unrealised_pnl"))
         free = to_decimal(account.get("available"))
         _accumulate(balances, currency, total, min(free, total))
 
         initial = to_decimal(account.get("init_margin")) + to_decimal(account.get("order_margin"))
         maintenance = to_decimal(account.get("maint_margin"))
         if initial > 0 or maintenance > 0:
+            # The options wallet reports one figure for the whole account, which
+            # is the account-wide scope by definition.
             currency_obj = self._currency(currency)
-            margins[None] = MarginBalance(
-                initial=Money(max(Decimal(0), initial), currency_obj),
-                maintenance=Money(max(Decimal(0), maintenance), currency_obj),
+            _merge_margin(
+                margins,
+                MarginBalance(
+                    initial=Money(max(Decimal(0), initial), currency_obj),
+                    maintenance=Money(max(Decimal(0), maintenance), currency_obj),
+                ),
             )
 
-    def _publish_account_state(self, reported: bool) -> None:
-        """Publish the aggregated wallet state as a Nautilus ``AccountState``."""
+    def _publish_account_state(self, reported: bool, ts_event: int = 0) -> None:
+        """Publish the aggregated wallet state as a Nautilus ``AccountState``.
+
+        ``ts_event`` is the venue's own timestamp for the change, when there is
+        one. A REST snapshot has none — it is a reading taken now — so it passes
+        ``0`` and the local clock stands in.
+        """
         balances: list[AccountBalance] = []
         for code, (total, free) in sorted(self._balances.items()):
             currency = self._currency(code)
@@ -3779,13 +3895,25 @@ class GateioExecutionClient(LiveExecutionClient):
 
         margins: list[MarginBalance] = []
         if self._account_type == AccountType.MARGIN:
-            margins = list(self._margins.values())
+            # Every live entry, every time: `MarginAccount.apply` replaces both
+            # stores from the event, so anything left out here is deleted. The
+            # merge across products matters as much as the completeness: two
+            # products can back onto one collateral — a USDT-settled perpetual
+            # and the USDT options wallet — and the platform keys account-wide
+            # margin by currency (accounting/accounts/margin.pyx:511-521), so
+            # two entries for the same currency would not add up, the second
+            # would simply replace the first.
+            merged: dict[InstrumentId | Currency, MarginBalance] = {}
+            for product_margins in self._margins_by_product.values():
+                for margin in product_margins.values():
+                    _merge_margin(merged, margin)
+            margins = list(merged.values())
 
         self.generate_account_state(
             balances=balances,
             margins=margins,
             reported=reported,
-            ts_event=self._clock.timestamp_ns(),
+            ts_event=ts_event or self._clock.timestamp_ns(),
         )
 
     # -- wallet transfers --------------------------------------------------
@@ -5128,9 +5256,21 @@ class GateioExecutionClient(LiveExecutionClient):
             try:
                 reports += await self._position_reports_for_product(product, requested)
             except WalletNotProvisionedError as e:
-                # Not a failure: Gate.io creates a product wallet on first use
-                # and says USER_NOT_FOUND until then, which is a definite "there
-                # is no position here" rather than an unanswered question.
+                if _is_refusal(e):
+                    # The venue was asked and would not answer. `require_wallet`
+                    # folds three different labels into this one exception, and
+                    # only USER_NOT_FOUND is a statement about positions;
+                    # FORBIDDEN and the unified-account labels say the key or the
+                    # account mode is not allowed to look. Treating those as
+                    # "no position here" is how a refusal becomes the FLAT
+                    # fallback below and closes a position that is still open.
+                    self._log_report_error(e, f"{product.value} PositionStatusReports")
+                    failures.append(e)
+                    continue
+                # A wallet Gate.io has not created yet holds no position: the
+                # venue creates it on the first transfer in and says
+                # USER_NOT_FOUND until then, which is a definite absence rather
+                # than an unanswered question.
                 self._log.warning(f"Skipping {product.value} position reports: {e}")
             except asyncio.CancelledError:
                 raise
@@ -5337,6 +5477,67 @@ def _accumulate(
     """Add a wallet's contribution to the aggregated per-currency balance."""
     previous_total, previous_free = balances.get(currency, (Decimal(0), Decimal(0)))
     balances[currency] = (previous_total + total, previous_free + max(Decimal(0), free))
+
+
+def _is_refusal(error: WalletNotProvisionedError) -> bool:
+    """Return whether the venue refused to answer rather than reported an absence.
+
+    ``require_wallet`` raises one exception type for two different facts:
+    ``USER_NOT_FOUND`` ("this wallet does not exist yet", so there is nothing in
+    it) and the account-mode labels ``FORBIDDEN``,
+    ``INVALID_UNIFIED_ACCOUNT``, ``UNIFIED_ACCOUNT_NOT_ACTIVATED`` ("this key or
+    this account mode may not read that ledger", which says nothing about what
+    the ledger holds). Balances can treat both as "skip this wallet"; a position
+    report cannot, because the absence of a report is read as flatness.
+
+    The distinguishing label is on the original venue error, which
+    ``require_wallet`` chains with ``raise ... from``, so it is read from
+    ``__cause__`` rather than by re-parsing the message.
+    """
+    label = getattr(error.__cause__, "label", None)
+    return label in ACCOUNT_MODE_LABELS
+
+
+def _is_cross_margin(position: dict[str, Any]) -> bool:
+    """Return whether a Gate.io futures position is held under cross margin.
+
+    ``leverage`` carries the isolated leverage, and Gate.io documents ``"0"`` as
+    the cross-margin marker: "leverage for isolated margin. 0 means cross margin.
+    For leverage of cross margin, please refer to `cross_leverage_limit`." A
+    payload with no ``leverage`` at all says nothing about the mode, and isolated
+    is the safer reading of silence: it keeps the margin attributed to the one
+    instrument it was observed on rather than pooling it across the account.
+    """
+    value = position.get("leverage")
+    if value in (None, ""):
+        return False
+    return to_decimal(value) == 0
+
+
+def _merge_margin(
+    margins: dict[InstrumentId | Currency, MarginBalance],
+    margin: MarginBalance,
+) -> None:
+    """Fold one margin entry into the set, keyed by the scope it belongs to.
+
+    Account-wide entries are keyed by collateral currency, exactly as
+    ``MarginAccount`` stores them (accounting/accounts/margin.pyx:511-521), so
+    several of them can coexist — a USDT-settled perpetual, a BTC-settled
+    inverse and the options wallet are three separate collaterals on one Gate.io
+    account. Keying them all under ``None`` would silently keep only the last.
+    """
+    key: InstrumentId | Currency = (
+        margin.currency if margin.instrument_id is None else margin.instrument_id
+    )
+    existing = margins.get(key)
+    if existing is None:
+        margins[key] = margin
+        return
+    margins[key] = MarginBalance(
+        initial=existing.initial + margin.initial,
+        maintenance=existing.maintenance + margin.maintenance,
+        instrument_id=margin.instrument_id,
+    )
 
 
 def _within(ts_ns: int, start_secs: int, end_secs: int) -> bool:
