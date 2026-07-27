@@ -97,6 +97,29 @@ a day for `1-DAY`. Use a short interval while wiring things up. Delivery and
 options publish no window-close flag, so their bars are additionally held until
 the next bucket opens plus a short grace period.
 
+## Nothing about the WebSocket appears in the log
+
+The transport logs through the platform, under the component name
+`GateioWebSocketClient`, so it is subject to the same configuration as every
+other component:
+
+```python
+from nautilus_trader.config import LoggingConfig
+
+LoggingConfig(
+    log_level="INFO",
+    log_level_file="DEBUG",
+    log_component_levels={"GateioWebSocketClient": "DEBUG"},
+)
+```
+
+At `DEBUG` the transport reports each connection, each heartbeat failure and
+each acknowledgement it could not match. Two things to know when reading it:
+`log_components_only=True` suppresses every component not named in
+`log_component_levels`, and a `Logger` built before the logging subsystem is
+initialized discards its messages, which is what happens when the transport is
+used standalone outside a `TradingNode`.
+
 ## The order book keeps resynchronising
 
 A gap in the incremental stream forces a REST re-snapshot. Occasional gaps are

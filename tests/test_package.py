@@ -208,6 +208,21 @@ class TestSourceCleanliness:
     def test_py_typed_marker_is_present(self):
         assert (PACKAGE_DIR / "py.typed").is_file()
 
+    @pytest.mark.parametrize("path", source_files(), ids=lambda p: p.name)
+    def test_no_module_logs_through_the_standard_library(self, path):
+        """Every component logs through the platform's logging subsystem.
+
+        A module holding its own `logging.getLogger` writes where the Nautilus
+        log file, `log_level`, `log_level_file` and `log_component_levels`
+        cannot reach it. The WebSocket transport did exactly that while
+        `instruments.py` used the platform `Logger`, so the same run answered
+        the operator's configuration in one place and ignored it in another.
+        Regression guard for the whole tree, not just the file that was fixed.
+        """
+        text = path.read_text(encoding="utf-8")
+        assert "getLogger" not in text, f"standard library logger in {path}"
+        assert "import logging" not in text, f"standard library logging imported in {path}"
+
 
 class TestVersionControlCoverage:
     """Every source file must reach a fresh clone.

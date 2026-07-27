@@ -50,13 +50,17 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
-import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 
+from nautilus_trader.common.component import Logger
+from nautilus_trader.live.cancellation import (
+    DEFAULT_TASK_CANCELLATION_TIMEOUT,
+    cancel_tasks_with_timeout,
+)
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
@@ -96,9 +100,6 @@ def is_transient_ws_error(error: Exception) -> bool:
     return isinstance(error, GateioError) and error.label in WS_TRANSIENT_LABELS
 
 
-logger = logging.getLogger(__name__)
-
-
 @dataclass(slots=True)
 class _Subscription:
     """A subscription to replay after a reconnect."""
@@ -134,8 +135,8 @@ class GateioWebSocketClient:
     handler : Callable[[dict], Any]
         Called with every decoded data message (subscription acknowledgements
         and pongs are consumed internally). A coroutine return value is
-        scheduled on the event loop; exceptions are logged and never break the
-        receive loop.
+        scheduled as a tracked background task, so ``disconnect`` waits for it;
+        exceptions are logged and never break the receive loop.
     api_key, api_secret : str
         Credentials for private channels. Public streams need neither.
     loop : asyncio.AbstractEventLoop, optional
@@ -185,6 +186,15 @@ class GateioWebSocketClient:
         self.size_decimal = size_decimal
         self.on_reconnect = on_reconnect
 
+        # The transport logs through the platform's logging subsystem, not the
+        # standard library, so that operator configuration (`log_level`,
+        # `log_level_file`, `log_component_levels`, the log file itself) covers
+        # reconnects, subscription failures and malformed frames the same way it
+        # covers the clients above. The component name is the class name, which
+        # is what `log_component_levels` matches on and what the in-tree
+        # reference transport uses (adapters/binance/websocket/client.py:75).
+        self._log: Logger = Logger(type(self).__name__)
+
         self._api_key = api_key
         self._api_secret = api_secret
         self._loop = loop
@@ -193,6 +203,9 @@ class GateioWebSocketClient:
         self._run_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._resubscribe_task: asyncio.Task[None] | None = None
+        #: Every background task this transport starts, so that `disconnect`
+        #: can hand the whole set to the platform's bounded cancellation.
+        self._tasks: set[asyncio.Task | asyncio.Future] = set()
         self._send_lock = asyncio.Lock()
         self._stopped = True
 
@@ -241,26 +254,26 @@ class GateioWebSocketClient:
         self._loop = self._loop or asyncio.get_running_loop()
         self._stopped = False
         await self._open()
-        self._run_task = self._loop.create_task(self._run_forever(), name="gateio-ws-recv")
-        self._heartbeat_task = self._loop.create_task(
-            self._heartbeat_loop(), name="gateio-ws-heartbeat"
-        )
+        self._run_task = self._spawn(self._run_forever(), name="gateio-ws-recv")
+        self._heartbeat_task = self._spawn(self._heartbeat_loop(), name="gateio-ws-heartbeat")
 
     async def disconnect(self) -> None:
         """Close the connection and stop all background work."""
         self._stopped = True
-        for task in (self._heartbeat_task, self._resubscribe_task, self._run_task):
-            if task is not None:
-                task.cancel()
-        for task in (self._heartbeat_task, self._resubscribe_task, self._run_task):
-            if task is None:
-                continue
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:  # noqa: BLE001 - shutdown is best effort
-                logger.debug("Background task ended with %s during disconnect", exc)
+        # `cancel_tasks_with_timeout` is the platform's own teardown and does
+        # what the previous hand-rolled cancel-then-await loop did not: it
+        # snapshots strong references before cancelling (a task held only by the
+        # loop can otherwise be collected mid-cancellation), gathers with
+        # `return_exceptions=True`, and warns with the task names if they have
+        # not settled within the timeout instead of waiting silently. It also
+        # covers the tasks that are not among the three named attributes, which
+        # is where the two fire-and-forget tasks used to escape.
+        await cancel_tasks_with_timeout(
+            self._tasks,
+            self._log,
+            timeout_secs=DEFAULT_TASK_CANCELLATION_TIMEOUT,
+        )
+        self._tasks.clear()
         self._heartbeat_task = None
         self._resubscribe_task = None
         self._run_task = None
@@ -269,6 +282,34 @@ class GateioWebSocketClient:
             if not pending.future.done():
                 pending.future.cancel()
         self._pending.clear()
+
+    def _spawn(self, coro: Coroutine[Any, Any, Any], name: str) -> asyncio.Task[Any]:
+        """Start ``coro`` as a tracked background task.
+
+        Every task the transport starts goes through here. A task referenced
+        only by the event loop can be garbage collected while it is suspended,
+        and nothing waits for it at shutdown; registering it means `disconnect`
+        cancels and awaits it with the rest.
+        """
+        loop = self._loop or asyncio.get_running_loop()
+        task = loop.create_task(coro, name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Drop a finished task from the registry and report why it ended.
+
+        Without this the registry would grow for the lifetime of the connection,
+        and a failed background task would surface only as asyncio's
+        "exception was never retrieved" warning on garbage collection.
+        """
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._log.exception(f"Background task '{task.get_name()}' failed", exc)
 
     async def _open(self) -> None:
         headers = (
@@ -284,7 +325,7 @@ class GateioWebSocketClient:
             close_timeout=5,
         )
         self.last_message_ns = time.time_ns()
-        logger.debug("Connected to %s", self.url)
+        self._log.debug(f"Connected to {self.url}")
 
     async def _close(self) -> None:
         ws, self._ws = self._ws, None
@@ -340,10 +381,8 @@ class GateioWebSocketClient:
         except Exception as exc:
             self.subscribe_failures += 1
             if is_transient_ws_error(exc):
-                logger.warning(
-                    "Subscription to %s failed transiently (%s); keeping it for replay",
-                    channel,
-                    exc,
+                self._log.warning(
+                    f"Subscription to {channel} failed transiently ({exc}); keeping it for replay",
                 )
                 raise
             self._subscriptions.pop(subscription.key, None)
@@ -440,7 +479,7 @@ class GateioWebSocketClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - any transport failure is recoverable
-                logger.warning("WebSocket receive failed on %s: %s", self.url, exc)
+                self._log.warning(f"WebSocket receive failed on {self.url}: {exc}")
             if self._stopped:
                 break
             await self._reconnect()
@@ -453,14 +492,13 @@ class GateioWebSocketClient:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=self.recv_timeout_secs)
             except TimeoutError:
-                logger.warning(
-                    "No message from %s for %.0fs, recycling the connection",
-                    self.url,
-                    self.recv_timeout_secs,
+                self._log.warning(
+                    f"No message from {self.url} for {self.recv_timeout_secs:.0f}s, "
+                    "recycling the connection",
                 )
                 return
             except ConnectionClosed as exc:
-                logger.info("Connection to %s closed: %s", self.url, exc)
+                self._log.info(f"Connection to {self.url} closed: {exc}")
                 return
             self.messages_received += 1
             self.last_message_ns = time.time_ns()
@@ -470,7 +508,7 @@ class GateioWebSocketClient:
         try:
             message = json.loads(raw)
         except (TypeError, ValueError):
-            logger.warning("Discarding malformed frame from %s", self.url)
+            self._log.warning(f"Discarding malformed frame from {self.url}")
             return
         if not isinstance(message, dict):
             return
@@ -521,21 +559,27 @@ class GateioWebSocketClient:
         result = message.get("result")
         kind = result.get("type") if isinstance(result, dict) else None
         text = result.get("msg") if isinstance(result, dict) else None
-        logger.info("Service notification from %s: %s %s", self.url, kind, text)
+        self._log.info(f"Service notification from {self.url}: {kind} {text}")
         if kind == "upgrade" and self._ws is not None:
-            # The venue is about to close the socket; reconnect proactively.
-            loop = self._loop or asyncio.get_running_loop()
-            loop.create_task(self._close())
+            # The venue is about to close the socket; reconnect proactively. The
+            # close is tracked because a shutdown arriving in the same window
+            # must wait for it rather than leave a pending task behind.
+            self._spawn(self._close(), name="gateio-ws-upgrade-close")
 
     def _invoke_handler(self, message: dict[str, Any]) -> None:
         try:
             outcome = self.handler(message)
-        except Exception:  # noqa: BLE001 - a faulty handler must not kill the stream
-            logger.exception("WebSocket handler raised for channel %s", message.get("channel"))
+        except Exception as exc:  # noqa: BLE001 - a faulty handler must not kill the stream
+            self._log.exception(
+                f"WebSocket handler raised for channel {message.get('channel')}",
+                exc,
+            )
             return
         if asyncio.iscoroutine(outcome):
-            loop = self._loop or asyncio.get_running_loop()
-            loop.create_task(outcome)
+            # The public signature permits an async handler, so this path is an
+            # advertised extension point. An untracked task here can be
+            # collected while suspended, which drops the message silently.
+            self._spawn(outcome, name=f"gateio-ws-handler-{message.get('channel')}")
 
     # -- reconnection ------------------------------------------------------
 
@@ -551,19 +595,18 @@ class GateioWebSocketClient:
             except Exception as exc:  # noqa: BLE001 - keep retrying any connect failure
                 delay = min(backoff, self.max_backoff)
                 delay *= 0.75 + random.random() * 0.5  # noqa: S311 - jitter, not cryptography
-                logger.warning(
-                    "Reconnect to %s failed (%s); retrying in %.1fs", self.url, exc, delay
+                self._log.warning(
+                    f"Reconnect to {self.url} failed ({exc}); retrying in {delay:.1f}s",
                 )
                 await asyncio.sleep(delay)
                 backoff = min(backoff * 2, self.max_backoff)
                 continue
 
             self.reconnects += 1
-            logger.info("Reconnected to %s (attempt count %d)", self.url, self.reconnects)
-            loop = self._loop or asyncio.get_running_loop()
+            self._log.info(f"Reconnected to {self.url} (attempt count {self.reconnects})")
             if self._resubscribe_task is not None and not self._resubscribe_task.done():
                 self._resubscribe_task.cancel()
-            self._resubscribe_task = loop.create_task(
+            self._resubscribe_task = self._spawn(
                 self._after_reconnect(), name="gateio-ws-resubscribe"
             )
             return
@@ -582,11 +625,9 @@ class GateioWebSocketClient:
                 raise
             except Exception as exc:  # noqa: BLE001 - report and continue with the rest
                 self.subscribe_failures += 1
-                logger.error(
-                    "Failed to replay subscription %s %s: %s",
-                    subscription.channel,
-                    subscription.payload,
-                    exc,
+                self._log.error(
+                    f"Failed to replay subscription {subscription.channel} "
+                    f"{subscription.payload}: {exc}",
                 )
         if self.on_reconnect is None:
             return
@@ -596,8 +637,8 @@ class GateioWebSocketClient:
                 await outcome
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - the callback is owner code
-            logger.exception("on_reconnect callback failed for %s", self.url)
+        except Exception as exc:  # noqa: BLE001 - the callback is owner code
+            self._log.exception(f"on_reconnect callback failed for {self.url}", exc)
 
     # -- heartbeat ---------------------------------------------------------
 
@@ -621,7 +662,7 @@ class GateioWebSocketClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - the receive loop handles recovery
-                logger.debug("Heartbeat ping failed on %s: %s", self.url, exc)
+                self._log.debug(f"Heartbeat ping failed on {self.url}: {exc}")
 
     # -- diagnostics -------------------------------------------------------
 

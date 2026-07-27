@@ -555,7 +555,9 @@ async def test_a_gap_resyncs_and_republishes_a_clean_snapshot(harness: Harness) 
     client._book_levels[PERP_ID] = 100
 
     scheduled: list[Any] = []
-    client._track = lambda coro, log_msg: scheduled.append(coro)  # type: ignore[method-assign]
+    # The client schedules its recovery work through the platform's
+    # `LiveDataClient.create_task`; capture the coroutine instead of running it.
+    client.create_task = lambda coro, **_: scheduled.append(coro)  # type: ignore[method-assign]
 
     client._handle_ws_message(
         GateioProductType.PERP,
@@ -944,7 +946,7 @@ async def test_transient_subscribe_failure_keeps_the_local_book(harness: Harness
 
     client._ws_clients[GateioProductType.PERP] = StubWs()  # type: ignore[assignment]
     tracked: list[Any] = []
-    client._track = lambda coro, log_msg: tracked.append(coro)  # type: ignore[method-assign]
+    client.create_task = lambda coro, **_: tracked.append(coro)  # type: ignore[method-assign]
 
     from nautilus_trader.model.enums import BookType
 
@@ -1561,3 +1563,149 @@ async def test_an_unimplemented_depth_subscription_leaves_a_phantom_subscription
         "raises and leaves a subscription the client keeps reporting"
     )
     assert "the subscription fails visibly" not in page, "the retracted claim is still on the page"
+
+
+# -- s4: the client uses the platform's task machinery, not its own ----------
+#
+# `LiveMarketDataClient.__init__` creates `self._tasks` as a WeakSet that
+# `create_task` populates and `cancel_pending_tasks` drains
+# (live/data_client.py:375, :478, :1149). The client replaced it with a plain
+# set, so every completed subscribe, unsubscribe and request task stayed
+# reachable for the lifetime of the node, and `_disconnect` cleared the
+# collection after cancelling, leaving the platform's bounded shutdown
+# (live/cancellation.py) with nothing to await.
+
+
+class _RecordingTransport:
+    """A stand-in for the shared HTTP transport that records its release."""
+
+    def __init__(self, journal: list[str]) -> None:
+        self._journal = journal
+
+    async def close(self) -> None:
+        self._journal.append("http")
+
+
+class _RecordingWebSocket:
+    """A stand-in for a product WebSocket that records its teardown."""
+
+    def __init__(self, journal: list[str]) -> None:
+        self._journal = journal
+
+    async def disconnect(self) -> None:
+        self._journal.append("ws")
+
+
+def _client_on_the_running_loop(http_client: Any) -> GateioDataClient:
+    """Build a client bound to the loop the test is running on.
+
+    The shared ``harness`` fixture builds its client on a fresh, never-started
+    loop, which is right for the parsing tests but cannot run a task.
+    """
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TraderId("TESTER-000"), clock=clock)
+    provider = StubProvider()
+    for instrument in build_instruments():
+        provider.add(instrument)
+    return GateioDataClient(
+        loop=asyncio.get_running_loop(),
+        client_id=GATEIO_CLIENT_ID,
+        msgbus=msgbus,
+        cache=Cache(),
+        clock=clock,
+        instrument_provider=provider,
+        http_client=http_client,
+        config=GateioDataClientConfig(products=(GateioProductType.PERP,)),
+    )
+
+
+async def test_the_client_keeps_the_platforms_task_registry() -> None:
+    """The registry must stay the base class's WeakSet."""
+    from weakref import WeakSet
+
+    client = _client_on_the_running_loop(_RecordingTransport([]))
+    assert isinstance(client._tasks, WeakSet), (
+        "the client replaced LiveMarketDataClient._tasks with its own collection"
+    )
+
+
+async def test_completed_background_tasks_do_not_accumulate() -> None:
+    """A long-running node must not retain every finished task.
+
+    Each subscribe, unsubscribe and request the data engine issues becomes a
+    task in this registry. Holding a plain set meant a session that resubscribed
+    or requested bars on a schedule grew one entry per call, forever.
+    """
+    import gc
+
+    client = _client_on_the_running_loop(_RecordingTransport([]))
+    assert len(client._tasks) == 0
+
+    for index in range(3):
+        client.create_task(asyncio.sleep(0), log_msg=f"probe-{index}")
+    await asyncio.sleep(0.01)
+    gc.collect()
+
+    assert len(client._tasks) == 0, "finished tasks are still held by the client"
+
+
+async def test_disconnect_settles_its_tasks_before_releasing_the_transports() -> None:
+    """Shutdown order is the reverse of acquisition, and it is awaited.
+
+    Two properties in one sequence. The background task is cancelled *and
+    awaited* through the platform's bounded teardown rather than merely told to
+    cancel, and the shared HTTP transport - which is reference counted, so this
+    release is what closes the pool for both clients - goes last, after the
+    sockets. Releasing it first meant a request still in flight failed with
+    ``CLIENT_CLOSED`` instead of being cancelled cleanly.
+    """
+    journal: list[str] = []
+    client = _client_on_the_running_loop(_RecordingTransport(journal))
+    client._ws_clients[GateioProductType.PERP] = _RecordingWebSocket(journal)  # type: ignore[assignment]
+
+    running = asyncio.Event()
+
+    async def _background() -> None:
+        running.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            journal.append("task")
+
+    task = client.create_task(_background(), log_msg="probe")
+    await asyncio.wait_for(running.wait(), timeout=1.0)
+
+    await client._disconnect()
+
+    assert task.done(), "_disconnect returned while its background task was still pending"
+    assert journal == ["task", "ws", "http"], f"shutdown ran out of order: {journal}"
+
+
+async def test_disconnect_leaves_the_platforms_shutdown_nothing_to_do() -> None:
+    """`cancel_pending_tasks` runs again after `_disconnect`; it must be a no-op.
+
+    The base `disconnect()` calls `_disconnect()` and then
+    `cancel_pending_tasks()` (live/data_client.py:550-552). Clearing the
+    registry inside `_disconnect` used to make that second call meaningless
+    whether or not anything had actually finished.
+    """
+    client = _client_on_the_running_loop(_RecordingTransport([]))
+    running = asyncio.Event()
+
+    async def _background() -> None:
+        running.set()
+        await asyncio.sleep(3600)
+
+    task = client.create_task(_background(), log_msg="probe")
+    await asyncio.wait_for(running.wait(), timeout=1.0)
+
+    await client._disconnect()
+
+    # The registry is the platform's to manage. Emptying it by hand is what made
+    # the second call meaningless: it reported a clean shutdown for tasks it had
+    # simply stopped tracking.
+    assert task in client._tasks, "_disconnect emptied the platform's task registry"
+    assert task.done()
+
+    await client.cancel_pending_tasks()
+    assert [pending for pending in client._tasks if not pending.done()] == []

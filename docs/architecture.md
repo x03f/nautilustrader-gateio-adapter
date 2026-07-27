@@ -62,7 +62,7 @@ The dependency direction is one-way, from the bottom of this table upwards:
 | `books.py` | standard library only | none |
 | `common/*` | standard library only | identifiers and enums only (`constants.py`, `enums.py`, `symbols.py`) |
 | `http/*` | `common/*`, `httpx` | none — namespaces return decoded JSON unchanged |
-| `websocket/*` | `common/*`, `websockets` | none — the transport hands raw envelopes to a callback |
+| `websocket/*` | `common/*`, `websockets`, the platform's logger and task cancellation | none — the transport hands raw envelopes to a callback |
 | `instruments.py`, `providers.py` | `http/*`, `common/*` | instrument and provider types |
 | `data.py`, `execution.py`, `factories.py` | everything below | the full live-client surface |
 
@@ -234,6 +234,31 @@ Gate.io treats repeated subscriptions as additive. A subscription that failed
 for a transport reason (`WS_NOT_CONNECTED` during a reconnect window,
 `WS_ACK_TIMEOUT`) is kept and replayed; only an outright venue rejection removes
 it.
+
+### Logging and background tasks in the transport
+
+The transport logs through NautilusTrader's logging subsystem
+(`nautilus_trader.common.component.Logger`), under the component name
+`GateioWebSocketClient`. Reconnects, subscription replay failures, malformed
+frames and the venue's service notifications therefore land in the Nautilus log
+file and obey `log_level`, `log_level_file` and `log_component_levels` like
+every other component. Using a standard-library logger here meant none of that
+applied, and the package contradicted itself, since `instruments.py` already
+logged through the platform.
+
+Every background task the transport starts — the receive loop, the heartbeat,
+the subscription replay, the proactive close triggered by the venue's `upgrade`
+notification and the task wrapping a coroutine returned by the message handler —
+is registered in one collection, and `disconnect()` hands that collection to the
+platform's `cancel_tasks_with_timeout`. That is what takes a strong reference
+snapshot before cancelling, so a task held only by the event loop cannot be
+collected mid-cancellation, and what reports the task names if they do not
+settle in time. A task the transport does not register is a task shutdown cannot
+account for.
+
+This does not require a running trading node: a `Logger` built before the
+logging subsystem is initialized simply discards its messages, so the REST and
+WebSocket layers remain usable standalone as described above.
 
 ## Instrument provider
 

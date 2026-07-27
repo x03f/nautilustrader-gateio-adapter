@@ -416,7 +416,11 @@ class GateioDataClient(LiveMarketDataClient):
         self._ticker_subs: dict[InstrumentId, set[str]] = defaultdict(set)
         self._update_instruments_task: asyncio.Task | None = None
         self._bar_flush_task: asyncio.Task | None = None
-        self._tasks: set[asyncio.Task] = set()
+        # No task registry of our own: `LiveMarketDataClient.__init__` already
+        # created `self._tasks` as a WeakSet that `create_task` populates and
+        # `cancel_pending_tasks` drains. Replacing it with a plain set was what
+        # made every completed subscribe and request task live for the lifetime
+        # of the node.
 
         # Metrics
         self._reconnects: dict[str, int] = defaultdict(int)
@@ -510,19 +514,16 @@ class GateioDataClient(LiveMarketDataClient):
         self._bar_flush_task = self.create_task(self._flush_bars_loop())
 
     async def _disconnect(self) -> None:
-        # See the execution client: the shared transport is reference counted and
-        # closes on the last release (seam-08).
-        await self._http_client.close()
-        if self._update_instruments_task is not None:
-            self._update_instruments_task.cancel()
-            self._update_instruments_task = None
-        if self._bar_flush_task is not None:
-            self._bar_flush_task.cancel()
-            self._bar_flush_task = None
-
-        for task in list(self._tasks):
-            task.cancel()
-        self._tasks.clear()
+        # Order matters, and it is the reverse of the order the resources were
+        # acquired in. `cancel_pending_tasks` is the platform's bounded teardown
+        # (live/cancellation.py): it snapshots strong references, cancels, and
+        # gathers with a timeout. Running it first means no background task is
+        # still using a socket or the HTTP pool when those are released. The base
+        # `disconnect()` calls it again once this coroutine returns, which is
+        # harmless — by then the WeakSet holds nothing pending.
+        await self.cancel_pending_tasks()
+        self._update_instruments_task = None
+        self._bar_flush_task = None
 
         for product, client in self._ws_clients.items():
             try:
@@ -531,12 +532,11 @@ class GateioDataClient(LiveMarketDataClient):
                 self._log.warning(f"Error disconnecting {product.value} WebSocket: {e}")
         self._ws_clients.clear()
 
-    def _track(self, coro: Any, log_msg: str) -> None:
-        """Run ``coro`` as a tracked background task."""
-        task = self.create_task(coro, log_msg=log_msg)
-        if task is not None:
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+        # Released last. The transport is shared with the execution client and
+        # reference counted, so this call is what actually closes the pool when
+        # this client is the last holder; anything still in flight would see
+        # `CLIENT_CLOSED` rather than a clean cancellation.
+        await self._http_client.close()
 
     # -- instruments -------------------------------------------------------
 
@@ -755,7 +755,7 @@ class GateioDataClient(LiveMarketDataClient):
             self._log.error(f"Cannot subscribe to the order book for {instrument_id}: {e}")
             return
 
-        self._track(
+        self.create_task(
             self._book_snapshot_then_deltas(instrument_id),
             log_msg=f"book snapshot {instrument_id}",
         )
@@ -980,7 +980,7 @@ class GateioDataClient(LiveMarketDataClient):
             if book is not None:
                 book.reset()
             self._resyncs[product.value] += 1
-            self._track(
+            self.create_task(
                 self._book_snapshot_then_deltas(instrument_id),
                 log_msg=f"book resnapshot {instrument_id}",
             )
@@ -1100,7 +1100,7 @@ class GateioDataClient(LiveMarketDataClient):
                 return  # unsubscribed while waiting
             await self._book_snapshot_then_deltas(instrument_id)
 
-        self._track(_retry(), log_msg=f"book snapshot retry {instrument_id}")
+        self.create_task(_retry(), log_msg=f"book snapshot retry {instrument_id}")
 
     def _snapshot_deltas(
         self,
@@ -1196,7 +1196,7 @@ class GateioDataClient(LiveMarketDataClient):
             self._resyncs[product.value] += 1
             self._log.warning(f"{e}; rebuilding from a REST snapshot")
             book.reset()
-            self._track(
+            self.create_task(
                 self._book_snapshot_then_deltas(instrument_id),
                 log_msg=f"book resync {instrument_id}",
             )

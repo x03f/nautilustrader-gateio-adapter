@@ -56,6 +56,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The WebSocket transport logs through the platform, not the standard
+  library.** `nautilus_gateio/websocket/client.py` held a
+  `logging.getLogger(__name__)`, so every reconnect, failed subscription replay,
+  malformed frame and venue service notice went somewhere the Nautilus log file
+  never saw and `log_level`, `log_level_file` and `log_component_levels` never
+  reached — while `instruments.py` in the same package already used the platform
+  `Logger`, so one run answered the operator's configuration in one place and
+  ignored it in another. The transport now logs under the component name
+  `GateioWebSocketClient`, which is what `log_component_levels` matches on. A
+  package-wide test refuses any future standard-library logger in the tree.
+- **No background task of the WebSocket transport escapes shutdown any more.**
+  `disconnect()` cancelled three named attributes; the proactive close started
+  by the venue's `upgrade` notification and the task wrapping a coroutine
+  returned by the message handler were in neither, so they were referenced only
+  by the event loop — collectable while suspended, and never awaited. Both are
+  now registered, and `disconnect()` hands the whole registry to the platform's
+  `cancel_tasks_with_timeout`, which snapshots strong references before
+  cancelling and names anything that has not settled. A background task that
+  fails is reported through the platform logger instead of surfacing as
+  asyncio's "exception was never retrieved" at some later collection.
+- **`GateioDataClient` no longer replaces the platform's task registry.** It
+  overwrote `LiveMarketDataClient._tasks` — a `WeakSet` the base class populates
+  from `create_task` and drains from `cancel_pending_tasks` — with a plain set,
+  so every completed subscribe, unsubscribe and request task stayed reachable for
+  the lifetime of the node. `_disconnect` then cancelled those tasks without
+  awaiting them and cleared the collection, leaving the platform's bounded
+  shutdown nothing to find and reporting a clean stop for work it had merely
+  stopped tracking. The client now uses `create_task` and `cancel_pending_tasks`
+  unchanged.
+- **The data client releases the shared HTTP transport last.** `_disconnect`
+  closed it first, while its own background tasks were still running: the
+  transport is reference counted, so on the second client to disconnect that
+  call actually closes the pool, and a request in flight then failed with
+  `CLIENT_CLOSED` instead of being cancelled. Shutdown now settles the tasks,
+  closes the sockets, and releases the transport in that order.
 - **Unrealised PnL was counted twice in portfolio equity.** The futures wallet
   total was published as `total + unrealised_pnl`, and the options wallet total
   as `equity`, which Gate.io defines as balance plus position value. The
