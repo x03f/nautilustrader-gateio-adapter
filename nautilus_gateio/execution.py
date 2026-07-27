@@ -213,6 +213,36 @@ class PositionStatusUnavailable(Exception):
     """
 
 
+class FillReportsUnavailable(Exception):
+    """A fill query answered for some products and failed for others.
+
+    The engine keeps one brake against squaring a position to flat: it refuses to
+    do it when the trade listing failed, so that the *next* cycle can apply the
+    venue's own closing trade instead of an inferred one
+    (``LiveExecutionEngine._process_cached_position_discrepancies`` guards the
+    squaring with ``not had_fill_query_errors``). That flag is set from one place
+    and one place only — ``_query_and_find_missing_fills`` sets it when a client's
+    ``generate_fill_reports`` *raises*. A client that logs a per-product failure
+    and returns what it collected reports the failure as "no fills", and the brake
+    never engages: the position is closed with a synthetic trade id and zero
+    commission, and because it is then no longer open it is never queried again,
+    so the real trade arriving later is never applied. The loss is permanent.
+
+    The reports gathered before the failure are carried on the exception rather
+    than discarded, because the two callers want different things from it. The
+    position paths want the failure; the recovery paths (startup mass status,
+    reconnect) want everything the venue *did* answer, since a mass status is
+    reconciled against the orders it names and cannot square a position to flat on
+    its own. Raising a bare error would make one 5xx on the options trade listing
+    throw away the order and fill recovery a restart exists to perform.
+    """
+
+    def __init__(self, message: str, reports: list[FillReport]) -> None:
+        super().__init__(message)
+        #: Everything the venue did answer for, before and after the failure.
+        self.reports: list[FillReport] = reports
+
+
 #: Order types this client can express on Gate.io.
 SUPPORTED_ORDER_TYPES: Final[frozenset[OrderType]] = frozenset(
     {
@@ -1018,16 +1048,25 @@ class GateioExecutionClient(LiveExecutionClient):
                     log_receipt_level=LogLevel.DEBUG,
                 ),
             )
-            fill_reports = await self.generate_fill_reports(
-                GenerateFillReports(
-                    instrument_id=None,
-                    venue_order_id=None,
-                    start=start,
-                    end=None,
-                    command_id=UUID4(),
-                    ts_init=self._clock.timestamp_ns(),
-                ),
-            )
+            try:
+                fill_reports = await self.generate_fill_reports(
+                    GenerateFillReports(
+                        instrument_id=None,
+                        venue_order_id=None,
+                        start=start,
+                        end=None,
+                        command_id=UUID4(),
+                        ts_init=self._clock.timestamp_ns(),
+                    ),
+                )
+            except FillReportsUnavailable as e:
+                # Recovery works from what the venue did answer. A product whose
+                # trade listing failed costs that product's fills, not the whole
+                # reconnect; the failure matters where a position could be
+                # squared to flat on the strength of it, and a mass status
+                # cannot do that.
+                self._log.warning(f"Reconnect recovery is working from a partial answer: {e}")
+                fill_reports = e.reports
         except Exception as e:  # noqa: BLE001 - a failed re-query must not kill the client
             self._log.error(f"Cannot reconcile after the {product.value} reconnect: {e}")
             return
@@ -4200,6 +4239,18 @@ class GateioExecutionClient(LiveExecutionClient):
         by querying, per instrument, every open position the mass status did not
         cover, and that path handles both "the venue says flat" and "the venue
         did not answer" correctly.
+
+        A trade listing that failed for one product is treated the same way and
+        for the same reason. It is raised — that is what tells the engine not to
+        square a position against a flat report it built itself — but recovery
+        works from what the venue *did* answer, so the reports gathered before
+        the failure are taken off the exception rather than thrown away.
+
+        What this method cannot do is check afterwards which of those reports
+        the engine booked, because the engine reconciles the mass status after
+        this call returns. The sweep in :meth:`_hand_over_unapplied_fills` is
+        therefore reached from the reconnect route only, and REC-01 in
+        docs/review-matrix.md records what a restart still loses because of it.
         """
         self._log.info("Generating ExecutionMassStatus...")
         self.reconciliation_active = True
@@ -4258,6 +4309,10 @@ class GateioExecutionClient(LiveExecutionClient):
         for result in (orders, fills, positions):
             if isinstance(result, asyncio.CancelledError):
                 raise result
+
+        if isinstance(fills, FillReportsUnavailable):
+            self._log.warning(f"Startup recovery is working from a partial answer: {fills}")
+            fills = fills.reports
 
         if isinstance(orders, BaseException) or isinstance(fills, BaseException):
             failure = orders if isinstance(orders, BaseException) else fills
@@ -5230,8 +5285,24 @@ class GateioExecutionClient(LiveExecutionClient):
         (``order_id``) and on futures and delivery (``order``); options has no
         such parameter, so the filter is applied to the parsed reports as well,
         which is what makes the guarantee hold on every product.
+
+        A product whose trade listing failed makes this method raise
+        :class:`FillReportsUnavailable`, carrying everything the other products
+        did answer. Returning the partial list instead — which is what logging
+        and continuing amounts to — is indistinguishable from "the venue reports
+        no such trades", and the engine's only defence against squaring a
+        position to flat on a failed query is that this call raises: it sets
+        ``had_fill_query_errors`` in ``_query_and_find_missing_fills`` from the
+        exception and from nothing else. Swallowing the failure there costs a
+        real closing trade, permanently, because the squared position is no
+        longer open and is never queried again.
+
+        A wallet Gate.io has not created is not a failure and does not raise:
+        ``USER_NOT_FOUND`` means the ledger does not exist, so it holds no
+        trades, which is a definite answer of none.
         """
         reports: list[FillReport] = []
+        failures: list[str] = []
         start_secs, end_secs = self._window(command.start, command.end)
 
         for product in self._products:
@@ -5245,8 +5316,11 @@ class GateioExecutionClient(LiveExecutionClient):
                 )
             except WalletNotProvisionedError as e:
                 self._log.warning(f"Skipping {product.value} fill reports: {e}")
-            except (asyncio.CancelledError, Exception) as e:  # noqa: BLE001
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - reported below, after every product
                 self._log_report_error(e, f"{product.value} FillReports")
+                failures.append(f"{product.value}: {e}")
 
         if command.venue_order_id is not None:
             reports = [
@@ -5256,6 +5330,14 @@ class GateioExecutionClient(LiveExecutionClient):
         # Reconciliation applies fills in list order, so ordering is load-bearing.
         reports.sort(key=lambda report: (report.ts_event, report.trade_id.value))
         self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
+
+        if failures:
+            raise FillReportsUnavailable(
+                f"Gate.io did not answer the trade listing"
+                f"{f' for {command.instrument_id}' if command.instrument_id is not None else ''}: "
+                f"{'; '.join(failures)}",
+                reports,
+            )
         return reports
 
     async def _fill_reports_for_product(
@@ -5611,12 +5693,30 @@ class GateioExecutionClient(LiveExecutionClient):
 
         entries = payloads if isinstance(payloads, list) else [payloads]
         reports: list[PositionStatusReport] = []
-        for payload in entries:
+        for index, payload in enumerate(entries):
+            # A row that cannot be read is not a row that says nothing. Dropping
+            # it leaves this method returning fewer reports than the venue sent —
+            # and one caller above reads "no report for this instrument" as an
+            # explicit FLAT while the other lets the engine build the same flat
+            # report itself, so a row the parser choked on ends up squaring a
+            # live position with an inferred fill. What the venue said is
+            # unknown; that is a failed query, and the only thing this client can
+            # honestly do with it is say so.
             if not isinstance(payload, dict):
-                continue
+                raise PositionStatusUnavailable(
+                    f"Gate.io answered the {product.value} position query with a row "
+                    f"({index + 1} of {len(entries)}) this client cannot read: "
+                    f"{type(payload).__name__} where a position object was expected. "
+                    f"Nothing follows about what the ledger holds",
+                )
             report = await self._parse_position_report(product, payload)
-            if report is not None:
-                reports.append(report)
+            if report is None:
+                raise PositionStatusUnavailable(
+                    f"Gate.io answered the {product.value} position query with a row "
+                    f"({index + 1} of {len(entries)}) this client cannot read. Nothing "
+                    f"follows about what the ledger holds",
+                )
+            reports.append(report)
         return reports
 
     async def _parse_position_report(
@@ -5624,7 +5724,13 @@ class GateioExecutionClient(LiveExecutionClient):
         product: GateioProductType,
         payload: dict[str, Any],
     ) -> PositionStatusReport | None:
-        """Build a :class:`PositionStatusReport` from one Gate.io position."""
+        """Build a :class:`PositionStatusReport` from one Gate.io position.
+
+        ``None`` means the row could not be read, never "there is no position
+        here": a position of zero is a report like any other, with
+        ``PositionSide.FLAT``. The caller turns the difference into a failed
+        query, because a row that was not read supports no claim at all.
+        """
         raw_symbol = venue_symbol_of(payload)
         if not raw_symbol:
             self._log.error(

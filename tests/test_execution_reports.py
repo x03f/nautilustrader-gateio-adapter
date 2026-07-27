@@ -33,7 +33,11 @@ from nautilus_trader.model.position import Position
 
 from nautilus_gateio.common.enums import GateioProductType
 from nautilus_gateio.common.errors import GateioError, WalletNotProvisionedError
-from nautilus_gateio.execution import REPORT_PAGE_LIMIT, PositionStatusUnavailable
+from nautilus_gateio.execution import (
+    REPORT_PAGE_LIMIT,
+    FillReportsUnavailable,
+    PositionStatusUnavailable,
+)
 
 try:  # pytest inserts the tests directory on the path; support both layouts
     from tests.test_execution_orders import (
@@ -554,10 +558,18 @@ class TestSpotPositionsAreNotReported:
         """The FLAT answer stays where the venue really can say "no position".
 
         Without it a futures position closed at the venue could never be closed
-        locally, which is why the fallback exists at all.
+        locally, which is why the fallback exists at all. The row here is the one
+        Gate.io sends for a contract whose position is closed: it names the
+        contract and reports zero size, so it is a statement about the ledger and
+        must square the book. A row the client could not read is the opposite
+        case, and is covered by ``TestUnreadablePositionRows``.
         """
         env = perp_env
-        env.perp.responses["position"] = {}
+        env.perp.responses["position"] = {
+            "contract": "BTC_USDT",
+            "size": 0,
+            "entry_price": "0",
+        }
 
         reports = env.run(
             env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
@@ -689,6 +701,158 @@ class TestUnansweredPositionQueries:
         assert mass_status is not None
         assert [str(key) for key in mass_status.order_reports] == ["900001"]
         assert mass_status.position_reports == {}
+
+
+class TestUnreadablePositionRows:
+    """Regression (REC-02): a row this client cannot parse is not an empty answer.
+
+    The venue said something; the client failed to read it. Dropping the row
+    leaves the query answering with fewer reports than the venue sent, and both
+    callers above read that as flatness — the per-instrument route builds the
+    FLAT report here, and the engine's account-wide check builds it itself for
+    any cached open position the answer omitted. Either way a live position is
+    squared with a RECONCILIATION order and an inferred fill.
+
+    The distinction being defended is between a row that *reports* zero and a row
+    that could not be read; ``TestSpotPositionsAreNotReported`` holds the first
+    half, so a fix that simply stopped reporting positions would fail there.
+    """
+
+    @pytest.mark.parametrize(
+        ("answer", "why"),
+        [
+            ({"size": -4, "entry_price": "59000"}, "no contract field"),
+            (None, "an empty 200 body, which the HTTP client returns as None"),
+            ("BTC_USDT", "a row that is not an object"),
+            ([{"size": -4}], "a list whose only row carries no contract"),
+        ],
+    )
+    def test_a_row_that_cannot_be_read_fails_the_per_instrument_query(
+        self,
+        perp_env,
+        answer,
+        why,
+    ):
+        env = perp_env
+        env.perp.responses["position"] = answer
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    @pytest.mark.parametrize(
+        ("answer", "why"),
+        [
+            ([{"size": -4, "entry_price": "59000"}], "no contract field"),
+            (None, "an empty 200 body, which the HTTP client returns as None"),
+            (["BTC_USDT"], "a row that is not an object"),
+        ],
+    )
+    def test_a_row_that_cannot_be_read_fails_the_account_wide_sweep(self, perp_env, answer, why):
+        """The account-wide route is the one the periodic position check uses.
+
+        It never sees this client's FLAT fallback: the engine manufactures the
+        flat report for anything the answer omitted, so a dropped row and an
+        answer that never mentioned the instrument are the same claim to it.
+        """
+        env = perp_env
+        env.perp.responses["positions"] = answer
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(env.client.generate_position_status_reports(_position_command(None)))
+
+    def test_an_unloadable_instrument_fails_the_query_rather_than_vanishing(self, perp_env):
+        """A row about a contract this client cannot resolve is still a row.
+
+        It names a position the venue is reporting. Dropping it silently answers
+        for a ledger that was never read, which is the same claim by a different
+        route.
+        """
+        env = perp_env
+        env.perp.responses["positions"] = [
+            {"contract": "ETH_USDT", "size": -4, "entry_price": "3000"},
+        ]
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(env.client.generate_position_status_reports(_position_command(None)))
+
+
+class TestFailedFillQueriesAreSurfaced:
+    """Regression (REC-03): a failed trade listing may not be reported as no trades.
+
+    ``LiveExecutionEngine`` keeps one brake against squaring a position to flat:
+    ``_process_cached_position_discrepancies`` does it only when
+    ``had_fill_query_errors`` is False, and ``_query_and_find_missing_fills``
+    sets that flag from a ``generate_fill_reports`` that *raises* and from
+    nothing else. A client that logs each per-product failure and returns what it
+    collected reports "no fills", the brake never engages, and the position is
+    closed with a synthetic trade id and no commission — permanently, because a
+    closed position is never queried again and the venue's real closing trade is
+    never applied.
+    """
+
+    def test_a_failed_product_makes_the_query_raise(self, perp_env):
+        env = perp_env
+        env.perp.responses["my_trades"] = RuntimeError("500 from the trade listing")
+
+        with pytest.raises(FillReportsUnavailable):
+            env.run(env.client.generate_fill_reports(_fill_reports_command()))
+
+    def test_the_failure_carries_what_the_other_products_did_answer(self, spot_and_perp_env):
+        """Recovery works from what the venue did answer, so it is not thrown away.
+
+        The exception is what the position paths need; the reports are what the
+        restart and reconnect recoveries need. Raising a bare error would let one
+        5xx on one product's trade listing cost the order and fill recovery a
+        restart exists to perform.
+        """
+        env = spot_and_perp_env
+        env.spot.responses["my_trades"] = RuntimeError("500 from the spot trade listing")
+        env.perp.responses["my_trades"] = lambda **kwargs: (
+            _futures_fills(1) if kwargs.get("offset", 0) == 0 else []
+        )
+
+        with pytest.raises(FillReportsUnavailable) as excinfo:
+            env.run(env.client.generate_fill_reports(_fill_reports_command()))
+
+        assert [report.instrument_id for report in excinfo.value.reports] == [PERP_BTC_USDT]
+
+    def test_an_unprovisioned_wallet_is_an_answer_of_none(self, perp_env):
+        """USER_NOT_FOUND means the ledger does not exist, so it holds no trades.
+
+        That is a definite answer and must not raise: an account that trades only
+        spot has to be able to reconcile.
+        """
+        env = perp_env
+        env.perp.responses["my_trades"] = WalletNotProvisionedError("no futures wallet yet")
+
+        assert env.run(env.client.generate_fill_reports(_fill_reports_command())) == []
+
+    def test_the_startup_mass_status_survives_a_failed_trade_listing(self, spot_and_perp_env):
+        """One 5xx on one product's trade listing may not cost the order recovery."""
+        env = spot_and_perp_env
+        env.spot.responses["my_trades"] = RuntimeError("500 from the spot trade listing")
+        env.perp.responses["list_orders"] = lambda **kwargs: (
+            _open_futures_orders() if kwargs.get("status") == "open" else []
+        )
+        # `generate_mass_status` with no lookback uses the client's own default
+        # window, so the trade has to be inside it rather than at the module's
+        # fixed epoch.
+        recent = int(env.clock.timestamp_ns() // 1_000_000_000) - 60
+        env.perp.responses["my_trades"] = lambda **kwargs: (
+            _futures_fills(1, create_time=recent) if kwargs.get("offset", 0) == 0 else []
+        )
+
+        mass_status = env.run(env.client.generate_mass_status())
+
+        assert mass_status is not None
+        assert [str(key) for key in mass_status.order_reports] == ["900001"]
+        assert [
+            report.trade_id.value
+            for reports in mass_status.fill_reports.values()
+            for report in reports
+        ] == ["T-0"]
 
 
 # -- contract report parsing --------------------------------------------------
@@ -1164,6 +1328,14 @@ def spot_env():
 @pytest.fixture()
 def perp_env():
     env = ExecHarness(products=(GateioProductType.PERP,))
+    yield env
+    env.close()
+
+
+@pytest.fixture()
+def spot_and_perp_env():
+    """Two products, so a failure on one can be told from a failure on all."""
+    env = ExecHarness(products=(GateioProductType.SPOT, GateioProductType.PERP))
     yield env
     env.close()
 

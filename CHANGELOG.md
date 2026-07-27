@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed trade listing is no longer reported to the execution engine as "no
+  trades".** `generate_fill_reports` caught every per-product failure, logged it
+  and returned whatever it had collected. The engine keeps exactly one brake
+  against squaring a cached position to flat — it declines to do so when the fill
+  query failed — and that flag is set from a query that *raises* and from nothing
+  else, so the brake never engaged. A 5xx on the trade listing while the position
+  query answered therefore closed the position with a synthetic trade id and no
+  commission, and the loss was permanent: a closed position is not open, so it is
+  never queried again and the venue's real closing trade is never applied. The
+  query now raises `FillReportsUnavailable`, carrying the reports the products
+  that did answer produced, so recovery still works from what the venue said
+  while the engine gets the failure it needs. `USER_NOT_FOUND` is unchanged: a
+  wallet Gate.io has not created holds no trades, which is a definite answer of
+  none.
+
+- **A position row whose shape this client cannot read is no longer answered as
+  flat.** A row that is not an object, a row carrying no venue symbol, a row
+  whose instrument cannot be resolved and an empty `200` body were all dropped,
+  and a query that dropped everything answered with an explicit flat report — a
+  statement the venue never made, and one the engine squares a live book against.
+  Such a row now fails the query instead, naming which row of how many and why. A
+  row that reports zero size is unaffected: that is the venue saying the position
+  is closed, and it must still square the book. This does not yet cover a row
+  whose *size* cannot be read; see `REC-02` in
+  [docs/review-matrix.md](docs/review-matrix.md).
+
 ### Changed
 
 - **A refusal this adapter makes itself is now `OrderDenied`, not `OrderSubmitted`

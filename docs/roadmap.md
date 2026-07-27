@@ -43,39 +43,58 @@ finished because its changes are written; it is finished when its criteria hold.
 
 Close what is already known to be wrong before adding anything.
 
-- **Recovery and reconciliation are not closed.** Five rounds have now passed their harnesses and
-  none has survived an attempt to refute it; passing is not evidence. The fifth round was put in
-  front of three independent verifiers — one on position authority, one on restatement
-  completeness, one asked to make the client fabricate an execution — and all three refuted it.
+- **Recovery and reconciliation are not closed.** Six rounds have now passed their own harnesses
+  and none has survived an attempt to refute it; passing is not evidence. The sixth round set out
+  to close the three defects listed below and was put in front of three independent verifiers — one
+  on restart-versus-reconnect parity, one on the unreadable-position claim, one on claim accuracy.
+  All three refuted it. One of the three fixes it attempted is in the tree, one is in the tree and
+  does not go far enough, and one has been withdrawn.
 
-  What the round did close, each proven by reverting the change and watching the damage return:
-  an order that missed more than one fill now recovers every trade under the venue's own statement
-  of that order, instead of one trade beside a cumulative quantity that made the engine mint a fill
-  of its own; an order the venue reports under a second id is rebased before its fills are applied;
-  and the restatement guard now admits exactly the reports that cannot produce an inferred fill,
-  read off the installed engine rather than assumed. The fabrication angle could not be refuted:
-  across 338 randomised reconnect cases run against this round and against its parent with the same
-  seeds, the parent replaced a real venue trade with a synthetic one ten times and this round never
-  did.
+  **Closed.** The fill-report query now raises when a product's trade listing fails, carrying the
+  reports the other products did answer. That raise is the only thing that arms the engine's brake
+  against squaring a position to flat on a failed query, so a 5xx on the trade listing no longer
+  closes a position with a synthetic trade id and no commission. Reverting it makes four tests and
+  a two-cycle harness scenario fail.
 
-  What is open, each demonstrated end to end against a real `LiveExecutionEngine` and stated in
-  [execution.md](execution.md):
-  - The unapplied-fill sweep runs only after a WebSocket reconnect. On the startup path the
-    engine's deduplication drops a venue-confirmed trade and nothing re-offers it, so a restart
-    that coincides with a fill understates the position and leaves an order working a quantity the
-    venue has already matched. Two verifiers reached this independently, from different angles.
-  - A position row the client cannot parse — no symbol field, a non-object row, an empty `200`
-    body — becomes an explicit flat report, which the engine squares the live book against. The
-    refusal-versus-absence typing this round added is correct and does not cover this route.
-  - The fill-report query never raises, so the engine's own brake against squaring a book on a
-    failed query never engages; a 5xx on the trade listing closes the position with a synthetic
-    trade id and no commission.
+  **Still open, and now stated more precisely than before:**
+  - A position row the client cannot read is still answered as a definite flat report. The two
+    shapes named by the previous refutation are fixed — a row that is not an object, and a row
+    whose venue symbol or instrument cannot be resolved, both of which used to be dropped so that
+    the query answered with fewer rows than the venue sent. The field that decides the answer is
+    not: the size is read with a helper that returns `0` for a missing key, for null, for an empty
+    string, for a non-numeric string and for any decimal magnitude below one lot, and `0` is flat.
+    The client cannot tell "the venue says zero" from "I could not read what the venue said", and
+    in the second case it logs nothing. Gate.io moved every futures size field from integer to
+    string in v4.106.0, which is what makes this reachable rather than hypothetical.
+  - A restart still loses a venue-confirmed trade wherever the engine's deduplication drops an
+    order report and the trades grouped under it. The sweep that re-offers them runs only after a
+    WebSocket reconnect. The net position is not wrong — the engine closes the gap with a
+    reconciliation order and an inferred fill — but the venue's trade id, price and fee are gone,
+    and on spot the fee is withheld in the currency being bought, so the inferred fill overstates
+    the position by exactly that fee.
 
-  The bookkeeping lesson is recorded with them: the round's commit message credited itself with a
-  fix its parent had already made and with a finding-matrix update its diff did not contain. Claims
-  about a change are now checked against the tree that carries it, not against the message.
-- Close the three open recovery defects above with a scenario that asserts the damage, and extend
-  the restart scenarios to cover the pairings only the reconnect scenarios exercise today.
+  **Withdrawn, and recorded so it is not tried again.** The sixth round's repair for the restart
+  path hung the sweep on the execution engine's publication of a mass status it has just
+  reconciled, on the grounds that this is the one moment both recovery routes share. The topic is
+  shared; the engine's state when it fires is not. A reconnect mass status carries no position
+  reports and a startup one does, and the engine reconciles those position reports *before* it
+  publishes. So on the startup path the sweep booked the venue's real trade on top of the fill the
+  engine had just inferred for the same trade: against a venue holding four lots short the account
+  held eight, with a fabricated reconciliation order beside it, and nothing corrects it because the
+  periodic position check is off by default. A restart turned a lost execution into a doubled
+  position, which is the more damaging half of the property the release gate exists to prove. The
+  change is out of the tree; the ordering that makes that hook wrong is recorded in the graph.
+
+  The reason no scenario caught it is recorded too, and is the more useful half of the round. Every
+  restart fixture answered the position endpoint with an empty book while the trade listing
+  reported a four-lot match — a state no perpetual account can be in, and the one answer under
+  which a client that books the trade twice still reads as correct. That fixture now answers with
+  the position the recovered trade creates, and fails on both trees.
+- Close the two open recovery defects above with a scenario that asserts the damage, and extend
+  the restart scenarios to cover the pairings only the reconnect scenarios exercise today. A fix
+  for the restart path has to book the recovered fills before anything can square the book against
+  a position report that already contains them, and has to leave the engine's partial-window fill
+  adjustment intact.
 - Fix the defects an audit against the platform documentation found, starting with the ten that
   produce silently wrong behaviour rather than an error.
 - Replace the facilities reimplemented here that the platform already ships, where the replacement

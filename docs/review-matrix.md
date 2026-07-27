@@ -111,13 +111,23 @@ review and are not closed.
 | ID | Finding | Status | Code | Evidence |
 |---|---|---|---|---|
 | `REC-01` | The unapplied-fill sweep runs only after a WebSocket reconnect, so on the startup path the engine's deduplication drops a venue-confirmed trade and nothing re-offers it: the position is understated and the order is left working a quantity the venue already matched | OPEN | `nautilus_gateio/execution.py` `_hand_over_unapplied_fills` | demonstrated against a real `LiveExecutionEngine` for a zero-filled, a partly-filled and a two-trade order, on spot and on perpetuals; reached independently by two verifiers |
-| `REC-02` | A position row the client cannot parse — no symbol field, a non-object row, an empty `200` body — is answered with an explicit flat report, and the engine squares the live book against it with a reconciliation order and an inferred fill | OPEN | `nautilus_gateio/execution.py` `_parse_position_report` | demonstrated on the startup route and on the position-check timer, with a control row that parses |
-| `REC-03` | `generate_fill_reports` catches every per-product failure, so the engine's brake against squaring a position on a failed fill query never engages; a 5xx on the trade listing closes the position with a synthetic trade id and no commission | OPEN | `nautilus_gateio/execution.py` `generate_fill_reports` | demonstrated with the same client and scenario, once with the failure swallowed and once surfaced |
+| `REC-02` | A position row the client cannot read is answered with an explicit flat report, and the engine squares the live book against it with a reconciliation order and an inferred fill. The row *shapes* are now covered — a non-object row, and a row whose venue symbol or instrument cannot be resolved, both raise instead of being dropped. The size field is not: it is read with a helper that returns `0` for a missing key, null, an empty string, a non-numeric string and any decimal magnitude below one lot, and `0` is flat | OPEN | `nautilus_gateio/execution.py` `_parse_position_report`, `_position_reports_for_product`; `nautilus_gateio/common/parsing.py` `to_int` | the covered shapes are held by `TestUnreadablePositionRows` and by a harness scenario with a control row that reports zero; the size field was demonstrated on both routes against a real `LiveExecutionEngine`, with the venue holding four lots short throughout |
+| `REC-03` | `generate_fill_reports` caught every per-product failure, so the engine's brake against squaring a position on a failed fill query never engaged; a 5xx on the trade listing closed the position with a synthetic trade id and no commission | FIXED | `nautilus_gateio/execution.py` `generate_fill_reports`, `FillReportsUnavailable` | `TestFailedFillQueriesAreSurfaced`; removing the raise makes those tests and a two-cycle harness scenario fail, while the control — a listing that answers with nothing to find — still squares the book |
 | `REC-04` | A quote-denominated spot market buy whose order listing is read mid-match loses trades: Gate.io publishes no base-denominated quantity for an unfilled market buy, so the report restates the order to the partial figure and the remaining matches are rejected as overfills | OPEN | `nautilus_gateio/execution.py` `_parse_spot_order_fields` | 12 of 338 randomised reconnect cases, identical on the current commit and its parent, so a standing defect rather than a regression |
 
 `REC-01` is stated in [execution.md](execution.md) under both Startup and Reconnect, because a reader
-of either section needs it. None of the four carries a regression test here yet; each was
-demonstrated outside the repository, which is why it is listed as open rather than as covered.
+of either section needs it.
+
+A repair for `REC-01` was written and withdrawn, and is recorded here because the shape of it is a
+trap. It started the sweep from the execution engine's publication of a mass status it had just
+reconciled, on the grounds that this is the one moment both recovery routes share. The topic is
+shared; the engine's state when it fires is not. A reconnect mass status carries no position
+reports and a startup one does, and the engine reconciles those position reports before it
+publishes — so on the startup path the sweep booked the venue's real trade on top of the fill the
+engine had just inferred for the same trade, leaving the account holding eight lots against a venue
+holding four. Anything that fixes `REC-01` has to book the recovered fills before the book can be
+squared against a position report that already contains them, and has to leave the engine's
+partial-window fill adjustment intact.
 
 ## Residual risks
 
