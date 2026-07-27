@@ -43,8 +43,10 @@ finished because its changes are written; it is finished when its criteria hold.
 
 Close what is already known to be wrong before adding anything.
 
-- Independently verify the recovery and reconciliation fixes. Two earlier rounds passed their
-  harnesses and did not survive an attempt to refute them; passing is not evidence.
+- Independently verify the recovery and reconciliation fixes. Four rounds have now passed their
+  harnesses and none has survived an attempt to refute it; passing is not evidence. What the
+  fourth leaves open is stated in [execution.md](execution.md): reconnect recovery of an order
+  that missed more than one fill, and a position query the venue refused being read as flat.
 - Fix the defects an audit against the platform documentation found, starting with the ten that
   produce silently wrong behaviour rather than an error.
 - Replace the facilities reimplemented here that the platform already ships, where the replacement

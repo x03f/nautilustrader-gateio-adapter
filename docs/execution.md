@@ -587,6 +587,15 @@ product as zero, which states exactly that.
 venue returns nothing, an explicit FLAT report is emitted — otherwise a stale
 local position could never be closed.
 
+That rule is meant to cover only the case where the venue answered, and it
+currently reaches past it: a position query the venue refuses for a permission or
+account-mode reason (`FORBIDDEN`, `INVALID_UNIFIED_ACCOUNT`,
+`UNIFIED_ACCOUNT_NOT_ACTIVATED`) is folded into the same path as a wallet the
+account has never opened, and a refusal then reads as flat. A position the venue
+still holds can be closed locally that way, by an execution nobody made. Open and
+known; until it is fixed, give the API key its futures read permission before
+relying on position reconciliation.
+
 **Funding** is *not applicable* as an execution event: the client emits no
 funding cash-flow event. Realised funding is reflected in the futures wallet
 balance, and therefore in the next `AccountState` from the balance stream or the
@@ -664,6 +673,19 @@ the order and handing the two over together. A trade re-offered on its own would
 be applied against whatever quantity the local order still carries, and since
 `OrderUpdated` triggers no state transition, an order whose quantity the venue
 has moved on from could never reach a terminal status again.
+
+That is what the code does; relying on it is another matter (*experimental*).
+Four attempts at this path have each closed the case their own scenario named
+and been refuted on another, and two defects are open in it now. When an outage
+leaves a single order with more than one unbooked trade, the re-read hand-over
+states the order's cumulative filled quantity beside a single trade, so the
+engine accounts for the difference by inferring a fill of its own: the venue's
+second trade id is never recorded, its commission is never withheld, and the
+position ends up wrong by that fee. When the direct re-read lags the trade
+listing, the same route can close the order at the partial quantity, and the
+remaining venue-confirmed execution is then refused as an overfill — the order
+being terminal, no later reconnect recovers it. One missed fill per order is
+what the tests cover, and what the two paragraphs above describe accurately.
 
 ### Duplicate suppression
 

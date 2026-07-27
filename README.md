@@ -33,7 +33,10 @@ instrument ids and the execution environment default all changed.
   converted into a different order.
 * **Real reconciliation.** All four NautilusTrader report generators are
   implemented against REST, so a restart with resting orders and open positions
-  is a supported path.
+  is a supported path. Two defects in it are open and stated in
+  [execution.md](docs/execution.md): recovery after a reconnect that missed more
+  than one fill of the same order, and a position query the venue refused being
+  read as flat.
 * **Usable standalone.** The async REST transport with its typed per-product
   namespaces, and the self-healing WebSocket clients, work without a Nautilus
   node.
