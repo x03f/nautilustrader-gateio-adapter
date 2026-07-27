@@ -51,6 +51,7 @@ from nautilus_gateio.common.errors import (
     OrderValidationError,
     UnsupportedOrderError,
     WalletNotProvisionedError,
+    WalletQueryRefusedError,
     should_retry,
 )
 from nautilus_gateio.common.signing import (
@@ -133,6 +134,7 @@ __all__ = [
     "OrderValidationError",
     "UnsupportedOrderError",
     "WalletNotProvisionedError",
+    "WalletQueryRefusedError",
     "__version__",
     "gateio_to_instrument_id",
     "generate_client_order_id",

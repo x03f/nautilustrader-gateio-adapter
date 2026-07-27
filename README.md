@@ -34,10 +34,12 @@ instrument ids and the execution environment default all changed.
   rejection the venue did not make.
 * **Real reconciliation.** All four NautilusTrader report generators are
   implemented against REST, so a restart with resting orders and open positions
-  is a supported path. Two defects in it are open and stated in
-  [execution.md](docs/execution.md): recovery after a reconnect that missed more
-  than one fill of the same order, and a position query the venue refused being
-  read as flat.
+  is a supported path. Four defects in it are open and stated in
+  [execution.md](docs/execution.md): the sweep that re-offers a trade the engine
+  dropped runs after a reconnect but not after a restart, a position row this
+  client cannot parse is reported as flat, a fill query that failed is reported
+  to the engine as "no fills", and a quote-denominated spot market buy read
+  while the venue is still matching it loses the matches that follow.
 * **Usable standalone.** The async REST transport with its typed per-product
   namespaces, and the self-healing WebSocket clients, work without a Nautilus
   node.

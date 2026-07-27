@@ -763,6 +763,20 @@ Keeping Nautilus client order ids within Gate.io's `text` limit is what makes a
 restart able to re-identify resting orders with no local state at all; see
 [client order ids](#client-order-ids).
 
+**The startup path has no unapplied-fill sweep, and a restart can therefore lose
+a trade the venue reported.** Startup builds the same `ExecutionMassStatus` the
+reconnect path builds, with each recovered trade grouped under its order report,
+and hands it to the engine — but it does not afterwards check which of those
+trades were actually booked. The engine drops an order report that tells it
+nothing new (same status, filled quantity, instrument and side as the cached
+order) and drops the trades grouped under that report along with it; the
+reconnect sweep re-offers them, startup does not. The order and trade listings
+are also issued concurrently, so a match landing between them produces exactly
+that pairing. Until the sweep runs on both paths, treat a restart that coincides
+with a fill as a case where the local book may understate the position and leave
+an order working a quantity the venue has already matched. See
+[Reconnect](#reconnect) for the mechanism and the measurements.
+
 ### Reconnect
 
 **Gate.io replays nothing on reconnect.** There is neither replay nor resume on
@@ -795,18 +809,61 @@ be applied against whatever quantity the local order still carries, and since
 `OrderUpdated` triggers no state transition, an order whose quantity the venue
 has moved on from could never reach a terminal status again.
 
-That is what the code does; relying on it is another matter (*experimental*).
-Four attempts at this path have each closed the case their own scenario named
-and been refuted on another, and two defects are open in it now. When an outage
-leaves a single order with more than one unbooked trade, the re-read hand-over
-states the order's cumulative filled quantity beside a single trade, so the
-engine accounts for the difference by inferring a fill of its own: the venue's
-second trade id is never recorded, its commission is never withheld, and the
-position ends up wrong by that fee. When the direct re-read lags the trade
-listing, the same route can close the order at the partial quantity, and the
-remaining venue-confirmed execution is then refused as an overfill — the order
-being terminal, no later reconnect recovers it. One missed fill per order is
-what the tests cover, and what the two paragraphs above describe accurately.
+That is what the code does after a reconnect, and only after a reconnect;
+relying on it is another matter (*experimental*). The sweep has exactly one
+caller, the reconnect handler, so a node that starts, reconciles and never loses
+its socket never runs it — see [Startup](#startup) for what that costs.
+
+The two defects that were open here in the fourth round are closed. An order
+with more than one unbooked trade now has every one of them handed over under
+the venue's own statement of that order, so the engine no longer accounts for
+the difference by inferring a fill of its own; and the case where the re-read
+lagged the trade listing no longer closes the order at the partial quantity.
+Both were closed against a demonstration of the damage — a fabricated trade id
+in place of a real one, and a position overstated by exactly the replaced
+trade's fee — and both re-appear when the fix is reverted.
+
+Five attempts at this path have now each closed the case their own scenario
+named and been refuted on another. The fifth was refuted from three independent
+directions at once, and what those attempts found is open:
+
+* **A restart loses what a reconnect recovers.** The engine deduplicates an
+  `ExecutionMassStatus` before applying it: an order report that matches the
+  cached order on status, filled quantity, instrument and side is deleted, and
+  every trade grouped under that report is deleted with it. The reconnect sweep
+  exists precisely to notice and repair that; on the startup path nothing does,
+  so a venue-confirmed execution is dropped in full and the order is left
+  working a remainder the venue has already cut. Measured on the fixtures of
+  scenarios that pass over the reconnect route — a zero-filled order, a
+  partly-filled one, one carrying two unbooked trades — on spot and on
+  perpetuals. Only a later reconnect, while the trade is still inside the
+  lookback window, repairs it.
+* **A position row this client cannot read is reported as flat.** A row missing
+  its symbol field, a row that is not an object, and an empty `200` body are all
+  discarded, and a per-instrument query that discarded everything answers with
+  an explicit flat report — which is a statement the venue never made. The
+  engine then squares the live position with a reconciliation order and an
+  inferred fill. The flat report is indistinguishable from one the venue really
+  did cause.
+* **A failed trade listing is reported to the engine as "no trades".** The
+  engine's own brake against squaring a book on a failed query is armed only
+  when the report query raises; this client catches every per-product failure,
+  logs it and returns what it has, so the brake never engages. A 5xx on the
+  trade listing while the position query answers therefore closes the position
+  with a synthetic trade id and no commission, and the real closing trade is
+  never applied, because by the next cycle the position is no longer open.
+
+A fourth loss is older than any of these rounds and sits on the reconnect path
+as well: a quote-denominated spot market buy read while the venue is still
+matching it. Gate.io publishes no base-denominated quantity for an unfilled
+market buy, so the listing's quantity is the amount filled so far; restating the
+order to that figure caps it, and the matches that follow are then refused as
+overfills. It appeared in twelve of 338 randomised reconnect cases and behaves
+identically before and after this round.
+
+None of the four is covered by a test here yet; each was demonstrated against a
+real `LiveExecutionEngine`, and each is work to be done rather than a bound the
+venue forces.
 
 ### Duplicate suppression
 

@@ -43,13 +43,39 @@ finished because its changes are written; it is finished when its criteria hold.
 
 Close what is already known to be wrong before adding anything.
 
-- Independently verify the recovery and reconciliation fixes. Four rounds have now passed their
-  harnesses and none has survived an attempt to refute it; passing is not evidence. What the
-  fourth leaves open is stated in [execution.md](execution.md): reconnect recovery of an order
-  that missed more than one fill. A position query the venue *refused* being read as flat is
-  closed — `FORBIDDEN` and the two unified-account labels now raise
-  `PositionStatusUnavailable`, and only `USER_NOT_FOUND`, which means the wallet does not exist
-  yet, still answers FLAT.
+- **Recovery and reconciliation are not closed.** Five rounds have now passed their harnesses and
+  none has survived an attempt to refute it; passing is not evidence. The fifth round was put in
+  front of three independent verifiers — one on position authority, one on restatement
+  completeness, one asked to make the client fabricate an execution — and all three refuted it.
+
+  What the round did close, each proven by reverting the change and watching the damage return:
+  an order that missed more than one fill now recovers every trade under the venue's own statement
+  of that order, instead of one trade beside a cumulative quantity that made the engine mint a fill
+  of its own; an order the venue reports under a second id is rebased before its fills are applied;
+  and the restatement guard now admits exactly the reports that cannot produce an inferred fill,
+  read off the installed engine rather than assumed. The fabrication angle could not be refuted:
+  across 338 randomised reconnect cases run against this round and against its parent with the same
+  seeds, the parent replaced a real venue trade with a synthetic one ten times and this round never
+  did.
+
+  What is open, each demonstrated end to end against a real `LiveExecutionEngine` and stated in
+  [execution.md](execution.md):
+  - The unapplied-fill sweep runs only after a WebSocket reconnect. On the startup path the
+    engine's deduplication drops a venue-confirmed trade and nothing re-offers it, so a restart
+    that coincides with a fill understates the position and leaves an order working a quantity the
+    venue has already matched. Two verifiers reached this independently, from different angles.
+  - A position row the client cannot parse — no symbol field, a non-object row, an empty `200`
+    body — becomes an explicit flat report, which the engine squares the live book against. The
+    refusal-versus-absence typing this round added is correct and does not cover this route.
+  - The fill-report query never raises, so the engine's own brake against squaring a book on a
+    failed query never engages; a 5xx on the trade listing closes the position with a synthetic
+    trade id and no commission.
+
+  The bookkeeping lesson is recorded with them: the round's commit message credited itself with a
+  fix its parent had already made and with a finding-matrix update its diff did not contain. Claims
+  about a change are now checked against the tree that carries it, not against the message.
+- Close the three open recovery defects above with a scenario that asserts the damage, and extend
+  the restart scenarios to cover the pairings only the reconnect scenarios exercise today.
 - Fix the defects an audit against the platform documentation found, starting with the ten that
   produce silently wrong behaviour rather than an error.
 - Replace the facilities reimplemented here that the platform already ships, where the replacement
@@ -91,7 +117,10 @@ of scope; precision verified against the live instrument definitions._
 - Startup, reconnect and restart reconciliation converging with the platform's own view.
 
 _Exit: the reconciliation and restart harnesses pass, including the scenarios that pair an open
-order report with a trade, a failing position query, and orders amended before filling._
+order report with a trade, a failing position query, and orders amended before filling — and each
+of those pairings is exercised on the restart route as well as the reconnect route. That
+qualification is here because the harnesses passed without it while a restart lost a
+venue-confirmed execution: a scenario set that covers one route only proves one route._
 
 ### Stage 4 — Infrastructure
 

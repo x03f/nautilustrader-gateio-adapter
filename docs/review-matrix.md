@@ -8,6 +8,11 @@ It is published because an alpha should be honest about what was found rather th
 works. Every status here was re-derived from the source, not carried over from an earlier report —
 where a tracking file and the code disagreed, the code decided.
 
+Findings raised later, by the rounds of work on recovery and the attempts to refute them, are in
+[a section of their own](#recovery-findings-raised-after-this-review) at the end. Four of those are
+open. This page is not a claim that nothing is wrong; it is a claim that what is known is written
+down.
+
 Run any row's validation command from the repository root.
 
 ## Summary
@@ -17,7 +22,8 @@ Run any row's validation command from the repository root.
 | Fixed | 51 | the defective behaviour is gone and a regression test fails against it |
 | Accepted | 1 | a deliberate bound rather than a defect; stated in the documentation |
 
-Severity of the 52 as first classified: 10 critical, 19 major, 21 minor, 2 nit.
+Severity of the 52 as first classified: 10 critical, 19 major, 21 minor, 2 nit. The four open
+recovery findings below are outside this count.
 
 ## Findings
 
@@ -93,6 +99,25 @@ Severity of the 52 as first classified: 10 critical, 19 major, 21 minor, 2 nit.
 |---|---|---|---|---|
 | `PKG-03` | Stale 0.1.0 artifacts sitting in dist/ can be republished by `twine upload dist/*` | FIXED | — | `tests/test_docs.py::TestReleaseArtefactHygiene::test_build_job_cleans_before_building` |
 | `seam-09-duplicated-book-depth-tables` | Per-product book interval/level tables are maintained separately in data.py and websocket/public.py | FIXED | — | `tests/test_data_client.py::test_the_data_client_reads_the_websocket_layer_tables` |
+
+## Recovery findings raised after this review
+
+The 52 above came from one cross-cutting review of the 0.2.0 rework. Recovery and reconciliation
+have since been worked on in rounds, each round ending with an independent attempt to refute it, and
+those attempts raise findings of their own. They are recorded here because this page is where a
+reader looks for what is known to be wrong, and kept separate because they are not part of that
+review and are not closed.
+
+| ID | Finding | Status | Code | Evidence |
+|---|---|---|---|---|
+| `REC-01` | The unapplied-fill sweep runs only after a WebSocket reconnect, so on the startup path the engine's deduplication drops a venue-confirmed trade and nothing re-offers it: the position is understated and the order is left working a quantity the venue already matched | OPEN | `nautilus_gateio/execution.py` `_hand_over_unapplied_fills` | demonstrated against a real `LiveExecutionEngine` for a zero-filled, a partly-filled and a two-trade order, on spot and on perpetuals; reached independently by two verifiers |
+| `REC-02` | A position row the client cannot parse — no symbol field, a non-object row, an empty `200` body — is answered with an explicit flat report, and the engine squares the live book against it with a reconciliation order and an inferred fill | OPEN | `nautilus_gateio/execution.py` `_parse_position_report` | demonstrated on the startup route and on the position-check timer, with a control row that parses |
+| `REC-03` | `generate_fill_reports` catches every per-product failure, so the engine's brake against squaring a position on a failed fill query never engages; a 5xx on the trade listing closes the position with a synthetic trade id and no commission | OPEN | `nautilus_gateio/execution.py` `generate_fill_reports` | demonstrated with the same client and scenario, once with the failure swallowed and once surfaced |
+| `REC-04` | A quote-denominated spot market buy whose order listing is read mid-match loses trades: Gate.io publishes no base-denominated quantity for an unfilled market buy, so the report restates the order to the partial figure and the remaining matches are rejected as overfills | OPEN | `nautilus_gateio/execution.py` `_parse_spot_order_fields` | 12 of 338 randomised reconnect cases, identical on the current commit and its parent, so a standing defect rather than a regression |
+
+`REC-01` is stated in [execution.md](execution.md) under both Startup and Reconnect, because a reader
+of either section needs it. None of the four carries a regression test here yet; each was
+demonstrated outside the repository, which is why it is listed as open rather than as covered.
 
 ## Residual risks
 

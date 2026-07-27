@@ -56,6 +56,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reconnect recovery of an order that missed more than one fill.** Every
+  recovered trade of one order is now handed over under the venue's own
+  statement of that order, instead of one trade beside a cumulative filled
+  quantity. The engine used to account for the difference by inventing a fill:
+  the venue's second trade id was never recorded, its commission never withheld,
+  and the position ended up overstated by exactly that fee. An order the venue
+  reports under a second id is also rebased before its fills are applied, and the
+  guard that restates an order from the venue listing now admits exactly the
+  reports that cannot produce an inferred fill, read off the installed engine
+  rather than assumed. Each of the three was closed against a demonstration of
+  the damage and re-checked by reverting the fix. **This does not close recovery**
+  — the same hand-over does not run on the startup path, and two further defects
+  are open; `docs/execution.md` and `docs/review-matrix.md` state all three.
+
 - **The WebSocket transport logs through the platform, not the standard
   library.** `nautilus_gateio/websocket/client.py` held a
   `logging.getLogger(__name__)`, so every reconnect, failed subscription replay,
@@ -268,6 +282,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`WalletQueryRefusedError` is part of the public API.** Gate.io answers a
+  wallet query it will not serve with `FORBIDDEN`, `INVALID_UNIFIED_ACCOUNT` or
+  `UNIFIED_ACCOUNT_NOT_ACTIVATED`, none of which says anything about what the
+  ledger holds, while `USER_NOT_FOUND` means the wallet does not exist yet and
+  therefore holds nothing. The adapter separates the two, but the type carrying
+  the distinction was reachable only through an import path the documentation
+  does not advertise, so no caller could act on it. It is now exported from the
+  package root beside `WalletNotProvisionedError`, of which it remains a
+  subclass — code that treats both alike stays correct, and code for which a
+  refusal and an absence differ catches the refusal first.
+
 - **Mark and index prices for options.** Gate.io publishes both per contract on
   `options.contract_tickers`, but the subscription guard admitted futures
   products only and the router matched the literal `futures.tickers`, so an
@@ -297,6 +322,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on those contracts.
 
 ### Documentation
+
+- **What recovery does and does not do, on each path separately.** The recovery
+  sections described one mechanism and one set of open defects; both were out of
+  date and the description was true of the reconnect path only. `docs/execution.md`
+  now states, under Startup as well as Reconnect, that the sweep which re-offers
+  a trade the engine dropped runs only after a reconnect, and what a restart
+  coinciding with a fill therefore costs. The three defects an independent review
+  of the last round demonstrated are stated there, listed in
+  `docs/review-matrix.md` as open, and `docs/roadmap.md` no longer claims the
+  recovery work is closed.
 
 - **What an unimplemented subscribe hook really does.** `docs/market-data.md`
   said the missing `OrderBookDepth10` subscription would "fail visibly rather

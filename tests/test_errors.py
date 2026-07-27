@@ -160,6 +160,41 @@ class TestRefusalIsTypedApartFromAbsence:
         assert should_retry(WalletQueryRefusedError("the key may not read that ledger")) is False
 
 
+class TestTheDistinctionIsReachableFromOutsideThePackage:
+    """The type exists so that a *caller* can catch a refusal before an absence.
+
+    It was introduced without being re-exported, so the only import path that
+    reached it was `nautilus_gateio.common.errors`, which the documentation does
+    not advertise as public. A distinction available to the adapter and to
+    nobody else is not a distinction the package offers.
+    """
+
+    def test_both_wallet_error_types_are_exported_from_the_package_root(self):
+        import nautilus_gateio
+
+        for name in ("WalletNotProvisionedError", "WalletQueryRefusedError"):
+            assert name in nautilus_gateio.__all__
+            assert getattr(nautilus_gateio, name, None) is not None
+
+    def test_a_caller_can_catch_the_refusal_before_the_absence(self):
+        """Order matters: the refusal is a subclass, so it must be caught first."""
+        from nautilus_gateio import WalletNotProvisionedError as Absence
+        from nautilus_gateio import WalletQueryRefusedError as Refusal
+
+        assert issubclass(Refusal, Absence)
+
+        caught = None
+        try:
+            raise Refusal("the venue would not answer")
+        except Refusal as e:
+            caught = ("refusal", e)
+        except Absence as e:  # pragma: no cover - the subclass clause wins
+            caught = ("absence", e)
+
+        assert caught is not None
+        assert caught[0] == "refusal"
+
+
 class TestAdapterLevelErrors:
     @pytest.mark.parametrize(
         "error_class",
