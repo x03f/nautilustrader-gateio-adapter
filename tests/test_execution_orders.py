@@ -383,6 +383,41 @@ def _rejections(env: ExecHarness) -> list[Any]:
     return env.events_of(OrderRejected)
 
 
+def _denials(env: ExecHarness) -> list[Any]:
+    from nautilus_trader.model.events import OrderDenied
+
+    return env.events_of(OrderDenied)
+
+
+def _assert_denied(env: ExecHarness, order: Any, fragment: str) -> None:
+    """Assert a refusal this client made itself, in the shape the platform defines.
+
+    The three event assertions are one statement, not three: a refusal decided
+    from the order object alone is ``OrderDenied`` ("denied by Nautilus for
+    being invalid, unprocessable, or exceeding a risk limit"), and
+    ``OrderRejected`` means the *venue* refused a submission
+    ("rejected by the trading venue", ``SUBMITTED -> REJECTED``). Claiming a
+    submission that never happened is what makes the old sequence wrong, so the
+    absence of ``OrderSubmitted`` is asserted as strictly as the presence of the
+    denial.
+
+    Applying the events through the real ``Order`` closes the argument: the
+    installed 1.230.0 state table reaches ``DENIED`` from ``INITIALIZED`` and
+    ``RELEASED`` only, so an ``OrderDenied`` emitted after an ``OrderSubmitted``
+    would raise ``InvalidStateTrigger`` here rather than pass quietly.
+    """
+    from nautilus_trader.model.enums import OrderStatus
+    from nautilus_trader.model.events import OrderRejected, OrderSubmitted
+
+    denied = _denials(env)
+    assert len(denied) == 1, f"expected exactly one OrderDenied, got {env.events}"
+    assert fragment in denied[0].reason
+    assert env.events_of(OrderSubmitted) == [], "the order never reached Gate.io"
+    assert env.events_of(OrderRejected) == [], "Gate.io did not refuse this order, we did"
+    env.drain(order)
+    assert order.status == OrderStatus.DENIED
+
+
 # -- MANDATORY TEST 7: fill-or-kill across every supported product ------------
 
 
@@ -483,9 +518,7 @@ class TestFillOrKillPerProduct:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "fill-or-kill" in rejected[0].reason
+            _assert_denied(env, order, "fill-or-kill")
             assert not env.options.called("create_order")
         finally:
             env.close()
@@ -502,9 +535,7 @@ class TestFillOrKillPerProduct:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "fill-or-kill" in rejected[0].reason
+            _assert_denied(env, order, "fill-or-kill")
         finally:
             env.close()
 
@@ -591,9 +622,7 @@ class TestConditionalOrderRejections:
         )
         _submit(harness, order)
 
-        rejected = _rejections(harness)
-        assert len(rejected) == 1
-        assert "post-only" in rejected[0].reason
+        _assert_denied(harness, order, "post-only")
         assert not harness.spot.called("create_price_order")
 
     def test_spot_price_order_rejects_display_qty(self, harness):
@@ -607,9 +636,7 @@ class TestConditionalOrderRejections:
         )
         _submit(harness, order)
 
-        rejected = _rejections(harness)
-        assert len(rejected) == 1
-        assert "display_qty" in rejected[0].reason
+        _assert_denied(harness, order, "display_qty")
         assert not harness.spot.called("create_price_order")
 
     def test_spot_price_order_rejects_reduce_only(self, harness):
@@ -622,9 +649,7 @@ class TestConditionalOrderRejections:
         )
         _submit(harness, order)
 
-        rejected = _rejections(harness)
-        assert len(rejected) == 1
-        assert "reduce-only" in rejected[0].reason
+        _assert_denied(harness, order, "reduce-only")
         assert not harness.spot.called("create_price_order")
 
     def test_spot_price_order_rejects_fok(self, harness):
@@ -638,9 +663,7 @@ class TestConditionalOrderRejections:
         )
         _submit(harness, order)
 
-        rejected = _rejections(harness)
-        assert len(rejected) == 1
-        assert "FOK" in rejected[0].reason
+        _assert_denied(harness, order, "FOK")
         assert not harness.spot.called("create_price_order")
 
     def test_futures_price_order_rejects_post_only(self, harness):
@@ -656,9 +679,7 @@ class TestConditionalOrderRejections:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "post-only" in rejected[0].reason
+            _assert_denied(env, order, "post-only")
             assert not env.perp.called("create_price_order")
         finally:
             env.close()
@@ -676,9 +697,7 @@ class TestConditionalOrderRejections:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "display_qty" in rejected[0].reason
+            _assert_denied(env, order, "display_qty")
         finally:
             env.close()
 
@@ -953,9 +972,7 @@ class TestOrderRouting:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "price-triggered" in rejected[0].reason
+            _assert_denied(env, order, "price-triggered")
         finally:
             env.close()
 
@@ -970,9 +987,7 @@ class TestOrderRouting:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "whole contracts" in rejected[0].reason
+            _assert_denied(env, order, "whole contracts")
         finally:
             env.close()
 
@@ -1024,9 +1039,7 @@ class TestDisplayQuantity:
         )
         _submit(harness, order)
 
-        rejected = _rejections(harness)
-        assert len(rejected) == 1
-        assert "hiding the whole amount" in rejected[0].reason
+        _assert_denied(harness, order, "hiding the whole amount")
         assert not harness.spot.called("create_order")
 
     def test_futures_hidden_order_is_refused_not_inverted(self):
@@ -1041,9 +1054,7 @@ class TestDisplayQuantity:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "hiding the whole amount" in rejected[0].reason
+            _assert_denied(env, order, "hiding the whole amount")
             assert not env.perp.called("create_order")
         finally:
             env.close()
@@ -1060,9 +1071,7 @@ class TestDisplayQuantity:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "hiding the whole amount" in rejected[0].reason
+            _assert_denied(env, order, "hiding the whole amount")
             assert not env.options.called("create_order")
         finally:
             env.close()
@@ -1080,9 +1089,7 @@ class TestDisplayQuantity:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "whole contracts" in rejected[0].reason
+            _assert_denied(env, order, "whole contracts")
             assert not env.perp.called("create_order")
         finally:
             env.close()
@@ -1127,9 +1134,7 @@ class TestPostOnlyWithImmediateTimeInForce:
         )
         _submit(harness, order)
 
-        rejected = _rejections(harness)
-        assert len(rejected) == 1
-        assert "post-only cannot be combined" in rejected[0].reason
+        _assert_denied(harness, order, "post-only cannot be combined")
         assert not harness.spot.called("create_order")
 
     @pytest.mark.parametrize("tif", [TimeInForce.IOC, TimeInForce.FOK])
@@ -1146,9 +1151,7 @@ class TestPostOnlyWithImmediateTimeInForce:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "post-only cannot be combined" in rejected[0].reason
+            _assert_denied(env, order, "post-only cannot be combined")
             assert not env.perp.called("create_order")
         finally:
             env.close()
@@ -1167,9 +1170,7 @@ class TestPostOnlyWithImmediateTimeInForce:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "post-only cannot be combined" in rejected[0].reason
+            _assert_denied(env, order, "post-only cannot be combined")
             assert not env.options.called("create_order")
         finally:
             env.close()
@@ -1238,9 +1239,7 @@ class TestOffTickPrices:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "not a multiple of" in rejected[0].reason
+            _assert_denied(env, order, "not a multiple of")
             assert not env.perp.called("create_order")
         finally:
             env.close()
@@ -1272,9 +1271,7 @@ class TestOffTickPrices:
             )
             _submit(env, order)
 
-            rejected = _rejections(env)
-            assert len(rejected) == 1
-            assert "trigger price" in rejected[0].reason
+            _assert_denied(env, order, "trigger price")
             assert not env.perp.called("create_price_order")
         finally:
             env.close()
@@ -1331,3 +1328,379 @@ class TestOffTickPrices:
 
         assert _rejections(harness) == []
         assert harness.spot.called("create_order")
+
+
+# -- the denied/rejected boundary --------------------------------------------
+
+
+class TestDeniedVersusRejectedBoundary:
+    """Who refused the order decides which event says so.
+
+    The platform draws the line by origin, not by severity:
+    ``OrderDenied`` is "denied by Nautilus for being invalid, unprocessable, or
+    exceeding a risk limit" and transitions ``INITIALIZED -> DENIED``, while
+    ``OrderRejected`` is "rejected by the trading venue" and transitions
+    ``SUBMITTED -> REJECTED`` (concepts/orders/index.md, "Order status
+    definitions"; concepts/events/order_denied.md and order_rejected.md). The
+    in-tree adapters follow it — Kraken denies an unsupported time in force, FOK
+    on a non-limit spot order and reduce-only on a cash account before calling
+    ``generate_order_submitted`` (adapters/kraken/execution.py).
+
+    Regression for the audit finding "Locally determined refusals emit
+    `OrderSubmitted` then `OrderRejected` instead of `OrderDenied`". Every test
+    here fails against that behaviour, and the two closing tests fail against
+    the opposite over-correction — a venue refusal reported as our own.
+    """
+
+    def test_an_unsupported_time_in_force_is_denied_not_rejected(self, harness):
+        """Coverage gap TC-E73: nothing drove an unsupported TIF through submit.
+
+        ``time_in_force_to_gateio`` raising was pinned; the event a strategy
+        actually receives was not, and it was the wrong one.
+        """
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+            time_in_force=TimeInForce.AT_THE_OPEN,
+        )
+        _submit(harness, order)
+
+        _assert_denied(harness, order, "not supported by Gate.io")
+        assert not harness.spot.called("create_order")
+
+    @pytest.mark.parametrize(
+        "tif",
+        [TimeInForce.AT_THE_OPEN, TimeInForce.AT_THE_CLOSE],
+    )
+    def test_a_session_time_in_force_on_a_market_order_is_denied(self, tif):
+        """The futures market path maps TIF separately, so it needs its own proof."""
+        env = ExecHarness(products=(GateioProductType.PERP,))
+        try:
+            order = env.order_factory.market(
+                PERP_BTC_USDT,
+                OrderSide.BUY,
+                Quantity.from_int(10),
+                time_in_force=tif,
+            )
+            _submit(env, order)
+
+            _assert_denied(env, order, "cannot be applied")
+            assert not env.perp.called("create_order")
+        finally:
+            env.close()
+
+    def test_reduce_only_on_a_regular_spot_order_is_denied(self, harness):
+        """Coverage gap TC-E71: the local half of the reduce-only refusal.
+
+        Gate.io spot has no reduce-only flag, so this is settled entirely on our
+        side and can never be an ``OrderRejected``.
+        """
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+            reduce_only=True,
+        )
+        _submit(harness, order)
+
+        _assert_denied(harness, order, "reduce-only")
+        assert not harness.spot.called("create_order")
+
+    def test_quote_quantity_outside_a_spot_market_buy_is_denied(self, harness):
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+            quote_quantity=True,
+        )
+        _submit(harness, order)
+
+        _assert_denied(harness, order, "quote-denominated quantity")
+        assert not harness.spot.called("create_order")
+
+    def test_quote_quantity_on_a_contract_order_is_denied(self):
+        env = ExecHarness(products=(GateioProductType.PERP,))
+        try:
+            order = env.order_factory.limit(
+                PERP_BTC_USDT,
+                OrderSide.BUY,
+                Quantity.from_int(10),
+                Price.from_str("60000.0"),
+                quote_quantity=True,
+            )
+            _submit(env, order)
+
+            _assert_denied(env, order, "has no meaning on Gate.io")
+            assert not env.perp.called("create_order")
+        finally:
+            env.close()
+
+    def test_a_globally_unsupported_type_is_denied_on_an_option_too(self):
+        """Coverage gap TC-E94: the global denials were only ever proven on spot."""
+        env = ExecHarness(products=(GateioProductType.OPT,))
+        try:
+            order = env.order_factory.trailing_stop_market(
+                OPT_BTC_USDT,
+                OrderSide.SELL,
+                Quantity.from_int(1),
+                trailing_offset=Decimal("5"),
+            )
+            _submit(env, order)
+
+            _assert_denied(env, order, "TRAILING_STOP_MARKET")
+            assert not env.options.called("create_order")
+        finally:
+            env.close()
+
+    def test_a_conditional_spot_order_on_cross_margin_is_denied(self):
+        """The refusal is a function of this client's own configuration."""
+        env = ExecHarness(spot_account_mode=GateioSpotAccountMode.CROSS_MARGIN)
+        try:
+            order = env.order_factory.stop_limit(
+                SPOT_BTC_USDT,
+                OrderSide.SELL,
+                Quantity.from_str("0.010000"),
+                Price.from_str("59000.00"),
+                Price.from_str("59500.00"),
+            )
+            _submit(env, order)
+
+            _assert_denied(env, order, "ledgers only")
+            assert not env.spot.called("create_price_order")
+        finally:
+            env.close()
+
+    def test_a_past_expire_time_on_a_conditional_order_is_denied(self, harness):
+        from nautilus_trader.core.datetime import unix_nanos_to_dt
+
+        harness.spot.responses["tickers"] = [{"last": "60000"}]
+        order = harness.order_factory.stop_limit(
+            SPOT_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_str("0.010000"),
+            Price.from_str("59000.00"),
+            Price.from_str("59500.00"),
+            time_in_force=TimeInForce.GTD,
+            expire_time=unix_nanos_to_dt(harness.clock.timestamp_ns() - 60_000_000_000),
+        )
+        _submit(harness, order)
+
+        _assert_denied(harness, order, "expire time is already in the past")
+        assert not harness.spot.called("create_price_order")
+
+    def test_an_unpriceable_spot_market_buy_is_denied(self, harness):
+        """No quote, no trade, no ticker: the request cannot be built at all.
+
+        The failure is on the *read* that prices the order, not on a submission,
+        so the strategy is told the order was never sent rather than that
+        Gate.io turned it down.
+        """
+        harness.spot.responses["tickers"] = []
+        order = harness.order_factory.market(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+        )
+        _submit(harness, order)
+
+        _assert_denied(harness, order, "no quote, trade or ticker price is available")
+        assert not harness.spot.called("create_order")
+
+    def test_a_builder_failure_of_any_kind_is_denied_not_left_in_flight(self, harness):
+        """The catch-all in front of the submission denies rather than waits.
+
+        An unexpected failure while the request is being built leaves the order
+        in ``INITIALIZED``, which the engine's in-flight check never looks at —
+        it queries ``SUBMITTED``, ``PENDING_UPDATE`` and ``PENDING_CANCEL``. So
+        treating it as an ambiguous outcome would strand the order silently for
+        the life of the process; only a denial closes it.
+        """
+
+        def _explode(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("body builder blew up")
+
+        harness.client._build_spot_order = _explode  # type: ignore[method-assign]
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+        )
+        _submit(harness, order)
+
+        _assert_denied(harness, order, "could not be built")
+        assert not harness.spot.called("create_order")
+
+    def test_a_venue_refusal_is_still_an_order_rejected(self, harness):
+        """The other side of the boundary: Gate.io answered, so Gate.io refused."""
+        from nautilus_trader.model.events import OrderDenied, OrderSubmitted
+
+        from nautilus_gateio.common.errors import GateioClientError
+
+        harness.spot.responses["create_order"] = GateioClientError(
+            400,
+            "BALANCE_NOT_ENOUGH",
+            "not enough balance",
+        )
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+        )
+        _submit(harness, order)
+
+        rejected = _rejections(harness)
+        assert len(rejected) == 1
+        assert "BALANCE_NOT_ENOUGH" in rejected[0].reason
+        assert harness.events_of(OrderDenied) == []
+        assert len(harness.events_of(OrderSubmitted)) == 1
+        assert harness.spot.called("create_order")
+
+    def test_a_post_only_refusal_by_the_venue_keeps_due_post_only(self, harness):
+        """A venue post-only refusal is a rejection and carries the platform flag."""
+        from nautilus_gateio.common.errors import GateioClientError
+
+        harness.spot.responses["create_order"] = GateioClientError(
+            400,
+            "POC_FILL_IMMEDIATELY",
+            "order would be filled immediately",
+        )
+        order = harness.order_factory.limit(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("0.010000"),
+            Price.from_str("60000.00"),
+            post_only=True,
+        )
+        _submit(harness, order)
+
+        rejected = _rejections(harness)
+        assert len(rejected) == 1
+        assert rejected[0].due_post_only is True
+        assert _denials(harness) == []
+
+
+# -- cancel-all: a local check that fails must not fall silent ----------------
+
+
+class _LogCapture:
+    """Reads back what the client logged, through the platform's own subsystem.
+
+    Some behaviour the platform prescribes *is* a log line and nothing else:
+    "cancel, modify, cancel-all, and batch-cancel commands that fail local
+    checks log warnings and do not produce rejection events"
+    (concepts/live.md). A test that cannot read the line cannot tell the fixed
+    behaviour from the bug, so the line is read where the platform writes it.
+    ``Component._log`` is a Cython attribute and not writable, and
+    ``init_logging`` is the documented way in — file output is its only
+    machine-readable sink.
+    """
+
+    def __init__(self, path: Any) -> None:
+        self._path = path
+        self._mark = 0
+
+    def _lines(self) -> list[str]:
+        from nautilus_trader.common.component import flush_logger
+
+        flush_logger()
+        if not self._path.exists():
+            return []
+        return self._path.read_text(encoding="utf-8").splitlines()
+
+    def mark(self) -> None:
+        self._mark = len(self._lines())
+
+    def since(self) -> list[str]:
+        return self._lines()[self._mark :]
+
+    def wait_for(self, fragment: str, timeout: float = 5.0) -> list[str]:
+        """Return the new lines once one of them carries ``fragment``.
+
+        The logging subsystem writes from its own thread, so a flush asks
+        for the write rather than completing it; under a full suite the line
+        lands a moment after the call returns.
+        """
+        import time
+
+        deadline = time.monotonic() + timeout
+        while True:
+            lines = self.since()
+            if any(fragment in line for line in lines) or time.monotonic() >= deadline:
+                return lines
+            time.sleep(0.02)
+
+
+@pytest.fixture(scope="session")
+def log_capture(tmp_path_factory):
+    from nautilus_trader.common.component import init_logging, is_logging_initialized
+    from nautilus_trader.common.enums import LogLevel
+
+    if is_logging_initialized():
+        pytest.skip("the logging subsystem was initialized elsewhere; its sink is unknown")
+
+    directory = tmp_path_factory.mktemp("logs")
+    guard = init_logging(
+        level_stdout=LogLevel.OFF,
+        level_file=LogLevel.DEBUG,
+        directory=str(directory),
+        file_name="capture",
+    )
+    capture = _LogCapture(directory / "capture.log")
+    yield capture
+    del guard
+
+
+class TestCancelAllLocalCheck:
+    """Regression: a cancel-all for an unconfigured product used to say nothing.
+
+    The platform's answer to a failed local check on a cancel-all is a warning
+    and no rejection event (concepts/live.md). This client produced the "no
+    event" half and, for the command itself, no line either: the only trace was
+    the router's generic "Cannot handle <instrument>", which names no command,
+    so a strategy waiting on its cancels had nothing tying the silence to them.
+    """
+
+    def _cancel_all(self, env: ExecHarness, instrument_id: InstrumentId) -> None:
+        from nautilus_trader.core.uuid import UUID4
+        from nautilus_trader.execution.messages import CancelAllOrders
+
+        env.run(
+            env.client._cancel_all_orders(
+                CancelAllOrders(
+                    trader_id=env.trader_id,
+                    strategy_id=env.strategy_id,
+                    instrument_id=instrument_id,
+                    client_id=ClientId(GATEIO_CLIENT_ID.value),
+                    order_side=OrderSide.NO_ORDER_SIDE,
+                    command_id=UUID4(),
+                    ts_init=env.clock.timestamp_ns(),
+                ),
+            ),
+        )
+
+    def test_an_unconfigured_product_warns_and_emits_no_event(self, log_capture):
+        env = ExecHarness()  # spot only, so a perpetual is out of scope
+        try:
+            log_capture.mark()
+            self._cancel_all(env, PERP_BTC_USDT)
+
+            assert env.events == [], "a failed local check produces no rejection event"
+            assert not env.perp.called("cancel_all")
+            lines = log_capture.wait_for("Cannot cancel all orders on BTC_USDT-PERP.GATE_IO")
+            assert any(
+                "[WARN]" in line and "Cannot cancel all orders on BTC_USDT-PERP.GATE_IO" in line
+                for line in lines
+            ), lines
+        finally:
+            env.close()
+
+    def test_a_configured_product_still_cancels(self, harness):
+        self._cancel_all(harness, SPOT_BTC_USDT)
+
+        assert harness.spot.called("cancel_all")

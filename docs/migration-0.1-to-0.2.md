@@ -522,13 +522,13 @@ product.
   regardless of what the order asked for, so an IOC or FOK limit rested on the
   book. 0.2.0a1 maps GTC, IOC and FOK, expresses post-only as `poc`, and
   refuses anything Gate.io cannot express — a time in force such as GTD or DAY,
-  or reduce-only on a spot order — with a stated reason. An order type the venue
-  does not have is denied before submission (`OrderDenied`); an order the venue
-  has but cannot be given the requested terms is rejected after submission
-  (`OrderRejected`). Code that relied on the silent downgrade will see one of
-  those where it previously saw a resting order, which is the intended
-  direction: a rejection you can read beats an order that is not the one you
-  submitted.
+  or reduce-only on a spot order — with a stated reason. Every refusal the
+  adapter makes on its own is `OrderDenied` before submission, whether it is an
+  order type the venue does not have or terms it cannot be given;
+  `OrderRejected` means Gate.io itself refused. Code that relied on the silent
+  downgrade will see a denial where it previously saw a resting order, which is
+  the intended direction: a refusal you can read beats an order that is not the
+  one you submitted.
 * **Order modification works** on spot and perpetuals. 0.1.0 logged a warning
   and did nothing, leaving the command unanswered; 0.2.0a1 amends where the
   venue has an amend endpoint and emits `OrderModifyRejected` with a reason where

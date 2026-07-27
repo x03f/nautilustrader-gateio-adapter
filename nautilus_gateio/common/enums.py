@@ -219,8 +219,63 @@ def order_status_from_gateio(
 ) -> OrderStatus:
     """Map Gate.io order state onto a Nautilus :class:`OrderStatus`.
 
-    Gate.io reports a coarse ``status`` plus a terminal ``finish_as`` reason; the
-    filled/total amounts disambiguate partially filled cancellations.
+    Gate.io reports a coarse ``status`` plus a terminal ``finish_as`` reason.
+    The two answer different questions and only one of them is authoritative
+    about completion: **the quantities say whether the order finished, the
+    reason says why it stopped.** The order of the branches below is therefore
+    load-bearing — completion is decided from ``filled``/``amount`` first, and
+    ``finish_as`` only selects the flavour of a *non*-completion.
+
+    Consulting the reason first looks equivalent and is not; it produces a wrong
+    terminal state in both directions, and this ordering closes both at once:
+
+    * ``FILLED``, ``EXPIRED`` and ``REJECTED`` are all terminal, but only
+      ``CANCELED`` has a transition left for a late fill (installed
+      model/orders/base.pyx:132-133 holds ``(CANCELED, PARTIALLY_FILLED)`` and
+      ``(CANCELED, FILLED)``, annotated "Real world possibility", and nothing
+      else). Reporting a completed order as ``EXPIRED`` therefore does more than
+      mislabel it: Gate.io does not order ``*.orders`` against ``*.usertrades``,
+      so the fill that completed the order routinely arrives after the message
+      that closed it, and against an ``EXPIRED`` order that execution is
+      discarded instead of booked.
+    * The mirror case is a reason that implies completion when nothing filled.
+      ``liquidated`` and ``auto_deleveraged`` are **cancellations** in Gate.io's
+      own words — "cancelled because of liquidation" and "finished by ADL" on
+      ``FuturesOrder.finish_as`` — so calling them ``FILLED`` with a zero fill
+      leaves the order open in the cache indefinitely: nothing closes an order
+      the client believes filled (the fill stream is meant to do that), and
+      reconciliation finds no fill to infer either.
+
+    ``expired`` is worth naming explicitly because it does not belong to a
+    regular order at all: it is absent from the ``finish_as`` enum of every
+    order object (``Order``, ``FuturesOrder``, ``OptionsOrder``) and appears
+    only on ``FuturesPriceTriggeredOrder`` (``cancelled`` / ``succeeded`` /
+    ``failed`` / ``expired``), where it means the *trigger* lapsed unfired. It
+    stays mapped here because the venue is free to widen a documented enum and a
+    GTD-style lapse is what ``EXPIRED`` exists for — but only for an order that
+    did not complete.
+
+    Reasons Gate.io documents and this enum does not name — ``poc``, ``small``,
+    ``depth_not_enough``, ``trader_not_enough``, ``liquidate_cancelled``,
+    ``price_protect_cancelled``, ``mmp_cancelled`` — parse to ``UNKNOWN`` and
+    fall through to the state, which resolves every one of them to the same
+    ``CANCELED`` an explicit branch would.
+
+    ``poc`` is the one whose fallback is not the whole answer. A post-only
+    order the venue would not rest is a *rejection*, and the flag that says so —
+    ``due_post_only`` — lives on ``OrderRejected``, which no ``OrderStatus`` can
+    carry. The live path does not depend on this mapping for it: the order
+    stream reads ``finish_as`` itself, ahead of any use of the status returned
+    here, and answers ``poc`` with a rejection where the order is still in a
+    state the platform allows one from.
+
+    The reconciliation path has no such override — an order status report built
+    from a REST listing has only this mapping — so a post-only refusal recovered
+    after a restart is reported ``CANCELED`` where ``REJECTED`` would be
+    faithful. That gap is open, and it is not closable by naming ``poc`` here:
+    the same value would then map to ``REJECTED`` for an order the venue had
+    already partly filled, and the platform has no ``PARTIALLY_FILLED ->
+    REJECTED`` transition to receive it.
     """
     state = str(status).lower() if status else ""
     reason = GateioFinishAs.parse(finish_as)
@@ -228,28 +283,26 @@ def order_status_from_gateio(
     if state == "open":
         return OrderStatus.PARTIALLY_FILLED if filled > 0 else OrderStatus.ACCEPTED
 
+    # Completion is a fact about quantities, so it outranks every reason. The
+    # `amount > 0` guard keeps out a payload that states no comparable quantity
+    # — a spot market buy, whose `amount` is a quote cash amount.
+    if amount > 0 and filled >= amount:
+        return OrderStatus.FILLED
+
     if reason is GateioFinishAs.FILLED:
+        # No usable quantities, so the venue's own word is all there is.
         return OrderStatus.FILLED
     if reason is GateioFinishAs.EXPIRED:
         return OrderStatus.EXPIRED
-    if reason in (GateioFinishAs.IOC, GateioFinishAs.FOK, GateioFinishAs.STP):
-        # Unfilled remainder of an immediate-or-cancel style order.
-        if amount > 0 and filled >= amount:
-            return OrderStatus.FILLED
-        return OrderStatus.CANCELED if filled == 0 else OrderStatus.CANCELED
-    if reason in (
-        GateioFinishAs.CANCELLED,
-        GateioFinishAs.REDUCE_ONLY,
-        GateioFinishAs.REDUCE_OUT,
-        GateioFinishAs.POSITION_CLOSED,
-    ):
+    if reason is not GateioFinishAs.UNKNOWN:
+        # Everything else Gate.io names ends the order without completing it:
+        # user cancels, the unfilled remainder of an IOC/FOK order, self-trade
+        # prevention, reduce-only and position-closed refusals, liquidation and
+        # ADL. A partial fill among them is still a cancellation — the platform
+        # reads the filled quantity off the fills, not off this status.
         return OrderStatus.CANCELED
-    if reason in (GateioFinishAs.LIQUIDATED, GateioFinishAs.AUTO_DELEVERAGED):
-        return OrderStatus.FILLED
 
-    # Fall back on the amounts when the venue omits a reason.
-    if amount > 0 and filled >= amount:
-        return OrderStatus.FILLED
+    # Fall back on the state when the venue omits or renames the reason.
     if state in ("cancelled", "closed", "finished"):
         return OrderStatus.CANCELED
     return OrderStatus.ACCEPTED

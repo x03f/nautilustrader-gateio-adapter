@@ -2,9 +2,9 @@
 
 Covers the order status machine (``status`` plus the terminal ``finish_as``
 reason and the filled/total amounts), time in force, order side, order type and
-liquidity side. Values follow ``scratchpad/spec/websocket.md``: futures and
-options report ``status in {open, finished}`` plus ``finish_as``, spot reports
-``open|closed|cancelled`` plus ``finish_as``.
+liquidity side. Values follow the Gate.io WebSocket v4 order channels: futures
+and options report ``status in {open, finished}`` plus ``finish_as``, spot
+reports ``open|closed|cancelled`` plus ``finish_as``.
 """
 
 from __future__ import annotations
@@ -292,10 +292,20 @@ class TestOrderStatusMapping:
         )
 
     @pytest.mark.parametrize("reason", ["liquidated", "auto_deleveraged"])
-    def test_forced_closures_are_filled(self, reason):
-        """A liquidated or auto-deleveraged order was executed by the venue."""
+    def test_forced_closures_are_read_off_the_quantities(self, reason):
+        """A forced closure says the order stopped, not that it traded.
+
+        Gate.io defines both on ``FuturesOrder.finish_as`` as terminations:
+        "cancelled because of liquidation" and "finished by ADL". What the order
+        actually did is in the quantities, so a fully filled one is FILLED and an
+        untouched one is CANCELED — see
+        ``tests/test_execution_order_fidelity.py`` for why the second matters.
+        """
         assert order_status_from_gateio("finished", reason, filled=10.0, amount=10.0) is (
             OrderStatus.FILLED
+        )
+        assert order_status_from_gateio("finished", reason, filled=0.0, amount=10.0) is (
+            OrderStatus.CANCELED
         )
 
     def test_missing_reason_falls_back_to_the_amounts(self):
@@ -323,9 +333,15 @@ class TestOrderStatusMapping:
         assert order_status_from_gateio(None, None, filled=0.0, amount=0.0) is OrderStatus.ACCEPTED
 
     @pytest.mark.parametrize("reason", [r.value for r in GateioFinishAs if r.value != "_unknown"])
-    def test_every_documented_reason_maps_to_a_terminal_status(self, reason):
-        """No documented terminal reason may leave an order looking live."""
-        status = order_status_from_gateio("finished", reason, filled=10.0, amount=10.0)
+    @pytest.mark.parametrize("filled", [0.0, 4.0, 10.0])
+    def test_every_documented_reason_maps_to_a_terminal_status(self, reason, filled):
+        """No documented terminal reason may leave an order looking live.
+
+        Parametrised over the fill as well as the reason, because the fill is
+        what decides between the terminal states and a branch that reads only one
+        of the two would pass a fixed-quantity check.
+        """
+        status = order_status_from_gateio("finished", reason, filled=filled, amount=10.0)
         assert status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED)
 
 

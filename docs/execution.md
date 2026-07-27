@@ -122,10 +122,16 @@ therefore fetches the real user id at connect (`/wallet/fee`, falling back to
 
 ### Submission and acceptance
 
-`OrderSubmitted` is generated before the REST call. The venue's response to that
-call is fed through **the same handler as the WebSocket order stream**, so the
-REST path and the stream path cannot drift apart in how they interpret an order
-object.
+The Gate.io request is built first and `OrderSubmitted` is generated only once
+it is ready to go out, immediately before the REST call. That ordering is the
+whole mechanism behind [rejection and denial](#rejection-denial-and-expiry):
+building the request is what decides every refusal this client makes on its own,
+so those refusals land while the order is still `INITIALIZED` and
+`OrderSubmitted` never claims a request that was not sent.
+
+The venue's response to that call is fed through **the same handler as the
+WebSocket order stream**, so the REST path and the stream path cannot drift
+apart in how they interpret an order object.
 
 `OrderAccepted` is generated when an order object reports `open` (or open with a
 non-zero filled amount) while the Nautilus order is still `SUBMITTED`; a later
@@ -185,15 +191,19 @@ amend.
 
 One translation is worth singling out because it is not literal:
 
-* **A base-denominated spot market buy becomes an aggressive IOC limit.**
+* **A base-denominated spot market buy becomes an aggressive limit.**
   Gate.io's native spot market buy spends a *quote* amount, so it cannot express
   "buy exactly this many base units". Converting the quantity behind the caller's
-  back would change the order, so it is sent as an immediate-or-cancel limit
-  priced through the book by the pair's **own published `slippage` cap** (5% if
-  the pair definition carries none); the venue fills at or better than that bound
-  and cancels the remainder. The substitution is logged at INFO with the
-  reference price and the cap. The reference price is the cached ask, then the
-  cached last trade, then the cached quote mid, then the REST ticker.
+  back would change the order, so it is sent as a limit order priced through the
+  book by the pair's **own published `slippage` cap** (5% if the pair definition
+  carries none); the venue fills at or better than that bound and cancels the
+  remainder. The substitution is logged at INFO with the reference price and the
+  cap. The reference price is the cached ask, then the cached last trade, then
+  the cached quote mid, then the REST ticker.
+
+  The price is the only thing substituted. The order's own time in force rides
+  along, so a `MARKET`/`FOK` buy goes out as a `fok` limit and stays
+  all-or-nothing instead of being downgraded to immediate-or-cancel.
 
 ### Nothing is silently altered
 
@@ -203,7 +213,7 @@ being changed into something the venue does accept:
 | Situation | Result |
 |---|---|
 | GTD, DAY, AT_THE_OPEN or AT_THE_CLOSE on a limit order | rejected, naming the supported set (GTC, IOC, FOK, and post-only via `poc`) |
-| On a futures or delivery market order, a time in force other than GTC, DAY, IOC or FOK; on an options market order, anything but GTC, DAY or IOC | rejected |
+| On any market order, a time in force other than GTC, DAY, IOC or FOK — and on options, FOK as well | rejected; spot goes through the same mapping as the other three products, so AT_THE_OPEN and AT_THE_CLOSE are refused there too |
 | `reduce_only` on a spot order | rejected — reduce-only is a derivatives concept and dropping it changes the order |
 | `quote_quantity=True` anywhere but a spot market buy | rejected |
 | `quote_quantity=True` on a spot market **sell** | rejected — Gate.io market sells take a base amount |
@@ -218,37 +228,45 @@ being changed into something the venue does accept:
 | Price-triggered spot order under `CROSS_MARGIN` | rejected — the venue's spot price-trigger endpoint has no cross-margin ledger |
 | post-only or `display_qty` on a price-triggered order | rejected — the fired order accepts neither, and dropping the flag would submit a materially different order |
 | Trigger type other than LAST_PRICE, MARK_PRICE or INDEX_PRICE on futures or delivery | rejected |
+| Trigger type other than DEFAULT or LAST_PRICE on **spot** | rejected — the spot trigger object is `{price, rule, expiration}`, with no price-type field, and spot has no mark or index price to name |
+| A conditional order whose trigger price contradicts its order type | rejected — see the comparison rule below |
 | A base-denominated spot market buy with no reference price available | rejected, suggesting `quote_quantity=True` |
 | Amending the trigger price of a working order | rejected — the venue cannot do it |
 
-Three exceptions to the rule, stated here rather than buried. The first is by
-design; the other two are places where the client currently does adjust the
-order, and you should know which:
+One exception to the rule, stated here rather than buried, and it is by design:
 
 * **GTD is accepted on a conditional order**, where it describes how long the
   trigger stays armed rather than how long the fired order rests. It is sent as
   `trigger.expiration` in seconds, and an expire time already in the past is
-  rejected. On a regular order GTD is rejected.
-* **A market order's time in force becomes `ioc`.** GTC and DAY carry no meaning
-  for an order that cannot rest, so mapping them to `ioc` changes nothing the
-  venue does, and FOK is honoured where the venue offers it. On futures,
-  delivery and options anything else is rejected — but a **spot** market order
-  takes a shorter path that coerces *every* time in force except FOK to `ioc`,
-  so AT_THE_OPEN and AT_THE_CLOSE are accepted there and silently sent as `ioc`
-  rather than rejected. Treat the spot market path as accepting IOC and FOK
-  only.
-* **A spot conditional order ignores `trigger_type`.** Gate.io's spot
-  price-order endpoint takes only a comparison rule against the last traded
-  price, so there is no field to carry a mark- or index-price trigger. A
-  non-default `trigger_type` on a spot conditional order is armed as a
-  last-price trigger rather than rejected. On futures and delivery the trigger
-  type is transmitted and an unsupported one is rejected.
+  rejected. On a regular order GTD is rejected. Know the limit of the
+  approximation: if the trigger fires shortly before `expire_time`, the order it
+  creates rests as `gtc` and outlives the expiry, because Gate.io's price-order
+  endpoints carry no expiry for the *fired* order. A strategy that used GTD to
+  bound its exposure should set `manage_gtd_expiry=True`, which makes
+  NautilusTrader keep its own timer and cancel at `expire_time`.
 
-The comparison rule itself follows the current market when a last price is known
-(from the cached trade tick, the cached quote mid, or the REST ticker), because
-that is what the venue validates the rule against. Without one it follows the
-semantics of the Nautilus order type: a stop is placed away from the market in
-the direction of the trade, an if-touched order towards it.
+### The comparison rule and the order type
+
+Gate.io models no difference between a stop and an if-touched order: the trigger
+carries a bare comparison rule, and the venue requires that rule to agree with
+the current last price (rule `1`, fire at or above, needs a trigger above the
+market; rule `2`, at or below, needs one below it). One rule per order is
+therefore submittable, and it is the one the market implies.
+
+That is enough for a well-formed order, where the market-implied rule and the
+rule the order type implies are the same: a stop sits away from the market in
+the direction of the trade, an if-touched order towards it. When they disagree —
+a BUY `STOP_MARKET` whose trigger is below the market, or a stop whose level the
+market has already run through — the only rule Gate.io accepts is the one that
+encodes the *other* conditional type, so the order is rejected with both rules
+named instead of being armed as something else. Refusing costs nothing that was
+available: the alternative was never "submit it as asked" but a venue rejection.
+If what you want is a conditional order that is already in the market, emulate
+it (see [Order emulation](products.md#order-emulation)) — the platform releases
+it immediately.
+
+With no last price to hand (no cached trade tick, quote mid or REST ticker) the
+order type decides the rule on its own and the venue makes the final call.
 
 ### Modification
 
@@ -294,28 +312,87 @@ understood.
 
 ### Rejection, denial and expiry
 
-| Venue outcome | Nautilus event |
+**Who refused the order decides which event says so.** `OrderDenied` is the
+platform's event for an order *Nautilus* will not submit — "denied by Nautilus
+for being invalid, unprocessable, or exceeding a risk limit", transitioning
+`INITIALIZED -> DENIED`. `OrderRejected` means the *venue* refused a submission:
+"rejected by the trading venue", `SUBMITTED -> REJECTED`. This client keeps the
+line by building the whole request before announcing anything, so every refusal
+it makes on its own is decided while the order is still `INITIALIZED`.
+
+The platform enforces the ordering: its state table reaches `DENIED` from
+`INITIALIZED` and `RELEASED` only, so a refusal announced after `OrderSubmitted`
+could not be expressed as a denial at all.
+
+| Outcome | Nautilus event |
 |---|---|
-| Unsupported order type, unknown instrument, unconfigured product | `OrderDenied`, before any network call |
-| Validation failure while building the request body | `OrderRejected` after `OrderSubmitted` |
+| Unknown instrument, unconfigured product, unsupported order type | `OrderDenied`, before any network call |
+| Any instruction Gate.io cannot express (the [refusal table](products.md#what-is-refused-rather-than-translated)) | `OrderDenied` — decided while the request is built, so nothing is sent |
+| Any other failure while building the request | `OrderDenied`, naming the failure |
 | Venue **refusal** on submission (a 4xx answer) | `OrderRejected`, carrying the venue's label and message |
 | Post-only order that would have taken liquidity | `OrderRejected` with `due_post_only=True` |
 | Submission whose outcome the venue never confirmed | nothing — see [Unknown outcomes](#unknown-outcomes) |
-| `finish_as=expired` | `OrderExpired` |
+| `finish_as=expired` | `OrderExpired`, unless the quantities say the order completed |
 | `finish_as=cancelled`, `reduce_only`, `reduce_out`, `position_closed` | `OrderCanceled` |
 | Unfilled remainder of an `ioc`, `fok` or self-trade-prevention order | `OrderCanceled` (`OrderFilled` if it in fact filled completely) |
-| `finish_as=liquidated` or `auto_deleveraged` | treated as filled; the closing event is the fill on the trade channel |
+| `finish_as=liquidated` or `auto_deleveraged` | `OrderCanceled` — Gate.io defines both as cancellations, and what the position did is carried by the fills on the trade channel |
+
+Those last rows share one rule: **the quantities decide whether an order
+completed; the reason only explains a non-completion.** A terminal message whose
+filled amount has reached its total is read as filled whatever reason it
+carries, and only below that total does the reason choose between expiry and
+cancellation. Reading the reason first fails in both directions — a completed
+order closed as `EXPIRED` has no transition left for the fill that completed it,
+and an untouched order closed as `FILLED` is never closed by anything.
+
+An `OrderDenied` is terminal, and that is the point: nothing was sent, so there
+is nothing at the venue to reconcile and the strategy is told so definitively
+instead of inferring it from a rejection that names Gate.io.
 
 Post-only rejection is detected on both paths the venue uses: the error labels
 `ORDER_POC_IMMEDIATE` and `POC_FILL_IMMEDIATELY` on the submission response, and
 `finish_as=poc` on a terminal order message. Both produce a rejection flagged as
 post-only, so NautilusTrader can treat it as the non-event it usually is rather
-than as a failure.
+than as a failure. A `finish_as=poc` message for an order this client has
+already booked a fill against is reported as `OrderCanceled` instead: the
+platform has no `PARTIALLY_FILLED -> REJECTED` transition, both sides agree the
+order is finished, and cancellation is the transition it accepts.
 
 Expiry and cancellation are emitted only when the order is not already closed,
 so a duplicate terminal message from the venue cannot drive the order's state
 machine twice. The per-order bookkeeping (the `text` alias, the applied trade
 ids and the trigger link) is dropped at the same point.
+
+### Events this client generates, and events it does not
+
+An execution client's event surface is defined by the platform, not by the
+venue. All twelve events an `ExecutionClient` can publish in 1.230.0 are
+generated here: `AccountState`, `OrderDenied`, `OrderSubmitted`,
+`OrderRejected`, `OrderAccepted`, `OrderModifyRejected`, `OrderCancelRejected`,
+`OrderUpdated`, `OrderCanceled`, `OrderTriggered`, `OrderExpired` and
+`OrderFilled`.
+
+The rest of the event model belongs to other components, and this client
+deliberately produces none of it:
+
+| Event | Produced by |
+|---|---|
+| `OrderInitialized` | `OrderFactory`, when the strategy creates the order |
+| `OrderEmulated`, `OrderReleased` | `OrderEmulator` |
+| `OrderPendingUpdate`, `OrderPendingCancel` | `Strategy`, before the command reaches this client |
+| `PositionOpened`, `PositionChanged`, `PositionClosed` | `ExecutionEngine`, derived from fills |
+| `PositionAdjusted` | `Position.apply_adjustment`, inside the model |
+
+Gate.io pushes position updates on a private channel; they are parsed and logged
+but never published, because REST reconciliation is the single source for
+positions and a second view would race the engine's own fill-driven derivation.
+
+`OrderFillVoided` is documented upstream but does **not** exist in 1.230.0 —
+no event, no `VOIDED` order status, no generator. Gate.io does void trades
+(self-trade-prevention reversals, erroneous-trade cancellations), so until the
+platform ships the event a voided trade leaves an uncorrectable `OrderFilled` in
+the order and position history. The version floor is pinned by a test, so the
+build that lifts it will not pass unnoticed.
 
 ### Unknown outcomes
 
@@ -358,9 +435,19 @@ fails.
 This client does not query the venue itself after an ambiguous failure.
 `LiveExecutionEngine` already re-queries every in-flight order through
 `generate_order_status_report`, bounded by `inflight_check_retries`; a second
-poll here would race it. Spot submissions are resolvable that way even before a
-venue order id is known, because the `text` alias is registered while the request
-body is built, not when the response arrives.
+poll here would race it.
+
+That query carries the client order id and, for a `SUBMITTED` order, **no venue
+order id** — the venue id is only assigned by `OrderAccepted`, which is exactly
+the event an ambiguous submit never received. It is answered on every product.
+The client order id travels in the order's `text`, which is registered while the
+request body is built rather than when the response arrives, so it is known even
+when nothing came back at all. Gate.io resolves that `text` in place of the venue
+id on the spot and perpetual single-order endpoints; on delivery and options,
+whose single-order endpoints document the venue id only, the order is located in
+the product's own order listings, where every row carries its `text`. Resting
+orders are searched first and recently finished ones after, so a submit that
+filled before its answer was lost is found as well.
 
 ## Fills
 
@@ -478,9 +565,32 @@ somebody else's.
 Cancel and amend follow the same map after a restart: an order still armed is
 disarmed by its armed id, an order that has fired is addressed by its fired id.
 
+### Reporting the order a trigger fired
+
+Gate.io keeps the trigger on the armed price order and none of it on the order
+that fires, so the venue's statement about that second object is "an accepted
+limit order with no trigger". Handed on unchanged it collides with the Nautilus
+order it belongs to, which is a `STOP_LIMIT` that has already been `TRIGGERED`,
+and the collision repeats on every reconciliation pass: the engine attempts
+`TRIGGERED -> ACCEPTED`, which the order state machine refuses, and
+`_should_update` compares the report's absent trigger price against the order's
+real one and publishes an `OrderUpdated` for an amendment nobody made.
+
+So the report of a fired order is restated from the link: it carries the trigger
+price and trigger type of the Nautilus order, and it reports `TRIGGERED` rather
+than `ACCEPTED` while it rests — for `STOP_LIMIT`, `LIMIT_IF_TOUCHED` and
+`TRAILING_STOP_LIMIT`, the types NautilusTrader has that state for. A market-style
+stop keeps the venue's own status, since the platform has no `TRIGGERED` state for
+it. `ts_triggered` is carried only while the local order has not recorded the
+trigger itself — that field is how a trigger which fired while this client was
+down is recovered, and repeating one the order already applied would be dropped
+by the state machine.
+
 Status: implemented and mock-tested, including the restart-across-the-transition
 path (`TestRestartAcrossTheTriggerTransition` in
-`tests/test_execution_triggers.py`). Mainnet validation pending.
+`tests/test_execution_triggers.py`) and the fired-order report
+(`TestFiredConditionalOrderReports` in `tests/test_execution_reports.py`).
+Mainnet validation pending.
 
 ## The fill-before-order race
 
@@ -614,8 +724,8 @@ All four report generators are implemented against REST:
 | Method | Source |
 |---|---|
 | `generate_order_status_reports` | open plus recently finished orders across every enabled product, paginated, including armed price-triggered orders |
-| `generate_order_status_report` | single lookup by venue order id or client order id, following the armed or fired id as appropriate |
-| `generate_fill_reports` | `my_trades` per product over the lookback window, sorted by `(ts_event, trade_id)` because reconciliation applies fills in list order |
+| `generate_order_status_report` | single lookup by venue order id or client order id, on every product, following the armed or fired id as appropriate |
+| `generate_fill_reports` | `my_trades` per product over the lookback window, narrowed to one order when the command names a venue order id, sorted by `(ts_event, trade_id)` because reconciliation applies fills in list order |
 | `generate_position_status_reports` | futures, delivery and options positions (netting) |
 
 ### Startup

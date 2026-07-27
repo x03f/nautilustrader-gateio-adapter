@@ -29,8 +29,9 @@ instrument ids and the execution environment default all changed.
   and USDT-settled options.
 * **Execution that never lies about your order.** Six order types, four
   time-in-force values, post-only, reduce-only and iceberg. Anything Gate.io
-  cannot express is denied or rejected with a stated reason — never silently
-  converted into a different order.
+  cannot express is denied with a stated reason before anything is sent — never
+  silently converted into a different order, and never reported as a venue
+  rejection the venue did not make.
 * **Real reconciliation.** All four NautilusTrader report generators are
   implemented against REST, so a restart with resting orders and open positions
   is a supported path. Two defects in it are open and stated in
@@ -343,8 +344,9 @@ Read this before configuring execution.
   2. **IP allow-listing** on the key;
   3. `environment="testnet"` for rehearsal (spot and USDT perpetuals only);
   4. NautilusTrader's own sandbox and backtest execution for simulation.
-* **Nothing is silently altered.** An order Gate.io cannot express is denied or
-  rejected with a reason, never converted into a different order.
+* **Nothing is silently altered.** An order Gate.io cannot express is denied
+  with a reason before any request is sent, never converted into a different
+  order.
 * **No venue-side setting is changed for you.** Hedge mode is refused, not
   switched; a unified account is never upgraded automatically.
 * **The adapter cannot move funds out of the account.** `transfer()` only

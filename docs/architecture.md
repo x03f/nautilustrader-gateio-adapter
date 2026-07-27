@@ -395,8 +395,9 @@ product accepts is set out per case in [execution.md](execution.md).
 
 The one deliberate substitution is documented and logged on every use: a
 base-denominated spot market buy, which Gate.io's spot API cannot express
-directly, is sent as an aggressive IOC limit bounded by the pair's own published
-slippage cap.
+directly, is sent as an aggressive limit bounded by the pair's own published
+slippage cap. It substitutes the price and only the price — the order's own time
+in force rides along, so a fill-or-kill buy stays fill-or-kill.
 
 **Degrade rather than fail.** "Wallet not created yet", "account not in the
 required mode" and "key lacks permission" are configuration states, not

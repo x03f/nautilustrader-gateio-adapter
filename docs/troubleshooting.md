@@ -135,20 +135,40 @@ If such orders stay in flight:
 
 * the engine's in-flight check must be running — it is on by default, but
   `inflight_check_interval_ms=0` disables it;
-* on futures, delivery and options a submission is only queryable once the venue
-  order id is known, so an unanswered submit there resolves by timeout rather
-  than by lookup. Spot submissions are queryable immediately, by client order id;
+* a submission is queryable by client order id on every product, with no venue
+  order id, so an unanswered submit resolves by lookup rather than by timeout.
+  If the lookup keeps coming back empty, Gate.io really is not holding the order:
+  look for `holds no ... order for` in the log, naming the client order id and
+  the symbol that were searched;
 * enabling `open_check_interval_secs` adds the open-order poll, a second source
   of truth for orders whose state the in-flight query could not settle.
 
 Never resubmit such an order by hand before the venue state is known. That is
 the one action the whole policy exists to prevent.
 
-## `OrderDenied: ... is not supported by Gate.io`
+## `OrderDenied` instead of the order you submitted
 
-The order type is outside `SUPPORTED_ORDER_TYPES` (MARKET, LIMIT, STOP_MARKET,
-STOP_LIMIT, MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED). Trailing stops and other types
-have no Gate.io equivalent; implement them at the strategy level.
+`OrderDenied` means this adapter refused the order and sent nothing; the reason
+on the event says which instruction it could not express. `OrderRejected` would
+mean Gate.io refused it. The full list of refusals is
+[products.md](products.md#what-is-refused-rather-than-translated); the common
+ones are:
+
+* `... is not supported by Gate.io` — the order type is outside
+  `SUPPORTED_ORDER_TYPES` (MARKET, LIMIT, STOP_MARKET, STOP_LIMIT,
+  MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED). Trailing stops and the other types have
+  no Gate.io equivalent; implement them at the strategy level.
+* `time in force ... is not supported` — Gate.io has `gtc`, `ioc`, `poc` and
+  `fok` and nothing else. A downgrade would change the execution guarantee, so
+  the order is refused instead.
+* `post-only cannot be combined with ...` — post-only *is* Gate.io's `poc`, a
+  maker-only order that rests, so it cannot also be immediate.
+* `... is not a multiple of the ... tick size` — the price is off the venue's
+  grid. `make_price()` rounds to the precision, not to the tick; use the
+  instrument's `next_bid_price()` / `next_ask_price()`.
+
+A denial is terminal and nothing was sent, so there is nothing at the venue to
+reconcile: fix the instruction and submit a new order.
 
 ## "instrument not found" when subscribing or submitting
 

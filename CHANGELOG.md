@@ -7,8 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A refusal this adapter makes itself is now `OrderDenied`, not `OrderSubmitted`
+  followed by `OrderRejected`.** An unsupported time in force, post-only on an
+  immediate order, `reduce_only` on spot, a `display_qty` the venue's `iceberg`
+  cannot carry, a fractional contract count, `quote_quantity` outside a spot
+  market buy, an off-tick price, a conditional order on options — none of these
+  consults Gate.io, so announcing a submission asserted a network fact that was
+  false and attributed the refusal to the venue. Downstream that put the order
+  through the engine's in-flight set for nothing, wrote a submission Gate.io
+  never received into the persisted event stream an audit reads back, and charged
+  the venue's rejection rate for local validation. The whole request is now built
+  before the submission is announced — building it is what decides these
+  refusals — so they arrive as `OrderDenied` while the order is still
+  `INITIALIZED`, and `OrderRejected` means only what the platform says it means.
+  A strategy matching on `OrderRejected` for these cases must handle
+  `on_order_denied` instead.
+
 ### Fixed
 
+- **A post-only termination no longer breaks the order state machine.** A
+  terminal order message carrying `finish_as=poc` produced `OrderRejected`
+  unconditionally, including for an order this client had already booked a fill
+  against. The platform has no `PARTIALLY_FILLED -> REJECTED` transition, so the
+  event raised `InvalidStateTrigger` inside the execution engine and the order
+  stayed open locally while Gate.io had finished it. That case is now reported as
+  `OrderCanceled`, the transition the platform does accept, and a replayed
+  message for an already-closed order produces nothing.
+- **A cancel-all for an unconfigured product no longer falls silent.** The
+  command returned without a word about itself, so a strategy waiting on its
+  cancels had nothing in the log tying the silence to what it sent. It now logs a
+  warning naming the instrument, and still emits no rejection event — which is
+  what the platform prescribes for a cancel-all that fails a local check.
+- **A conditional spot order on a cross-margin ledger is refused with a reason.**
+  Building the refusal message sorted a dict keyed by an enum that defines no
+  ordering, so the refusal raised `TypeError` and never reached the strategy as a
+  refusal.
 - **A command the venue never answered is no longer reported as a rejection.**
   A submit, cancel or amend that failed on the transport, on a 5xx, or while
   reading the response produced `OrderRejected` / `OrderCancelRejected` /
@@ -38,6 +73,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   milliseconds rested at the venue until it was cancelled. Post-only is Gate.io's
   `poc` time in force, a maker-only *resting* order: it still composes with GTC,
   and the two immediate combinations are now refused instead of substituted.
+- **A completed order is no longer reported expired, and an untouched one is no
+  longer reported filled.** The terminal status was read off Gate.io's
+  `finish_as` reason before the fill quantities, which broke in both directions.
+  An order that filled in full and came back with `finish_as=expired` was closed
+  as `EXPIRED`, a state the platform allows no late fill out of, so the trade
+  that completed it — which Gate.io publishes on a separate stream and routinely
+  delivers afterwards — was discarded and the position was left short of it. In
+  the other direction `liquidated` and `auto_deleveraged`, which Gate.io defines
+  as cancellations, were reported `FILLED` with nothing filled, leaving the order
+  open in the cache indefinitely. The quantities now decide whether an order
+  completed; the reason only explains a non-completion.
+- **A spot conditional order no longer discards `trigger_type`.** Gate.io's spot
+  trigger object is `{price, rule, expiration}` with no price-type field, so a
+  spot `STOP_MARKET` submitted with `MARK_PRICE` was armed on the last traded
+  price instead — precisely the price such an order is usually written to avoid.
+  Spot now accepts `DEFAULT` and `LAST_PRICE` and refuses the rest, as the
+  futures path already did for the types it cannot encode.
+- **A conditional order can no longer be armed as the opposite order type.** The
+  venue takes a bare comparison rule and requires it to agree with the last
+  price, and the rule was derived from the market alone. A BUY `STOP_MARKET`
+  whose trigger sat below the market — a breakout entry — was therefore armed as
+  a buy-if-touched that fires when the price *falls*, with no event to say so.
+  When the market-implied rule contradicts the order type, the order is now
+  rejected naming both.
+- **Spot market orders no longer absorb a session time in force.** The spot path
+  coerced everything but `FOK` to `ioc`, so `AT_THE_OPEN` and `AT_THE_CLOSE` were
+  accepted there and rejected on the other three products. Every product now
+  shares one mapping.
+- **A base-denominated spot market buy keeps its execution guarantee.** The
+  aggressive limit that stands in for Gate.io's quote-denominated market buy was
+  always sent `ioc`, so a `MARKET`/`FOK` buy quietly became "fill whatever is
+  available". The substitution is in the price only; the order's own time in
+  force is now carried through.
 - **Off-tick prices are refused instead of being sent.** The `BNB_USDT` perpetual
   and the longer-dated `ETH_USDT` delivery contracts quote two decimals but tick
   in `0.05`. `Instrument.make_price()` rounds to the precision and the
@@ -55,6 +123,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FixedTickScheme` registered as `GATEIO_TICK_{increment}_P{precision}` carrying
   the venue's own increment, which is how an on-tick price can be produced at all
   on those contracts.
+
+### Documentation
+
+- **Order emulation is documented.** Every order type this adapter denies —
+  trailing stops, conditional orders on options — and every contingency
+  relationship can be traded against Gate.io by letting NautilusTrader emulate
+  the order locally and send this client only the `MARKET` or `LIMIT` it
+  releases. The pages said "Unsupported" and "Contingent orders have to be
+  managed by the strategy", neither of which was true. `docs/products.md` now
+  carries an *Order emulation* section, including the caveat that installed
+  1.230.0 accepts only three `emulation_trigger` values and **cancels** an order
+  that names any other, and separates the types Gate.io cannot do from the ones
+  this adapter has not implemented yet (both trailing types and attached
+  take-profit / stop-loss exist at the venue).
 
 ## [0.2.0a1] - 2026-07-26
 

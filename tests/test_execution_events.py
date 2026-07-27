@@ -2023,3 +2023,97 @@ class TestFillBeforeOrderUpdate:
         assert replayed == []
         assert order.filled_qty == Quantity.from_int(4)
         assert order.venue_order_id == VenueOrderId("900001")
+
+
+# -- the post-only termination must respect the platform's state table --------
+
+
+class TestPostOnlyTermination:
+    """``finish_as=poc`` is a rejection only where the FSM can accept one.
+
+    Regression: the branch used to call ``generate_order_rejected``
+    unconditionally, while the three branches beside it all guarded on the
+    order's state. The installed state table has no
+    ``PARTIALLY_FILLED -> REJECTED`` entry (model/orders/base.pyx), so the
+    unconditional call raises ``InvalidStateTrigger`` inside the execution
+    engine for an order this client has already booked a fill against — and the
+    order then stays open locally while Gate.io has finished it.
+
+    The payload path is not hypothetical: ``_handle_order_payload`` serves the
+    REST responses to submit, cancel and amend as well as the order stream, and
+    Gate.io does not order ``spot.orders`` against ``spot.usertrades``.
+    """
+
+    def _terminate_as_post_only(self, env: ExecHarness, order: Any) -> list[Any]:
+        env.client._handle_order_payload(
+            GateioProductType.SPOT,
+            _spot_order_payload(
+                status="closed",
+                finish_as="poc",
+                left="0.005000",
+                filled_amount="0.005000",
+                text=f"t-{order.client_order_id.value}",
+            ),
+        )
+        return env.drain(order)
+
+    def test_an_untouched_order_is_rejected_with_the_post_only_flag(self, spot_harness):
+        from nautilus_trader.model.events import OrderRejected
+
+        env = spot_harness
+        order = _accepted_spot_buy(env)
+
+        env.client._handle_order_payload(
+            GateioProductType.SPOT,
+            _spot_order_payload(
+                status="closed",
+                finish_as="poc",
+                left="0.010000",
+                filled_amount="0",
+                text=f"t-{order.client_order_id.value}",
+            ),
+        )
+        events = env.drain(order)
+
+        assert [type(event).__name__ for event in events] == ["OrderRejected"]
+        assert isinstance(events[0], OrderRejected)
+        assert events[0].due_post_only is True
+        assert order.status == OrderStatus.REJECTED
+
+    def test_a_partly_filled_order_is_canceled_not_rejected(self, spot_harness):
+        """The order is finished either way; only one transition is legal."""
+        env = spot_harness
+        order = _accepted_spot_buy(env)
+        env.client._handle_fill_payload(
+            GateioProductType.SPOT,
+            _spot_fill_payload(env, order, "T-1", amount="0.005000"),
+        )
+        env.drain(order)
+        assert order.status == OrderStatus.PARTIALLY_FILLED
+
+        events = self._terminate_as_post_only(env, order)
+
+        # Applying through the real FSM is the assertion: an OrderRejected here
+        # would raise InvalidStateTrigger out of `env.drain`.
+        assert [type(event).__name__ for event in events] == ["OrderCanceled"]
+        assert isinstance(events[0], OrderCanceled)
+        assert order.status == OrderStatus.CANCELED
+
+    def test_an_already_closed_order_produces_nothing(self, spot_harness):
+        """A replayed payload for a finished order is not a second termination."""
+        env = spot_harness
+        order = _accepted_spot_buy(env)
+        env.client._handle_order_payload(
+            GateioProductType.SPOT,
+            _spot_order_payload(
+                status="cancelled",
+                finish_as="cancelled",
+                text=f"t-{order.client_order_id.value}",
+            ),
+        )
+        env.drain(order)
+        assert order.status == OrderStatus.CANCELED
+        env.client._register_text(order.client_order_id, f"t-{order.client_order_id.value}")
+
+        assert self._terminate_as_post_only(env, order) == []
+        assert order.status == OrderStatus.CANCELED

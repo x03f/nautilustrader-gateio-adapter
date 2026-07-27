@@ -42,8 +42,13 @@ STOP_*/ *_IF_TOUCHED       the product's price-triggered endpoint
 
 Anything Gate.io cannot express without changing the order's meaning (GTD, DAY,
 AT_THE_OPEN, reduce-only on spot, a quote-denominated quantity anywhere but a
-spot market buy) is rejected with an explicit reason rather than silently
-altered.
+spot market buy) is refused with an explicit reason rather than silently
+altered. The whole request is built before the submission is announced, so
+every such refusal arrives as ``OrderDenied`` — the platform's event for an
+order Nautilus itself will not submit — and never as ``OrderSubmitted``
+followed by an ``OrderRejected`` that would blame Gate.io for a decision this
+client made. ``OrderRejected`` is emitted only for a refusal the venue actually
+answered with.
 
 Sizes on futures, delivery and options are **contract counts**: the Nautilus
 ``Quantity`` is the number of contracts and is sent as a signed integer, positive
@@ -263,6 +268,18 @@ FUTURES_TRIGGER_PRICE_TYPES: Final[dict[TriggerType, int]] = {
     TriggerType.INDEX_PRICE: 2,
 }
 
+#: Trigger types a spot price order can carry.
+#:
+#: Gate.io's spot trigger object is ``{price, rule, expiration}`` and has no
+#: price-type field at all, so the venue's own "market price" is the only
+#: reference available: ``DEFAULT`` and ``LAST_PRICE`` name it, and nothing else
+#: can be expressed. Spot has no mark or index price to name in the first place,
+#: so this is a narrower set than the futures one by the venue's design rather
+#: than by omission.
+SPOT_TRIGGER_TYPES: Final[frozenset[TriggerType]] = frozenset(
+    {TriggerType.DEFAULT, TriggerType.LAST_PRICE},
+)
+
 #: Fallback slippage cap for a base-denominated spot market buy, used when the
 #: pair definition carries no ``slippage`` field.
 DEFAULT_SPOT_SLIPPAGE: Final[Decimal] = Decimal("0.05")
@@ -279,6 +296,19 @@ REPORT_PAGE_LIMIT: Final[int] = 100
 #: Hard cap on pages fetched for one report query, so a pathological venue
 #: response can never turn reconciliation into an unbounded request loop.
 MAX_REPORT_PAGES: Final[int] = 20
+
+#: Products whose single-order endpoint resolves a client id given in ``text``.
+#:
+#: Gate.io documents the path parameter of ``GET /spot/orders/{order_id}`` and
+#: ``GET /futures/{settle}/orders/{order_id}`` as the venue order id *or* the
+#: user custom id (the ``text`` field), valid while the order rests and for a
+#: short window after it finishes. ``GET /delivery/{settle}/orders/{order_id}``
+#: and ``GET /options/orders/{order_id}`` document the venue-assigned id only,
+#: so an order on those products is located by scanning the order listings —
+#: see :meth:`GateioExecutionClient._report_by_client_order_id`.
+CLIENT_ID_ADDRESSABLE_PRODUCTS: Final[frozenset[GateioProductType]] = frozenset(
+    {GateioProductType.SPOT, GateioProductType.PERP, GateioProductType.INVERSE},
+)
 
 #: Characters Gate.io accepts in the ``text`` field after the ``t-`` prefix.
 _TEXT_BODY_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -352,19 +382,55 @@ def trigger_rule(
 ) -> int:
     """Return the Gate.io trigger rule for a conditional order.
 
-    Gate.io does not model "stop" and "if touched" separately: it takes a
-    comparison rule and validates it against the current last price (rule ``1``
-    requires a trigger above the market, rule ``2`` one below it). When a last
-    price is known the rule follows directly from the comparison, which is what
-    the venue itself validates; without one it follows the semantics of the
-    Nautilus order type — a stop is placed away from the market in the direction
-    of the trade, an if-touched order towards it.
+    Gate.io does not model "stop" and "if touched" separately: it takes a bare
+    comparison rule and pins it to the current market — rule ``1`` (fire at or
+    above) requires a trigger strictly *above* the last price at submission and
+    rule ``2`` (fire at or below) one strictly *below*, and violating that is
+    refused at submission. One rule per order is therefore submittable, and it
+    is the one the market implies.
+
+    The order type is not thereby redundant, because the two are only
+    interchangeable while the order is well formed. A stop is placed away from
+    the market in the direction of the trade (BUY above, SELL below); an
+    if-touched order towards it (BUY below, SELL above). For a well-formed order
+    the market-derived rule and the type-derived rule agree and this function is
+    a no-op check. When they disagree — a BUY ``STOP_MARKET`` whose trigger sits
+    below the market, or a stop whose level the market has already breached —
+    the only rule Gate.io will accept encodes the *other* order type: a breakout
+    entry armed as a dip buy, in the same direction, with no event to say so.
+
+    So the disagreement is refused rather than resolved. Refusing costs nothing
+    that was available: the alternative is not "submit the order as asked", it
+    is a venue rejection, because the type-derived rule is exactly the one the
+    last-price constraint forbids. What it buys is a reason, and a caller that
+    genuinely wants a trigger already in the market can emulate the order
+    locally, where the platform releases it immediately instead.
+
+    Without a last price nothing can contradict anything, so the type-derived
+    rule stands on its own and the venue makes the final call.
     """
-    if last_price is not None and last_price > 0:
-        return TRIGGER_RULE_ABOVE if trigger_price >= last_price else TRIGGER_RULE_BELOW
     if order_type in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT):
-        return TRIGGER_RULE_ABOVE if order_side == OrderSide.BUY else TRIGGER_RULE_BELOW
-    return TRIGGER_RULE_BELOW if order_side == OrderSide.BUY else TRIGGER_RULE_ABOVE
+        implied = TRIGGER_RULE_ABOVE if order_side == OrderSide.BUY else TRIGGER_RULE_BELOW
+    else:
+        implied = TRIGGER_RULE_BELOW if order_side == OrderSide.BUY else TRIGGER_RULE_ABOVE
+
+    if last_price is None or last_price <= 0:
+        return implied
+
+    from_market = TRIGGER_RULE_ABOVE if trigger_price >= last_price else TRIGGER_RULE_BELOW
+    if from_market != implied:
+        raise UnsupportedOrderError(
+            f"a {order_type_to_str(order_type)} to "
+            f"{'BUY' if order_side == OrderSide.BUY else 'SELL'} triggers "
+            f"{'above' if implied == TRIGGER_RULE_ABOVE else 'below'} the market, but the "
+            f"trigger price {trigger_price} is "
+            f"{'at or above' if from_market == TRIGGER_RULE_ABOVE else 'below'} the last price "
+            f"{last_price}. Gate.io takes only a comparison rule and requires it to agree with "
+            f"the market, so this order can be armed only as the opposite conditional type. "
+            f"Correct the trigger price, submit the type the level implies, or emulate the "
+            f"order locally with `emulation_trigger`",
+        )
+    return from_market
 
 
 #: Order types NautilusTrader accepts an ``OrderTriggered`` event for. Gate.io
@@ -403,6 +469,25 @@ FILLABLE_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
 #: order's, which is a disagreement to report rather than to act on.
 RESTATABLE_ORDER_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
     {OrderStatus.INITIALIZED, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED},
+)
+
+#: Local order statuses an ``OrderRejected`` can still be applied from.
+#:
+#: Read off the installed platform's own state table (model/orders/base.pyx):
+#: ``REJECTED`` is reachable from these six and from nothing else. The entry
+#: that is missing matters — there is no ``PARTIALLY_FILLED -> REJECTED``, so a
+#: venue payload saying the order finished as post-only, arriving after a fill
+#: has been booked against it here, would raise ``InvalidStateTrigger`` inside
+#: the execution engine if it were reported as a rejection.
+REJECTABLE_ORDER_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+    {
+        OrderStatus.INITIALIZED,
+        OrderStatus.SUBMITTED,
+        OrderStatus.ACCEPTED,
+        OrderStatus.TRIGGERED,
+        OrderStatus.PENDING_UPDATE,
+        OrderStatus.PENDING_CANCEL,
+    },
 )
 
 
@@ -465,6 +550,56 @@ class GateioTriggerLink:
             f"{type(self).__name__}(product={self.product.value}, armed_id={self.armed_id!r}, "
             f"client_order_id={self.client_order_id.value!r}, fired_id={self.fired_id!r})"
         )
+
+
+class GateioOrderRequest:
+    """A Gate.io request body, built in full before anything is sent.
+
+    This type exists to hold a boundary the platform draws in its order state
+    machine. ``OrderDenied`` is reachable only from ``INITIALIZED`` (installed
+    1.230.0, ``model/orders/base.pyx`` state table: ``(INITIALIZED, DENIED)``
+    and ``(RELEASED, DENIED)`` are its only entries), so a refusal this client
+    decides on its own has to be decided **before** ``generate_order_submitted``
+    or it cannot be expressed at all. Building the body is what decides those
+    refusals: every one of them is a function of the order object and the
+    instrument, and none of them consults Gate.io.
+
+    Separating the build from the send makes the boundary structural rather
+    than a list of checks somebody has to remember to hoist: a refusal added to
+    a builder later lands on the denial side by construction, because the
+    builder runs before the submission is announced.
+
+    Parameters
+    ----------
+    body : dict[str, Any]
+        The JSON body to send.
+    is_trigger : bool
+        Whether the body addresses a price-order endpoint rather than the
+        regular order endpoint.
+    trigger_price : Price, optional
+        The trigger price, kept for the log line the trigger path writes once
+        the venue has armed the order.
+    trigger_rule : int, optional
+        The venue trigger rule, kept for the same log line.
+
+    """
+
+    __slots__ = ("body", "is_trigger", "trigger_price", "trigger_rule")
+
+    def __init__(
+        self,
+        body: dict[str, Any],
+        is_trigger: bool = False,
+        trigger_price: Price | None = None,
+        trigger_rule: int | None = None,
+    ) -> None:
+        self.body = body
+        self.is_trigger = is_trigger
+        self.trigger_price = trigger_price
+        self.trigger_rule = trigger_rule
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(is_trigger={self.is_trigger}, body={self.body!r})"
 
 
 class GateioExecutionClient(LiveExecutionClient):
@@ -1473,6 +1608,33 @@ class GateioExecutionClient(LiveExecutionClient):
             )
             return
 
+        # Everything this client refuses on its own is decided here, before any
+        # event claims a request reached Gate.io. `OrderDenied` is the event the
+        # platform defines for exactly that ("denied by Nautilus for being
+        # invalid, unprocessable, or exceeding a risk limit",
+        # concepts/orders/index.md; `INITIALIZED -> DENIED`,
+        # concepts/events/order_denied.md), and `OrderRejected` is reserved for
+        # the venue's own refusal ("rejected by the trading venue",
+        # `SUBMITTED -> REJECTED`). The in-tree adapters draw the same line:
+        # Kraken denies an unsupported time in force, FOK on a non-limit spot
+        # order and reduce-only on a cash account before its own
+        # `generate_order_submitted` (adapters/kraken/execution.py:899-940 vs
+        # :951), and OKX denies market-on-options the same way.
+        try:
+            request = await self._prepare_order(order, instrument, product, raw_symbol)
+        except (UnsupportedOrderError, OrderValidationError, ValueError) as e:
+            self._deny(order, str(e))
+            return
+        except Exception as e:  # noqa: BLE001 - a denial is the only honest outcome here
+            # Nothing has been sent, so there is no in-flight order for the
+            # engine to resolve and `_outcome_unresolved` would strand this one
+            # in INITIALIZED for the life of the process: the in-flight check
+            # only queries orders in SUBMITTED, PENDING_UPDATE or PENDING_CANCEL
+            # (live/execution_engine.py `_check_inflight_orders`). Denying is
+            # both terminal and true — the order never left this client.
+            self._deny(order, f"the Gate.io request could not be built: {e}")
+            return
+
         self.generate_order_submitted(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -1481,21 +1643,7 @@ class GateioExecutionClient(LiveExecutionClient):
         )
 
         try:
-            # Both prices are checked here rather than in each builder: the grid
-            # is a property of the instrument, and every order type that carries
-            # a price reaches the venue through one of the two calls below.
-            self._assert_on_tick_grid(instrument, "price", getattr(order, "price", None))
-            self._assert_on_tick_grid(
-                instrument,
-                "trigger price",
-                getattr(order, "trigger_price", None),
-            )
-            if order.order_type in CONDITIONAL_ORDER_TYPES:
-                await self._submit_trigger_order(order, instrument, product, raw_symbol)
-            else:
-                await self._submit_regular_order(order, instrument, product, raw_symbol)
-        except (UnsupportedOrderError, OrderValidationError, ValueError) as e:
-            self._reject(order, str(e))
+            await self._send_order(order, product, request)
         except GateioError as e:
             reason = f"{e.label or 'ERROR'}: {e.message}"
             if is_ambiguous_outcome(e):
@@ -1503,14 +1651,105 @@ class GateioExecutionClient(LiveExecutionClient):
                 return
             self._reject(order, reason, due_post_only=e.label in POST_ONLY_LABELS)
         except Exception as e:  # noqa: BLE001 - never leave an order in limbo
-            # Everything the adapter itself refuses is caught above, so what is
-            # left happened around a request Gate.io may already have accepted:
-            # a response this client could not read, a task cancelled mid-call.
-            # Rejecting on that is unrecoverable, not merely pessimistic — see
-            # `_outcome_unresolved`.
+            # Nothing this client refuses can reach here any more: the whole
+            # request was built above. What is left happened around a request
+            # Gate.io may already have accepted — a response this client could
+            # not read, a task cancelled mid-call — including the `ValueError`
+            # and `OrderValidationError` a malformed success payload can raise
+            # while it is being parsed. Rejecting on that is unrecoverable, not
+            # merely pessimistic; see `_outcome_unresolved`.
             self._outcome_unresolved("Submission", order.client_order_id, f"submit failed: {e}")
 
+    async def _prepare_order(
+        self,
+        order: Order,
+        instrument: Instrument,
+        product: GateioProductType,
+        raw_symbol: str,
+    ) -> GateioOrderRequest:
+        """Build the Gate.io request for ``order``, refusing what it cannot express.
+
+        Every refusal this client makes on its own is raised from here, so the
+        caller can turn all of them into one ``OrderDenied`` before a submission
+        is announced. Nothing here mutates client state or sends an order; the
+        only I/O is a *read* of the current price, which two encodings need (an
+        aggressive spot buy has to be priced, and a trigger rule has to know
+        which side of the market the trigger sits on).
+        """
+        # Both prices are checked here rather than in each builder: the grid is a
+        # property of the instrument, and every order type that carries a price
+        # reaches the venue through one of the two calls below.
+        self._assert_on_tick_grid(instrument, "price", getattr(order, "price", None))
+        self._assert_on_tick_grid(
+            instrument,
+            "trigger price",
+            getattr(order, "trigger_price", None),
+        )
+        if order.order_type in CONDITIONAL_ORDER_TYPES:
+            return await self._prepare_trigger_order(order, product, raw_symbol)
+        return await self._prepare_regular_order(order, instrument, product, raw_symbol)
+
+    async def _prepare_regular_order(
+        self,
+        order: Order,
+        instrument: Instrument,
+        product: GateioProductType,
+        raw_symbol: str,
+    ) -> GateioOrderRequest:
+        if product.is_spot:
+            body = await self._build_spot_order(order, instrument, raw_symbol)
+        elif product.is_option:
+            body = self._build_options_order(order, raw_symbol)
+        else:
+            body = self._build_futures_order(order, raw_symbol)
+        return GateioOrderRequest(body)
+
+    async def _send_order(
+        self,
+        order: Order,
+        product: GateioProductType,
+        request: GateioOrderRequest,
+    ) -> None:
+        """Send a built request and publish whatever the venue answers with."""
+        if request.is_trigger:
+            await self._send_trigger_order(order, product, request)
+            return
+
+        response: Any
+        if product.is_spot:
+            response = await self._spot_http.create_order(request.body)
+        elif product.is_option:
+            response = await self._options_http.create_order(request.body)
+        else:
+            response = await self._futures_api(product).create_order(request.body)
+
+        if isinstance(response, dict):
+            self._handle_order_payload(product, response)
+
     def _deny(self, order: Order, reason: str) -> None:
+        """Refuse an order this client will not submit. Nothing was sent.
+
+        This is one half of a boundary the platform draws and this client keeps.
+        ``OrderDenied`` is "denied by Nautilus for being invalid, unprocessable,
+        or exceeding a risk limit" (concepts/orders/index.md, "Order status
+        definitions"), it transitions ``INITIALIZED -> DENIED``, and it carries
+        neither a ``venue_order_id`` nor an ``account_id``
+        (concepts/events/order_denied.md) — because no venue was involved. Its
+        counterpart, :meth:`_reject`, means Gate.io refused a submission.
+
+        The distinction is not bookkeeping. Emitting ``OrderSubmitted`` asserts
+        a network fact, so a refusal announced that way puts the order through
+        the engine's in-flight set for nothing, writes a submission Gate.io
+        never received into the persisted event stream an audit reads back, and
+        charges the venue's rejection rate for this client's own validation.
+
+        The platform also makes the boundary one-way: the installed 1.230.0
+        state table reaches ``DENIED`` from ``INITIALIZED`` and ``RELEASED``
+        only, so once ``OrderSubmitted`` has been emitted a denial can no longer
+        be applied at all. Everything this client refuses is therefore decided
+        while the request is built, before the submission is announced — see
+        :class:`GateioOrderRequest`.
+        """
         self._log.error(f"Denying {order.client_order_id!r}: {reason}")
         self.generate_order_denied(
             strategy_id=order.strategy_id,
@@ -1521,6 +1760,14 @@ class GateioExecutionClient(LiveExecutionClient):
         )
 
     def _reject(self, order: Order, reason: str, due_post_only: bool = False) -> None:
+        """Report that **Gate.io** refused a submitted order.
+
+        Reserved for a refusal the venue itself made and proved:
+        ``OrderRejected`` is "rejected by the trading venue"
+        (concepts/events/order_rejected.md, ``SUBMITTED -> REJECTED``). A
+        refusal this client decided is :meth:`_deny`; an outcome nobody can
+        prove either way is :meth:`_outcome_unresolved`.
+        """
         self._log.error(f"Rejecting {order.client_order_id!r}: {reason}")
         self.generate_order_rejected(
             strategy_id=order.strategy_id,
@@ -1576,26 +1823,6 @@ class GateioExecutionClient(LiveExecutionClient):
             f"to resolve",
         )
 
-    async def _submit_regular_order(
-        self,
-        order: Order,
-        instrument: Instrument,
-        product: GateioProductType,
-        raw_symbol: str,
-    ) -> None:
-        if product.is_spot:
-            body = await self._build_spot_order(order, instrument, raw_symbol)
-            response = await self._spot_http.create_order(body)
-        elif product.is_option:
-            body = self._build_options_order(order, raw_symbol)
-            response = await self._options_http.create_order(body)
-        else:
-            body = self._build_futures_order(order, raw_symbol)
-            response = await self._futures_api(product).create_order(body)
-
-        if isinstance(response, dict):
-            self._handle_order_payload(product, response)
-
     async def _build_spot_order(
         self,
         order: Order,
@@ -1621,11 +1848,15 @@ class GateioExecutionClient(LiveExecutionClient):
         if order.order_type == OrderType.MARKET:
             if order.is_post_only:
                 raise UnsupportedOrderError("a market order cannot be post-only")
-            tif = (
-                GateioTimeInForce.FOK
-                if order.time_in_force == TimeInForce.FOK
-                else GateioTimeInForce.IOC
-            )
+            # Spot goes through the same mapping as futures, delivery and
+            # options rather than deciding its own. The shortcut this replaced
+            # ("FOK stays FOK, everything else becomes ioc") silently accepted
+            # AT_THE_OPEN and AT_THE_CLOSE, which the other three products
+            # reject: one client answering the same instruction two ways is a
+            # trap for a strategy that switches products, and a session
+            # instruction on a 24/7 venue is a porting mistake worth reporting
+            # rather than absorbing.
+            tif = self._market_time_in_force(order, allow_fok=True)
             if order.side == OrderSide.SELL:
                 if order.is_quote_quantity:
                     raise UnsupportedOrderError(
@@ -1644,7 +1875,7 @@ class GateioExecutionClient(LiveExecutionClient):
                 body["time_in_force"] = tif.value
                 return body
 
-            return await self._build_aggressive_spot_buy(order, instrument, raw_symbol, body)
+            return await self._build_aggressive_spot_buy(order, instrument, raw_symbol, body, tif)
 
         if order.is_quote_quantity:
             raise UnsupportedOrderError(
@@ -1673,15 +1904,22 @@ class GateioExecutionClient(LiveExecutionClient):
         instrument: Instrument,
         raw_symbol: str,
         body: dict[str, Any],
+        tif: GateioTimeInForce,
     ) -> dict[str, Any]:
-        """Express a base-denominated spot market buy as an aggressive IOC limit.
+        """Express a base-denominated spot market buy as an aggressive limit.
 
         Gate.io's native spot market buy spends a **quote** amount, so it cannot
         express "buy exactly this many base units". Rather than convert the
-        quantity behind the caller's back, the order is sent as an
-        immediate-or-cancel limit order priced through the book by the pair's own
-        published slippage cap; the venue then fills at or better than that bound
-        and cancels any remainder.
+        quantity behind the caller's back, the order is sent as a limit order
+        priced through the book by the pair's own published slippage cap; the
+        venue then fills at or better than that bound.
+
+        The substitution is in the *price*, and it stops there. The time in
+        force is carried through unchanged, which is why it is a parameter
+        rather than a constant: a spot limit order takes ``fok`` as readily as
+        ``ioc``, so a ``MARKET``/``FOK`` buy stays all-or-nothing at the bound
+        instead of being downgraded to "fill whatever is available" — a
+        different execution guarantee, and the one thing FOK exists to rule out.
         """
         reference = await self._reference_price(
             GateioProductType.SPOT,
@@ -1705,9 +1943,9 @@ class GateioExecutionClient(LiveExecutionClient):
         body["type"] = "limit"
         body["amount"] = str(order.quantity)
         body["price"] = str(limit_price)
-        body["time_in_force"] = GateioTimeInForce.IOC.value
+        body["time_in_force"] = tif.value
         self._log.info(
-            f"Base-denominated spot market buy on {raw_symbol} sent as an IOC limit at "
+            f"Base-denominated spot market buy on {raw_symbol} sent as a {tif.value} limit at "
             f"{limit_price} (reference {reference}, slippage cap {slippage})",
         )
         return body
@@ -1904,13 +2142,12 @@ class GateioExecutionClient(LiveExecutionClient):
 
     # -- price-triggered orders --------------------------------------------
 
-    async def _submit_trigger_order(
+    async def _prepare_trigger_order(
         self,
         order: Order,
-        instrument: Instrument,
         product: GateioProductType,
         raw_symbol: str,
-    ) -> None:
+    ) -> GateioOrderRequest:
         if product.is_option:
             raise UnsupportedOrderError(
                 "Gate.io options have no price-triggered order endpoint; "
@@ -1933,10 +2170,25 @@ class GateioExecutionClient(LiveExecutionClient):
 
         if product.is_spot:
             body = self._build_spot_price_order(order, raw_symbol, trigger_price, rule)
-            response = await self._spot_http.create_price_order(body)
         else:
             body = self._build_futures_price_order(order, raw_symbol, trigger_price, rule)
-            response = await self._futures_api(product).create_price_order(body)
+        return GateioOrderRequest(
+            body,
+            is_trigger=True,
+            trigger_price=trigger_price,
+            trigger_rule=rule,
+        )
+
+    async def _send_trigger_order(
+        self,
+        order: Order,
+        product: GateioProductType,
+        request: GateioOrderRequest,
+    ) -> None:
+        if product.is_spot:
+            response = await self._spot_http.create_price_order(request.body)
+        else:
+            response = await self._futures_api(product).create_price_order(request.body)
 
         trigger_id = self._trigger_order_id(response)
         if trigger_id is None:
@@ -1961,7 +2213,7 @@ class GateioExecutionClient(LiveExecutionClient):
         )
         self._log.info(
             f"Armed price-triggered order {order.client_order_id!r} as {trigger_id} "
-            f"(rule {rule}, trigger {trigger_price})",
+            f"(rule {request.trigger_rule}, trigger {request.trigger_price})",
         )
 
     @staticmethod
@@ -1980,9 +2232,13 @@ class GateioExecutionClient(LiveExecutionClient):
     ) -> dict[str, Any]:
         account = PRICE_ORDER_ACCOUNTS.get(self._spot_mode)
         if account is None:
+            # The modes are sorted by their venue value, not as enum members:
+            # `GateioSpotAccountMode` defines no ordering, so `sorted()` over the
+            # keys raises `TypeError` while building this very message and the
+            # refusal never reaches the strategy as a refusal.
+            supported = ", ".join(sorted(mode.value for mode in PRICE_ORDER_ACCOUNTS))
             raise UnsupportedOrderError(
-                f"Gate.io price-triggered spot orders accept the "
-                f"{', '.join(sorted(PRICE_ORDER_ACCOUNTS))} ledgers only, "
+                f"Gate.io price-triggered spot orders accept the {supported} ledgers only, "
                 f"configured mode is {self._spot_mode.value}",
             )
         if order.is_quote_quantity:
@@ -1993,6 +2249,23 @@ class GateioExecutionClient(LiveExecutionClient):
             raise UnsupportedOrderError(
                 "Gate.io spot orders have no reduce-only flag; reduce-only is a derivatives "
                 "concept and the price-triggered order would change meaning if it were dropped",
+            )
+        if order.trigger_type not in SPOT_TRIGGER_TYPES:
+            # The trigger type is the instruction that says *which* price arms
+            # the order, so dropping it does not lose a decoration, it arms the
+            # order against a different price than the one that was named — and
+            # usually against the one the caller chose the trigger type to
+            # avoid, since MARK_PRICE and MID_POINT are picked precisely to be
+            # immune to a thin-book last-trade wick. Gate.io's spot trigger has
+            # no field to carry it, so it is refused here exactly as the futures
+            # path refuses a price type it cannot encode.
+            raise UnsupportedOrderError(
+                f"trigger type {trigger_type_to_str(order.trigger_type)} cannot be expressed on "
+                f"a Gate.io spot conditional order: the spot price-order endpoint takes a bare "
+                f"comparison against the market price and has no price-type field, so the order "
+                f"would silently arm on a different price. Use DEFAULT or LAST_PRICE; for a mark "
+                f"or index trigger, trade the futures contract, whose price-order endpoint does "
+                f"carry a price type",
             )
         self._assert_trigger_execution_flags(order)
 
@@ -2215,6 +2488,16 @@ class GateioExecutionClient(LiveExecutionClient):
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
         resolved = self._resolve(command.instrument_id)
         if resolved is None:
+            # A cancel-all that fails a local check produces no event — the
+            # platform is explicit that "cancel, modify, cancel-all, and
+            # batch-cancel commands that fail local checks log warnings and do
+            # not produce rejection events" (concepts/live.md) — but it must not
+            # produce silence either. Without this line a strategy waiting for
+            # its cancels waits forever with nothing in the log to explain it.
+            self._log.warning(
+                f"Cannot cancel all orders on {command.instrument_id}: the instrument is not a "
+                f"configured Gate.io product, so no cancel was sent and no order was affected",
+            )
             return
         product, raw_symbol = resolved
 
@@ -2698,14 +2981,38 @@ class GateioExecutionClient(LiveExecutionClient):
             return
 
         if finish_as == POST_ONLY_FINISH_AS:
-            self.generate_order_rejected(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                reason="post-only order would have taken liquidity (finish_as=poc)",
-                ts_event=ts_event,
-                due_post_only=True,
-            )
+            if order.status in REJECTABLE_ORDER_STATUSES:
+                self.generate_order_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    reason="post-only order would have taken liquidity (finish_as=poc)",
+                    ts_event=ts_event,
+                    due_post_only=True,
+                )
+            elif not order.is_closed:
+                # The venue says this post-only order finished without resting,
+                # yet a fill has already been booked against it here — the shape
+                # a REST response for a cancel or an amend takes when it arrives
+                # after the trade stream. The platform has no
+                # `PARTIALLY_FILLED -> REJECTED` transition, so a rejection would
+                # raise `InvalidStateTrigger` inside the execution engine and the
+                # order would stay open locally while it is finished at Gate.io.
+                # What both sides agree on is that it is finished, and
+                # `PARTIALLY_FILLED -> CANCELED` is legal, so the termination is
+                # reported as the cancellation it is.
+                self._log.warning(
+                    f"{order.client_order_id!r} is {order.status_string()} here but Gate.io "
+                    f"reports it finished as post-only; reporting the termination as a "
+                    f"cancellation, which is the transition the platform accepts",
+                )
+                self.generate_order_canceled(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=venue_order_id,
+                    ts_event=ts_event,
+                )
             self._forget_order(order.client_order_id)
             return
 
@@ -4042,10 +4349,36 @@ class GateioExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        """Generate a single order status report by venue or client order id."""
+        """Generate a single order status report by venue or client order id.
+
+        Either identifier is enough, and answering to the client order id alone
+        is not optional. ``LiveExecutionEngine._check_inflight_orders`` (installed
+        live/execution_engine.py:701-765) queries an order that is still
+        ``SUBMITTED``, and a ``SUBMITTED`` order has no venue order id — the
+        engine passes ``order.venue_order_id``, which is ``None`` until
+        ``OrderAccepted``. That query is the whole resolution path for a submit
+        whose outcome Gate.io never confirmed: ``open_check_interval_secs``
+        defaults to ``None`` (live/config.py:188), so the open-order sweep is not
+        even running, and after ``inflight_check_retries`` unanswered queries
+        ``_resolve_inflight_order`` (:767-795) emits
+        ``OrderRejected(reason="UNKNOWN")`` — terminal, and on 1.230.0 no later
+        ``OrderAccepted`` can undo it. Returning ``None`` for want of a venue
+        order id therefore discards exactly the handling
+        :meth:`_outcome_unresolved` exists to provide.
+        """
         instrument_id = command.instrument_id
         client_order_id = command.client_order_id
         venue_order_id = command.venue_order_id
+
+        if client_order_id is None and venue_order_id is None:
+            # The platform states this as the method's own contract
+            # (LiveExecutionClient.generate_order_status_report, installed
+            # live/execution_client.py:359-362: "Raises ValueError if both the
+            # `client_order_id` and `venue_order_id` are None"), and the
+            # reference adapter asserts it the same way
+            # (adapters/binance/execution.py:381-384). It is a caller error, not
+            # an order that could not be found, so it must not be logged as one.
+            raise ValueError("both `client_order_id` and `venue_order_id` were `None`")
 
         if venue_order_id is None and client_order_id is not None:
             venue_order_id = self._cache.venue_order_id(client_order_id)
@@ -4080,34 +4413,14 @@ class GateioExecutionClient(LiveExecutionClient):
             product, raw_symbol = resolved
 
             if venue_order_id is None:
-                if not product.is_spot:
-                    self._log.warning(
-                        f"Cannot look up {client_order_id!r} on {product.value}: Gate.io "
-                        f"resolves a client order id only while the order is resting",
-                    )
-                    return None
-                text = (
-                    self._text_by_client_order_id.get(client_order_id)
-                    if client_order_id is not None
-                    else None
-                )
-                if text is None:
-                    self._log.warning(f"No venue order id known for {client_order_id!r}")
-                    return None
-                lookup_id = text
-            else:
-                lookup_id = venue_order_id.value
-
-            if product.is_spot:
-                payload = await self._spot_http.get_order(
-                    lookup_id,
+                return await self._report_by_client_order_id(
+                    product,
                     raw_symbol,
-                    account=self.spot_account,
+                    instrument_id,
+                    client_order_id,  # type: ignore[arg-type]  # guarded above
                 )
-            elif product.is_option:
-                payload = await self._options_http.get_order(lookup_id)
-            else:
-                payload = await self._futures_api(product).get_order(lookup_id)
+
+            payload = await self._get_order(product, venue_order_id.value, raw_symbol)
         except WalletNotProvisionedError as e:
             self._log.warning(f"Cannot generate an order status report: {e}")
             return None
@@ -4115,6 +4428,32 @@ class GateioExecutionClient(LiveExecutionClient):
             self._log_report_error(e, "OrderStatusReport")
             return None
 
+        return await self._report_from_payload(product, payload, raw_symbol)
+
+    async def _get_order(
+        self,
+        product: GateioProductType,
+        order_id: str,
+        raw_symbol: str,
+    ) -> Any:
+        """Read one order from the product's single-order endpoint."""
+        if product.is_spot:
+            return await self._spot_http.get_order(
+                order_id,
+                raw_symbol,
+                account=self.spot_account,
+            )
+        if product.is_option:
+            return await self._options_http.get_order(order_id)
+        return await self._futures_api(product).get_order(order_id)
+
+    async def _report_from_payload(
+        self,
+        product: GateioProductType,
+        payload: Any,
+        raw_symbol: str,
+    ) -> OrderStatusReport | None:
+        """Turn one order payload into a report, loading its instrument if needed."""
         if not isinstance(payload, dict):
             return None
         instrument = await self._instrument_or_load(
@@ -4123,6 +4462,86 @@ class GateioExecutionClient(LiveExecutionClient):
         if instrument is None:
             return None
         return self._parse_order_status_report(product, payload, instrument)
+
+    def _known_venue_text(self, client_order_id: ClientOrderId) -> str | None:
+        """Return the ``text`` this order was submitted under, without minting one.
+
+        :meth:`_venue_text` is the wrong call for a lookup: it *creates* an alias
+        for an id it has not seen, which would have this client ask Gate.io about
+        a text it never sent. The alias table answers for the life of the
+        process; past a restart the ``t-``-prefixed form is still reconstructible
+        for any id that fits the field, which is the ordinary case and the reason
+        the id is embedded verbatim in the first place. An id that did not fit
+        was submitted under a generated text, and that mapping does not survive
+        the process — the caller falls back to the listing scan, which reports
+        the order as external, which is what it has become.
+        """
+        known = self._text_by_client_order_id.get(client_order_id)
+        if known is not None:
+            return known
+        if _TEXT_BODY_PATTERN.match(client_order_id.value):
+            return CLIENT_ORDER_ID_PREFIX + client_order_id.value
+        return None
+
+    async def _report_by_client_order_id(
+        self,
+        product: GateioProductType,
+        raw_symbol: str,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+    ) -> OrderStatusReport | None:
+        """Report an order whose venue order id this client never learned.
+
+        This is the ambiguous-submit case: the create request went out, the
+        answer did not come back, and the only handle on the order is the client
+        id embedded in its ``text``. Gate.io takes that text in place of the
+        venue id on the spot and perpetual single-order endpoints
+        (:data:`CLIENT_ID_ADDRESSABLE_PRODUCTS`) but not on delivery or options,
+        and even where it is taken it stops resolving once the order has been
+        finished for a minute. So the direct read is an optimisation, not the
+        mechanism: what works on every product and at every age is the order
+        listing, which carries ``text`` on every row and is already parsed into
+        reports by :meth:`_order_reports_for_product`. Resting orders are listed
+        first because an order queried without a venue id has almost always just
+        been submitted; the finished listing is only walked when that missed.
+        """
+        text = self._known_venue_text(client_order_id)
+        if text is not None and product in CLIENT_ID_ADDRESSABLE_PRODUCTS:
+            try:
+                payload = await self._get_order(product, text, raw_symbol)
+            except GateioError as e:
+                # "Not found" is an ordinary answer here — the custom-id window
+                # has closed, or the venue never accepted the order — and it is
+                # not the end of the search, so it must not surface as a report
+                # failure.
+                self._log.debug(f"Gate.io did not resolve {text!r} directly: {e}")
+            else:
+                report = await self._report_from_payload(product, payload, raw_symbol)
+                # The identity is checked rather than assumed: this report is
+                # about to be adopted as the venue's statement on an in-flight
+                # order, and adopting the wrong venue order id for it would
+                # address every later cancel and amend to somebody else's order.
+                if report is not None and report.client_order_id == client_order_id:
+                    return report
+
+        start_secs, end_secs = self._window(None, None)
+        for open_only in (True, False):
+            reports = await self._order_reports_for_product(
+                product,
+                instrument_id,
+                open_only=open_only,
+                start_secs=start_secs,
+                end_secs=end_secs,
+            )
+            for report in reports:
+                if report.client_order_id == client_order_id:
+                    return report
+
+        self._log.warning(
+            f"Gate.io holds no {product.value} order for {client_order_id!r} on {raw_symbol}: "
+            f"neither the resting nor the finished listing carries its client id",
+        )
+        return None
 
     def _parse_order_status_report(
         self,
@@ -4189,6 +4608,11 @@ class GateioExecutionClient(LiveExecutionClient):
         )
         ts_init = self._clock.timestamp_ns()
 
+        order_status, trigger_price, trigger_type, restate_trigger = self._fired_trigger_fields(
+            venue_order_id,
+            self._order_status(product, payload),
+        )
+
         return OrderStatusReport(
             account_id=self.account_id,
             instrument_id=instrument.id,
@@ -4197,10 +4621,12 @@ class GateioExecutionClient(LiveExecutionClient):
             order_side=side,
             order_type=order_type,
             time_in_force=time_in_force_from_gateio(time_in_force_value),
-            order_status=self._order_status(product, payload),
+            order_status=order_status,
             quantity=quantity,
             filled_qty=filled_qty,
             price=price,
+            trigger_price=trigger_price,
+            trigger_type=trigger_type,
             avg_px=avg_px if avg_px and avg_px > 0 else None,
             display_qty=display_qty,
             post_only=post_only,
@@ -4208,7 +4634,77 @@ class GateioExecutionClient(LiveExecutionClient):
             report_id=UUID4(),
             ts_accepted=ts_accepted or ts_init,
             ts_last=ts_last or ts_init,
+            ts_triggered=(ts_accepted or ts_init) if restate_trigger else None,
             ts_init=ts_init,
+        )
+
+    def _fired_trigger_fields(
+        self,
+        venue_order_id: VenueOrderId,
+        order_status: OrderStatus,
+    ) -> tuple[OrderStatus, Price | None, TriggerType, bool]:
+        """Restate the report of an order one of this client's triggers fired.
+
+        Gate.io splits a conditional order into two venue objects: the armed
+        price order, which holds the trigger, and the ordinary order it creates
+        when the trigger fires, which holds none of it. Reported exactly as the
+        venue states it, that second object is an ACCEPTED limit order with no
+        trigger price — while the local order is a STOP_LIMIT that has already
+        been TRIGGERED. Both halves of the comparison then misfire on installed
+        1.230.0, on every reconciliation pass, for as long as the order rests:
+
+        * ``_handle_order_status_transitions`` (live/execution_engine.py:3253)
+          calls ``_generate_order_accepted`` because the report says ACCEPTED and
+          the order does not, and ``TRIGGERED -> ACCEPTED`` is absent from the
+          state table (model/orders/base.pyx:110-157), so the event is dropped
+          with a warning and the pass reconciles nothing;
+        * ``_should_update`` (:3307-3318) compares ``report.trigger_price``
+          against the order's for every stop type, and ``None`` never equals a
+          price, so a reconciliation ``OrderUpdated`` claiming an amendment the
+          venue never made is published to the message bus each time.
+
+        The trigger fields are taken from the local order because the venue does
+        not repeat them on the fired object, and the armed/fired link is this
+        client's own record of which pair of venue ids is one Nautilus order —
+        the same reading :meth:`_build_trigger_order_report` already does for the
+        order type.
+
+        ``TRIGGERED`` is reported only for the types the platform has that state
+        for: ``_generate_order_triggered`` (:3644-3654) skips market-style stops
+        outright, and reporting TRIGGERED for one of those would have the engine
+        treat the report as reconciled while emitting nothing, so those keep the
+        venue's own status and gain only the trigger price.
+
+        ``ts_triggered`` is restated only while the local order has not recorded
+        the trigger itself. The engine re-emits ``OrderTriggered`` from that field
+        on the CANCELED and EXPIRED paths (:3281, :3294) without checking the
+        order's current state, so repeating a trigger the order already applied
+        buys a dropped event and a warning and nothing else; the field exists so
+        that a trigger which fired while this client was down is not lost.
+        """
+        link = self._trigger_link_for_venue_order_id(venue_order_id.value)
+        if link is None or link.fired_id != venue_order_id.value:
+            return order_status, None, TriggerType.NO_TRIGGER, False
+
+        order = self._cache.order(link.client_order_id)
+        if order is None or not order.has_trigger_price:
+            return order_status, None, TriggerType.NO_TRIGGER, False
+
+        trigger_type = getattr(order, "trigger_type", TriggerType.NO_TRIGGER)
+        if trigger_type == TriggerType.NO_TRIGGER:
+            # `OrderStatusReport` refuses a trigger price without a trigger type,
+            # so an order that somehow carries one without the other is reported
+            # without either rather than not at all.
+            return order_status, None, TriggerType.NO_TRIGGER, False
+
+        if order_status == OrderStatus.ACCEPTED and order.order_type in TRIGGERABLE_ORDER_TYPES:
+            order_status = OrderStatus.TRIGGERED
+
+        return (
+            order_status,
+            order.trigger_price,
+            trigger_type,
+            getattr(order, "ts_triggered", 0) == 0,
         )
 
     def _parse_spot_order_fields(
@@ -4391,7 +4887,20 @@ class GateioExecutionClient(LiveExecutionClient):
         self,
         command: GenerateFillReports,
     ) -> list[FillReport]:
-        """Generate fill reports across every enabled product."""
+        """Generate fill reports across every enabled product.
+
+        ``command.venue_order_id`` narrows the answer to one order's executions.
+        It is a filter the platform declares on the command
+        (``GenerateFillReports``, installed execution/messages.pyx:338-382) and
+        that in-tree adapters set when they re-read the trades of a single order,
+        so a client that ignored it would answer a question about one order with
+        every fill in the window — and a caller grouping those under that order's
+        status report would attach executions the venue booked against other
+        orders. Gate.io takes the same narrowing server-side on spot
+        (``order_id``) and on futures and delivery (``order``); options has no
+        such parameter, so the filter is applied to the parsed reports as well,
+        which is what makes the guarantee hold on every product.
+        """
         reports: list[FillReport] = []
         start_secs, end_secs = self._window(command.start, command.end)
 
@@ -4402,11 +4911,17 @@ class GateioExecutionClient(LiveExecutionClient):
                     command.instrument_id,
                     start_secs,
                     end_secs,
+                    command.venue_order_id,
                 )
             except WalletNotProvisionedError as e:
                 self._log.warning(f"Skipping {product.value} fill reports: {e}")
             except (asyncio.CancelledError, Exception) as e:  # noqa: BLE001
                 self._log_report_error(e, f"{product.value} FillReports")
+
+        if command.venue_order_id is not None:
+            reports = [
+                report for report in reports if report.venue_order_id == command.venue_order_id
+            ]
 
         # Reconciliation applies fills in list order, so ordering is load-bearing.
         reports.sort(key=lambda report: (report.ts_event, report.trade_id.value))
@@ -4419,6 +4934,7 @@ class GateioExecutionClient(LiveExecutionClient):
         instrument_id: InstrumentId | None,
         start_secs: int,
         end_secs: int,
+        venue_order_id: VenueOrderId | None = None,
     ) -> list[FillReport]:
         symbol: str | None = None
         if instrument_id is not None:
@@ -4427,13 +4943,18 @@ class GateioExecutionClient(LiveExecutionClient):
                 return []
             symbol = resolved[1]
 
+        order_id = venue_order_id.value if venue_order_id is not None else None
+
         payloads: list[dict[str, Any]] = []
         if product.is_spot:
             symbols = [symbol] if symbol else sorted(self._active_symbols(product)) or [None]
             for pair in symbols:
                 payloads += await self._collect_pages(
+                    # Gate.io refuses `order_id` without `currency_pair`, so an
+                    # unscoped sweep keeps asking broadly and narrows afterwards.
                     lambda page, pair=pair: self._spot_http.my_trades(
                         pair=pair,
+                        order_id=order_id if pair else None,
                         limit=REPORT_PAGE_LIMIT,
                         page=page + 1,
                         frm=start_secs,
@@ -4462,6 +4983,7 @@ class GateioExecutionClient(LiveExecutionClient):
             payloads += await self._collect_pages(
                 lambda page: self._futures_api(product).my_trades(
                     contract=symbol,
+                    order=order_id,
                     limit=REPORT_PAGE_LIMIT,
                     offset=page * REPORT_PAGE_LIMIT,
                 ),

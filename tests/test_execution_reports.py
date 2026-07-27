@@ -14,6 +14,7 @@ import pytest
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     GenerateFillReports,
+    GenerateOrderStatusReport,
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
 )
@@ -27,15 +28,17 @@ from nautilus_trader.model.enums import (
 )
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import PositionId, TradeId, VenueOrderId
-from nautilus_trader.model.objects import Money, Quantity
+from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.model.position import Position
 
 from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import WalletNotProvisionedError
+from nautilus_gateio.common.errors import GateioError, WalletNotProvisionedError
 from nautilus_gateio.execution import REPORT_PAGE_LIMIT, PositionStatusUnavailable
 
 try:  # pytest inserts the tests directory on the path; support both layouts
     from tests.test_execution_orders import (
+        FUT_BTC_USDT,
+        OPT_BTC_USDT,
         PERP_BTC_USDT,
         PERP_CONTRACT_PAYLOAD,
         SPOT_BTC_USDT,
@@ -44,6 +47,8 @@ try:  # pytest inserts the tests directory on the path; support both layouts
     )
 except ImportError:  # pragma: no cover - depends on the pytest import mode
     from test_execution_orders import (  # type: ignore[no-redef]
+        FUT_BTC_USDT,
+        OPT_BTC_USDT,
         PERP_BTC_USDT,
         PERP_CONTRACT_PAYLOAD,
         SPOT_BTC_USDT,
@@ -737,6 +742,415 @@ class TestContractOrderReports:
         assert report.order_status == OrderStatus.FILLED
 
 
+# -- MANDATORY: resolving an order the venue never gave us an id for ----------
+
+
+def _single_report_command(instrument_id: Any, order: Any) -> GenerateOrderStatusReport:
+    """Build the command the engine builds for an order that is still in flight.
+
+    ``LiveExecutionEngine._check_inflight_orders`` passes ``order.venue_order_id``,
+    and a ``SUBMITTED`` order has none — the venue id is only assigned by
+    ``OrderAccepted``. This is the exact shape of the query that has to be
+    answered for an ambiguous submit to be resolved.
+    """
+    return GenerateOrderStatusReport(
+        instrument_id=instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=None,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def _in_flight(env: ExecHarness, instrument_id: Any, quantity: Quantity) -> Any:
+    """Leave a limit order SUBMITTED, as an unconfirmed submit leaves it."""
+    order = env.order_factory.limit(
+        instrument_id,
+        OrderSide.BUY,
+        quantity,
+        Price.from_str("59000.0"),
+    )
+    env.add_order(order)
+    env.client.generate_order_submitted(
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        ts_event=env.clock.timestamp_ns(),
+    )
+    env.drain(order)
+    assert order.status == OrderStatus.SUBMITTED
+    assert order.venue_order_id is None
+    return order
+
+
+class TestClientOrderIdLookup:
+    """A submit whose outcome Gate.io never confirmed must stay resolvable.
+
+    ``_outcome_unresolved`` deliberately leaves such an order ``SUBMITTED`` so
+    that the engine can settle it, and the engine settles it in exactly one way:
+    ``_check_inflight_orders`` (installed live/execution_engine.py:701-765) issues
+    ``QueryOrder`` with ``order.venue_order_id``, which is ``None``, and
+    ``_resolve_inflight_order`` (:767-795) emits
+    ``OrderRejected(reason="UNKNOWN")`` once ``inflight_check_retries`` queries
+    have come back empty. That rejection is terminal on 1.230.0, so an order
+    Gate.io is holding live would never be representable again.
+
+    The client used to answer that query with ``None`` on every product except
+    spot, which is to say it answered ``None`` for the whole derivatives half of
+    the adapter.
+    """
+
+    def test_the_platform_query_path_answers_for_a_perpetual(self, perp_env):
+        """Driven through the platform's own ``query_order`` plumbing, not ours."""
+        from nautilus_trader.execution.messages import QueryOrder
+
+        env = perp_env
+        order = _in_flight(env, PERP_BTC_USDT, Quantity.from_int(10))
+        env.perp.responses["get_order"] = {
+            "id": 900001,
+            "id_string": "900001",
+            "contract": "BTC_USDT",
+            "size": 10,
+            "left": 10,
+            "price": "59000.0",
+            "tif": "gtc",
+            "status": "open",
+            "text": f"t-{order.client_order_id.value}",
+            "create_time": INSIDE_SECS,
+        }
+
+        env.client.query_order(
+            QueryOrder(
+                trader_id=env.trader_id,
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=None,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+        env.run(_drain_tasks(env))
+
+        # The venue's statement has to reach the engine; without it the order is
+        # rejected as unknown while it is live at Gate.io.
+        assert [type(report).__name__ for report in env.reports] == ["OrderStatusReport"]
+        assert env.reports[0].client_order_id == order.client_order_id
+        assert env.reports[0].venue_order_id == VenueOrderId("900001")
+        # Gate.io takes the client id in place of the venue id on this endpoint.
+        assert [call.args[0] for call in env.perp.calls_named("get_order")] == [
+            f"t-{order.client_order_id.value}",
+        ]
+
+    def test_delivery_is_found_in_the_resting_listing(self, delivery_env):
+        """Delivery's single-order endpoint takes the venue id only, so it is listed."""
+        env = delivery_env
+        order = _in_flight(env, FUT_BTC_USDT, Quantity.from_int(3))
+        env.delivery.responses["list_orders"] = lambda **kwargs: (
+            [
+                {
+                    "id": 550055,
+                    "id_string": "550055",
+                    "contract": "BTC_USDT_20260807",
+                    "size": 3,
+                    "left": 3,
+                    "price": "59000.0",
+                    "tif": "gtc",
+                    "status": "open",
+                    "text": f"t-{order.client_order_id.value}",
+                    "create_time": INSIDE_SECS,
+                },
+            ]
+            if kwargs.get("status") == "open"
+            else []
+        )
+
+        report = env.run(
+            env.client.generate_order_status_report(
+                _single_report_command(FUT_BTC_USDT, order),
+            ),
+        )
+
+        assert report is not None
+        assert report.client_order_id == order.client_order_id
+        assert report.venue_order_id == VenueOrderId("550055")
+        # No pointless request to an endpoint Gate.io documents as venue-id only.
+        assert not env.delivery.called("get_order")
+
+    def test_options_are_found_in_the_finished_listing(self, options_env):
+        """An order that filled before the answer was lost is still resolvable."""
+        env = options_env
+        order = _in_flight(env, OPT_BTC_USDT, Quantity.from_int(2))
+        env.options.responses["list_orders"] = lambda **kwargs: (
+            [
+                {
+                    "id": 660066,
+                    "id_string": "660066",
+                    "contract": "BTC_USDT-20260729-70000-C",
+                    "size": 2,
+                    "left": 0,
+                    "price": "120.0",
+                    "tif": "gtc",
+                    "status": "finished",
+                    "finish_as": "filled",
+                    "text": f"t-{order.client_order_id.value}",
+                    "create_time": INSIDE_SECS,
+                },
+            ]
+            if kwargs.get("status") == "finished"
+            else []
+        )
+
+        report = env.run(
+            env.client.generate_order_status_report(
+                _single_report_command(OPT_BTC_USDT, order),
+            ),
+        )
+
+        assert report is not None
+        assert report.client_order_id == order.client_order_id
+        assert report.venue_order_id == VenueOrderId("660066")
+        assert report.order_status == OrderStatus.FILLED
+        assert not env.options.called("get_order")
+
+    def test_a_direct_miss_falls_through_to_the_listing(self, perp_env):
+        """Gate.io stops resolving the custom id a minute after the order finishes."""
+        env = perp_env
+        order = _in_flight(env, PERP_BTC_USDT, Quantity.from_int(10))
+        env.perp.responses["get_order"] = GateioError(404, "ORDER_NOT_FOUND", "not found")
+        # A finished order is windowed, and the window this lookup uses is its
+        # own: an order queried without a venue id has just been submitted.
+        just_now = int(env.clock.timestamp_ns() // 1_000_000_000)
+        env.perp.responses["list_orders"] = lambda **kwargs: (
+            [
+                {
+                    "id": 900002,
+                    "id_string": "900002",
+                    "contract": "BTC_USDT",
+                    "size": 10,
+                    "left": 0,
+                    "price": "59000.0",
+                    "tif": "gtc",
+                    "status": "finished",
+                    "finish_as": "filled",
+                    "text": f"t-{order.client_order_id.value}",
+                    "create_time": just_now,
+                },
+            ]
+            if kwargs.get("status") == "finished"
+            else []
+        )
+
+        report = env.run(
+            env.client.generate_order_status_report(
+                _single_report_command(PERP_BTC_USDT, order),
+            ),
+        )
+
+        assert report is not None
+        assert report.venue_order_id == VenueOrderId("900002")
+        assert report.order_status == OrderStatus.FILLED
+
+    def test_a_foreign_answer_is_not_adopted(self, perp_env):
+        """The identity is checked, not assumed, before the report is handed on.
+
+        This report is about to become the venue's statement on an in-flight
+        order; adopting the wrong venue order id for it would address every later
+        cancel and amend to somebody else's order.
+        """
+        env = perp_env
+        order = _in_flight(env, PERP_BTC_USDT, Quantity.from_int(10))
+        env.perp.responses["get_order"] = {
+            "id": 999999,
+            "id_string": "999999",
+            "contract": "BTC_USDT",
+            "size": 10,
+            "left": 10,
+            "price": "59000.0",
+            "tif": "gtc",
+            "status": "open",
+            "text": "t-SOMEBODY-ELSE",
+            "create_time": INSIDE_SECS,
+        }
+
+        report = env.run(
+            env.client.generate_order_status_report(
+                _single_report_command(PERP_BTC_USDT, order),
+            ),
+        )
+
+        assert report is None
+        assert order.venue_order_id is None
+
+    def test_an_order_the_venue_never_took_is_still_reported_missing(self, perp_env):
+        """Nothing is invented for an order Gate.io does not hold."""
+        env = perp_env
+        order = _in_flight(env, PERP_BTC_USDT, Quantity.from_int(10))
+
+        report = env.run(
+            env.client.generate_order_status_report(
+                _single_report_command(PERP_BTC_USDT, order),
+            ),
+        )
+
+        assert report is None
+
+    def test_neither_identifier_is_a_caller_error(self, perp_env):
+        """The platform documents this as a ``ValueError``, not as "not found"."""
+        env = perp_env
+        with pytest.raises(ValueError, match="were `None`"):
+            env.run(
+                env.client.generate_order_status_report(
+                    GenerateOrderStatusReport(
+                        instrument_id=PERP_BTC_USDT,
+                        client_order_id=None,
+                        venue_order_id=None,
+                        command_id=UUID4(),
+                        ts_init=0,
+                    ),
+                ),
+            )
+
+
+# -- the report of an order a trigger of ours fired ---------------------------
+
+
+def _fired_stop_limit(env: ExecHarness, *, apply_triggered: bool) -> Any:
+    """Arm a perpetual STOP_LIMIT at ``777`` and fire it onto order ``900001``."""
+    order = env.order_factory.stop_limit(
+        PERP_BTC_USDT,
+        OrderSide.SELL,
+        Quantity.from_int(10),
+        Price.from_str("59000.0"),
+        Price.from_str("59500.0"),
+    )
+    env.accepted(order, "777")
+    if apply_triggered:
+        # Driven through the client's own rebase, which is the only sequence
+        # `Order.apply` accepts: `OrderUpdated` carries the new venue order id,
+        # `OrderTriggered` follows it.
+        env.client._register_trigger_link(GateioProductType.PERP, "777", order.client_order_id)
+        env.client._maybe_swap_trigger_venue_order_id(
+            order,
+            VenueOrderId("900001"),
+            env.clock.timestamp_ns(),
+        )
+        env.drain(order)
+        assert order.status == OrderStatus.TRIGGERED
+    else:
+        # The trigger fired while this client was down: the venue knows, the
+        # local order does not.
+        env.client._register_trigger_link(
+            GateioProductType.PERP,
+            "777",
+            order.client_order_id,
+            fired_id="900001",
+        )
+    return order
+
+
+FIRED_ORDER_PAYLOAD: dict[str, Any] = {
+    "id": 900001,
+    "id_string": "900001",
+    "contract": "BTC_USDT",
+    "size": -10,
+    "left": 10,
+    "price": "59000.0",
+    "tif": "gtc",
+    "status": "open",
+    "create_time": INSIDE_SECS,
+}
+
+
+class TestFiredConditionalOrderReports:
+    """The order a trigger created is still the conditional order, and reads so.
+
+    Gate.io keeps the trigger on the armed price order and none of it on the
+    order that fires, so the venue's own statement about the fired object is
+    "an accepted limit order with no trigger". Reported that way it collides with
+    the local order twice on every reconciliation pass: the engine tries
+    ``TRIGGERED -> ACCEPTED``, which the state table refuses, and ``_should_update``
+    (live/execution_engine.py:3307-3318) sees ``None`` where the order has a
+    trigger price and publishes an ``OrderUpdated`` for an amendment nobody made.
+    """
+
+    def test_a_resting_fired_order_reports_triggered(self, perp_env):
+        env = perp_env
+        order = _fired_stop_limit(env, apply_triggered=True)
+
+        report = env.client._parse_order_status_report(
+            GateioProductType.PERP,
+            FIRED_ORDER_PAYLOAD,
+            env.instruments[1],
+        )
+
+        assert report is not None
+        assert report.order_status == OrderStatus.TRIGGERED
+        # `_should_update` reads exactly these three for a STOP_LIMIT; all three
+        # must match, or a phantom amendment is published on every pass.
+        assert report.trigger_price == order.trigger_price
+        assert report.price == order.price
+        assert report.quantity == order.quantity
+        # The trigger is already on the order, so restating it would only be
+        # dropped by the FSM.
+        assert report.ts_triggered == 0
+
+    def test_accepted_would_be_refused_by_the_state_table(self, perp_env):
+        """Why TRIGGERED and not ACCEPTED, proved against the installed FSM."""
+        from nautilus_trader.core.fsm import InvalidStateTrigger
+        from nautilus_trader.model.events import OrderAccepted
+
+        env = perp_env
+        order = _fired_stop_limit(env, apply_triggered=True)
+
+        with pytest.raises(InvalidStateTrigger):
+            order.apply(
+                OrderAccepted(
+                    trader_id=order.trader_id,
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=VenueOrderId("900001"),
+                    account_id=env.client.account_id,
+                    event_id=UUID4(),
+                    ts_event=0,
+                    ts_init=0,
+                ),
+            )
+
+    def test_a_trigger_missed_while_down_is_carried_on_the_report(self, perp_env):
+        """``ts_triggered`` is how the engine recovers an ``OrderTriggered`` it missed."""
+        env = perp_env
+        _fired_stop_limit(env, apply_triggered=False)
+
+        report = env.client._parse_order_status_report(
+            GateioProductType.PERP,
+            dict(FIRED_ORDER_PAYLOAD, status="finished", finish_as="cancelled", left=10),
+            env.instruments[1],
+        )
+
+        assert report is not None
+        assert report.order_status == OrderStatus.CANCELED
+        # The engine gates the recovered `OrderTriggered` on this being non-zero
+        # (live/execution_engine.py:3281).
+        assert report.ts_triggered > 0
+
+    def test_an_unrelated_order_carries_no_trigger(self, perp_env):
+        env = perp_env
+        _fired_stop_limit(env, apply_triggered=True)
+
+        report = env.client._parse_order_status_report(
+            GateioProductType.PERP,
+            dict(FIRED_ORDER_PAYLOAD, id=123456, id_string="123456"),
+            env.instruments[1],
+        )
+
+        assert report is not None
+        assert report.trigger_price is None
+        assert report.order_status == OrderStatus.ACCEPTED
+        assert report.ts_triggered == 0
+
+
 # -- fixtures -----------------------------------------------------------------
 
 
@@ -752,6 +1166,67 @@ def perp_env():
     env = ExecHarness(products=(GateioProductType.PERP,))
     yield env
     env.close()
+
+
+@pytest.fixture()
+def delivery_env():
+    env = ExecHarness(products=(GateioProductType.FUT,))
+    yield env
+    env.close()
+
+
+@pytest.fixture()
+def options_env():
+    env = ExecHarness(products=(GateioProductType.OPT,))
+    yield env
+    env.close()
+
+
+async def _drain_tasks(env: ExecHarness) -> None:
+    """Await the tasks the client's own fire-and-forget entry points create."""
+    import asyncio
+
+    pending = [task for task in asyncio.all_tasks(env.loop) if task is not asyncio.current_task()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def test_fill_reports_honour_the_venue_order_id_filter(perp_env):
+    """Asked about one order, the client must not answer with every fill.
+
+    ``GenerateFillReports.venue_order_id`` (installed
+    execution/messages.pyx:338-382) narrows the answer to a single order, and a
+    caller that groups the answer under that order's status report — which is
+    what ``ExecutionMassStatus`` does, keying trades by venue order id — would
+    otherwise attach executions Gate.io booked against other orders.
+    """
+    env = perp_env
+    mine = _futures_fills(1, create_time=INSIDE_SECS + 1)[0]
+    mine["id"] = "T-mine"
+    mine["order_id"] = "900001"
+    other = _futures_fills(1, create_time=INSIDE_SECS + 2)[0]
+    other["id"] = "T-other"
+    other["order_id"] = "900002"
+    env.perp.responses["my_trades"] = lambda **kwargs: (
+        [mine, other] if kwargs.get("offset", 0) == 0 else []
+    )
+
+    reports = env.run(
+        env.client.generate_fill_reports(
+            GenerateFillReports(
+                instrument_id=None,
+                venue_order_id=VenueOrderId("900001"),
+                start=WINDOW_START,
+                end=WINDOW_END,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        ),
+    )
+
+    assert [report.trade_id.value for report in reports] == ["T-mine"]
+    # Gate.io narrows this server-side, so the whole window is not walked either.
+    assert [call.kwargs.get("order") for call in env.perp.calls_named("my_trades")] == ["900001"]
 
 
 def test_fill_reports_are_sorted_for_replay(perp_env):
