@@ -1212,16 +1212,31 @@ def test_an_index_price_keeps_the_venue_scale(harness: Harness) -> None:
 
 
 def test_an_unparseable_reference_price_is_not_published_as_zero(harness: Harness) -> None:
-    _install_perp(harness)
-    harness.client._ticker_subs[PERP_ID] = {"mark", "index"}
+    """Regression: an unusable field used to take the rest of the message with it.
+
+    Asserting only that no mark or index is published proves nothing — the old
+    code published neither either. What it did instead was raise out of
+    ``make_price``, and since the ticker carries all three derivative types in one
+    message, the funding rate beside the bad field was lost with it. So the damage
+    to assert is the funding update, not the absent price.
+    """
+    _install_perp(harness, funding_interval=28_800, funding_next_apply=1_784_995_200)
+    harness.client._ticker_subs[PERP_ID] = {"mark", "index", "funding"}
 
     harness.client._handle_ws_message(
         GateioProductType.PERP,
-        _futures_ticker(1_784_995_205_000, mark_price="", index_price="n/a"),
+        _futures_ticker(
+            1_784_995_205_000,
+            mark_price="",
+            index_price="n/a",
+            funding_rate="0.0001",
+        ),
     )
 
     assert _marks(harness) == []
     assert _indexes(harness) == []
+    (funding,) = _fundings(harness)
+    assert funding.rate == Decimal("0.0001")
 
 
 @pytest.mark.parametrize(
