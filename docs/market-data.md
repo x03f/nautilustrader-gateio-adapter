@@ -45,6 +45,7 @@ against the live venue.** The statuses below therefore mean:
 | Bars from the candlestick streams | implemented and mock-tested |
 | Historical bars and trades over REST | implemented, mainnet validation pending |
 | Mark price, index price, funding rate | implemented, mainnet validation pending |
+| Historical funding rates over REST | implemented, mainnet validation pending |
 | Book resynchronisation after a reconnect | implemented, mainnet validation pending |
 | `OrderBookDepth10` subscriptions | unsupported |
 | The periodic `*.order_book` snapshot channel | unsupported by the data client |
@@ -110,22 +111,31 @@ Which instruments exist per product, and what a `Quantity` means on each, is in
 | `subscribe_quote_ticks` | `{spot,futures,options}.book_ticker` | all |
 | `subscribe_order_book_deltas` | REST snapshot plus `*.order_book_update`, sequence-validated | all |
 | `subscribe_bars` | `*.candlesticks`, closed bars only | all |
-| `subscribe_mark_prices` | `futures.tickers`, `mark_price` field | perpetual, inverse, delivery |
-| `subscribe_index_prices` | `futures.tickers`, `index_price` field | perpetual, inverse, delivery |
+| `subscribe_mark_prices` | `futures.tickers` / `options.contract_tickers`, `mark_price` field | perpetual, inverse, delivery, options |
+| `subscribe_index_prices` | `futures.tickers` / `options.contract_tickers`, `index_price` field | perpetual, inverse, delivery, options |
 | `subscribe_funding_rates` | `futures.tickers`, `funding_rate` field | perpetual, inverse |
 | `subscribe_instruments` / `subscribe_instrument` | REST, refreshed by the reload task | all |
 
-`subscribe_order_book_depth` (`OrderBookDepth10`) is not implemented. The
-NautilusTrader base implementation raises `NotImplementedError`, which the live
-client reports as a failed subscription task — the subscription fails visibly
-rather than sitting there delivering nothing.
+`subscribe_order_book_depth` (`OrderBookDepth10`) is not implemented, and the
+failure is **not** clean. `LiveMarketDataClient.subscribe_order_book_depth`
+records the subscription *before* it starts the task that raises
+`NotImplementedError`, so a caller gets both: one exception in the log, and a
+subscription the client then reports as held for the rest of its life.
+`subscribed_order_book_depth()` lists the instrument, and because
+`DataEngine._handle_subscribe_order_book` skips any instrument already in that
+list, the subscription is never retried and no second message is ever logged.
+Read the log line, not the subscription list. (Verified against the installed
+NautilusTrader 1.230.0; the same ordering applies to every unimplemented
+`subscribe_*` hook on that class, including `subscribe_option_greeks` and
+`subscribe_instrument_status`.)
 
 ## Requests
 
 | Nautilus request | Gate.io source | Behaviour |
 |---|---|---|
-| `request_bars` | REST `*/candlesticks` | Paginated at 1000 rows per call; buckets that have not closed yet are dropped; rows are keyed by open time so overlapping pages collapse; results sorted oldest-first and trimmed to `limit` |
+| `request_bars` | REST `*/candlesticks` | Paginated at 1000 rows per call; buckets that have not closed yet are dropped; rows are keyed by open time so overlapping pages collapse; a row the platform rejects is dropped and counted rather than failing the request; results sorted oldest-first and trimmed to `limit` |
 | `request_trade_ticks` | REST `*/trades` | At most 1000 rows, filtered client-side to the `start`/`end` window (see the caveat below) |
+| `request_funding_rates` | REST `/futures/{settle}/funding_rate` | Perpetual only; at most 1000 records, filtered client-side to the `start`/`end` window; sorted oldest-first |
 | `request_order_book_snapshot` | REST `*/order_book` | Depth clamped to a value the product accepts; published as one `F_SNAPSHOT` batch |
 | `request_instrument` / `request_instruments` | Instrument provider | Loads on demand if not already cached |
 
@@ -202,9 +212,37 @@ message. Gate.io may also push a `full: true` message on the incremental channel
 that is itself a complete snapshot of the subscribed depth and resynchronises the
 book without a REST call.
 
+A `full` push is placed in the stream on the same terms as a REST snapshot,
+because the venue documents it as re-pushable at any time:
+
+* one whose `u` is not newer than the local update id describes depth the stream
+  has already replaced. It is discarded and counted in `snapshots_stale`, and
+  nothing is republished — the book is already correct;
+* one carrying no `u` at all cannot be placed in the stream. Keeping the previous
+  id would leave the book holding one state while claiming another, so every
+  later notification would be measured against the wrong expectation. It raises
+  `OrderBookSequenceError` and the book is rebuilt from REST.
+
 `SnapshotStaleError` is deliberately not a subclass of `OrderBookSequenceError`.
 A stale snapshot is not a sequence break: the book is still correct and the caller
 has nothing to do, whereas a sequence break requires a rebuild.
+
+#### Depth beyond the subscribed window
+
+The incremental channel takes a depth `level`, which the venue describes as the
+"optional depth level interested. Only updates within are notified". Whether a
+price level that falls out of the top-N window because a better level appeared is
+reported as removed is not stated anywhere in the venue's documentation, and this
+adapter does not assume an answer: it neither trims the local book to N levels —
+that would drop depth the venue may still be maintaining — nor claims the book is
+bounded. If the venue does prune, the book stays at N levels by itself; if it does
+not, levels below the window survive carrying the last size the venue confirmed
+for them, and a snapshot batch republishes them.
+
+One line of a live session settles it: compare `GateioOrderBook.depth` for a busy
+instrument against the configured level after a few minutes. Until that
+observation exists, treat depth far from the touch as indicative on a long-lived
+subscription.
 
 ### Gap detection and resynchronisation
 
@@ -376,25 +414,66 @@ Volume follows the venue's own accounting: on spot the base-currency amount
 (field `a`, not the quote-currency turnover in `v`), and on every contract product
 the contract count in `v`.
 
+**A candle the platform rejects is dropped, not fatal.** NautilusTrader enforces
+the OHLC invariants in the `Bar` constructor — `high` at least `open`, `low` and
+`close`; `low` at most `open` and `close` — and illiquid delivery and option
+candles do occasionally violate them. Such a row is dropped and counted in the
+`candles_dropped` health counter; a historical request logs one warning naming
+how many rows it lost and answers with the rest. It does not fail the request,
+because a request that answers with nothing is indistinguishable from a venue
+with no history, and the documented request-then-subscribe pattern subscribes
+from inside that response's callback.
+
 ## Mark price, index price and funding rate
 
-All three are fields of the `futures.tickers` stream, so one venue subscription
-serves any combination of them. The client reference-counts the subscribers and
-unsubscribes from the venue channel only when the last one goes away, so cancelling
-mark prices does not silently stop funding rates.
+These are Nautilus `MarkPriceUpdate`, `IndexPriceUpdate` and `FundingRateUpdate`.
+Gate.io has no dedicated channel for any of them: they are fields of the ticker
+stream — `futures.tickers` on the three futures products, `options.contract_tickers`
+on options — so one venue subscription serves any combination. The client
+reference-counts the subscribers and unsubscribes from the venue channel only when
+the last one goes away, so cancelling mark prices does not silently stop funding
+rates.
 
-Funding rates exist for perpetuals only. A delivery contract converges on its
-settlement price instead of paying funding and reports a basis in that field, so a
-funding subscription for one is refused rather than accepted and left silent.
-Where the contract definition provides them, the funding interval and the next
-funding time are attached to each update.
+**Products.** Mark and index prices exist for every derivative: the three futures
+products and options. Funding is perpetual-only — a delivery contract converges on
+its settlement price and reports a basis in that field, and an option has no
+funding leg at all, so a funding subscription for either is refused rather than
+accepted and left silent. On spot all three are refused: the spot ticker is
+24-hour trade statistics and carries none of them.
 
-On spot these three are not applicable and the subscription is refused. On options
-it is refused as well, because the client reads only `futures.tickers`. Gate.io
-does publish per-contract mark and index prices for options on
-`options.contract_tickers` and through `GET /options/tickers`, alongside the
-implied volatilities and the greeks; both are reachable through the transport and
-the REST namespaces, but neither is mapped into these Nautilus data types.
+**Scale.** A mark or index price is published on the scale the venue published it
+with, not rounded onto the instrument's order tick. Gate.io states two independent
+minimum units, `order_price_round` and `mark_price_round`, and they differ on real
+contracts: the BTC_USDT perpetual quotes orders in 0.1 and marks in 0.01, and the
+BTC_USDT options quote orders in 1 and mark in 0.1, where quantising would publish
+a mark of 5797.7 as 5798. `mark_price_round` acts as a floor on the precision so
+the scale does not wobble when a value happens to end in a zero. A field the venue
+sends empty or unparseable produces no update at all rather than a zero.
+
+**Next funding time.** `FundingRateUpdate.next_funding_ns` is derived, and this is
+worth knowing before trading on it. The ticker carries no next-funding timestamp;
+the only source is `funding_next_apply` on the contract definition, which the
+instrument reload task refreshes every `update_instruments_interval_mins`
+(60 minutes by default) while the ticker pushes about once a second. Published
+verbatim it would name a settlement that has already happened for up to a whole
+refresh interval. Instead the cached value is treated as what it is — an exact
+point on the venue's funding grid — and rolled forward by whole `funding_interval`
+steps to the first settlement after the update's own timestamp. Where the contract
+publishes no `funding_interval` there is nothing to roll it forward with, and the
+field is omitted rather than sent wrong. `interval` is attached whenever the
+contract states one.
+
+`request_funding_rates` answers from `GET /futures/{settle}/funding_rate`, whose
+records carry only an application timestamp and a rate. Those updates therefore
+carry `interval` — a property of the contract — but no `next_funding_ns`, since
+the endpoint publishes nothing about the next application.
+
+**Not published from these channels.** `options.contract_tickers` also carries
+`mark_iv`, `bid_iv`, `ask_iv` and the full greek set, and Gate.io serves the same
+fields from `GET /options/tickers`. They are reachable through the transport and
+the REST namespaces but are not yet mapped onto the platform's `OptionGreeks`
+type, so `subscribe_option_greeks` is unimplemented — see the note under
+[Subscriptions](#subscriptions) for what an unimplemented subscribe hook does.
 
 ## Reconnection and resubscription
 
@@ -437,9 +516,9 @@ What is deduplicated, and what is not, is worth stating precisely:
 `GateioDataClient.metrics()` returns cumulative counters. Per product:
 `reconnects`, `gaps`, `resyncs`, `snapshot_retries`, `snapshot_errors` and
 `messages`. Alongside them: `published` counted per data type (including the
-skip counters named above), `book_gaps` per instrument, how many local books
-exist and how many of them are currently synchronised, and the underlying
-connection statistics for each socket.
+skip counters named above), `candles_dropped` per bar type, `book_gaps` per
+instrument, how many local books exist and how many of them are currently
+synchronised, and the underlying connection statistics for each socket.
 
 The distinction that matters when reading them: `gaps` counts sequence breaks in a
 live stream, each of which forces a resync and means data was genuinely lost.

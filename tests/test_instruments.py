@@ -789,3 +789,96 @@ class TestMalformedPayloads:
 
         with pytest.raises(ValueError, match="unknown product"):
             parse_instrument(spot_payload, unknown)  # type: ignore[arg-type]
+
+
+# -- a number that decides money is never substituted --------------------------
+
+
+class TestOptionalNotionalBounds:
+    """``max_notional`` / ``min_notional`` are optional; losing the pair is not."""
+
+    def test_notional_bound_that_rounds_to_zero_is_dropped_not_fatal(self, spot_payload):
+        """A quote currency coarser than the bound used to discard the whole pair.
+
+        ``Money`` is built at the quote currency's precision, and the platform's
+        ``Instrument`` constructor requires a positive ``max_notional``; a bound
+        that floors to zero therefore raised inside the constructor and the
+        blanket handler turned an optional field into a lost instrument. The size
+        bounds have refused that trade since they were written.
+        """
+        payload = {**spot_payload, "quote": "JPY", "max_quote_amount": "0.4"}
+
+        instrument = parse_spot_instrument(payload)
+
+        assert instrument is not None
+        assert instrument.max_notional is None
+        assert instrument.quote_currency.code == "JPY"
+
+    def test_a_usable_notional_bound_is_still_carried(self, spot_payload):
+        instrument = parse_spot_instrument(spot_payload)
+
+        assert instrument.min_notional is not None
+        assert instrument.min_notional.currency.code == "USDT"
+
+
+class TestRatesAreNeverAssumed:
+    """A missing rate is refused, because zero is a claim about money.
+
+    ``margin_maint`` feeds ``MarginAccount``'s maintenance margin and the fee
+    rates feed ``Account.calculate_commission``; substituting zero states that a
+    position needs no margin and that trading is free, and neither is
+    distinguishable afterwards from a rate the venue really published.
+    """
+
+    def test_contract_without_a_maintenance_rate_is_refused(self, perp_payload):
+        payload = {k: v for k, v in perp_payload.items() if k != "maintenance_rate"}
+
+        assert parse_perpetual_instrument(payload, GateioProductType.PERP) is None
+
+    def test_delivery_contract_without_a_maintenance_rate_is_refused(self, delivery_payload):
+        payload = {k: v for k, v in delivery_payload.items() if k != "maintenance_rate"}
+
+        assert parse_delivery_instrument(payload) is None
+
+    @pytest.mark.parametrize("field", ["maker_fee_rate", "taker_fee_rate"])
+    def test_contract_without_a_fee_rate_is_refused(self, perp_payload, field):
+        payload = {k: v for k, v in perp_payload.items() if k != field}
+
+        assert parse_perpetual_instrument(payload, GateioProductType.PERP) is None
+
+    @pytest.mark.parametrize("field", ["maker_fee_rate", "taker_fee_rate"])
+    def test_option_without_a_fee_rate_is_refused(self, option_payload, field):
+        payload = {k: v for k, v in option_payload.items() if k != field}
+
+        assert parse_option_instrument(payload) is None
+
+    def test_unparseable_rate_is_refused_rather_than_read_as_zero(self, perp_payload):
+        payload = {**perp_payload, "maintenance_rate": "n/a"}
+
+        assert parse_perpetual_instrument(payload, GateioProductType.PERP) is None
+
+    def test_spot_pair_without_a_fee_and_without_an_account_tier_is_refused(self, spot_payload):
+        payload = {k: v for k, v in spot_payload.items() if k != "fee"}
+
+        assert parse_spot_instrument(payload) is None
+
+    def test_spot_pair_without_a_fee_still_loads_on_the_account_tier(self, spot_payload):
+        payload = {k: v for k, v in spot_payload.items() if k != "fee"}
+
+        instrument = parse_spot_instrument(
+            payload,
+            fee_maker=Decimal("0.00098"),
+            fee_taker=Decimal("0.00098"),
+        )
+
+        assert instrument is not None
+        assert instrument.maker_fee == Decimal("0.00098")
+
+    def test_a_negative_maker_fee_is_carried_through(self, perp_payload):
+        """Every Gate.io perpetual rebates the maker; the sign is meaningful."""
+        instrument = parse_perpetual_instrument(
+            {**perp_payload, "maker_fee_rate": "-0.0001"},
+            GateioProductType.PERP,
+        )
+
+        assert instrument.maker_fee == Decimal("-0.0001")

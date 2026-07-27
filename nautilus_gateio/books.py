@@ -19,9 +19,25 @@ documented synchronisation algorithm is:
    discarded rather than applied, so a slow REST response cannot roll a book
    that has meanwhile resynced itself backwards.
 
+Spot and perpetual streams may also push a ``full: true`` message, which *is* a
+complete snapshot of the subscribed depth. The venue documents it as re-pushable
+at any time, so it is placed in the stream the same way a REST snapshot is: one
+that is not newer than the local state is superseded depth and is discarded, and
+one carrying no update id cannot be placed at all and is a sequence break.
+
 Level amounts are absolute, not deltas: a level with size ``0`` is a deletion.
 Messages with empty ``a``/``b`` arrays still advance the update id and must not
 be skipped.
+
+One thing this module deliberately does **not** do is bound the book to the
+subscribed depth. The venue describes the channel's ``level`` parameter as
+"optional depth level interested, only updates within are notified", which leaves
+open whether a price level that falls out of the top-N window because a better
+level appeared is reported as removed. If it is, the book stays at N levels by
+itself; if it is not, levels below the window survive carrying the last size the
+venue confirmed for them. Trimming would answer the question the other way and
+drop depth the venue may still be maintaining, so neither reading is assumed
+here — :attr:`GateioOrderBook.depth` is what an operator watches to settle it.
 
 This module is deliberately free of any framework dependency — it deals in
 :class:`~decimal.Decimal` prices and sizes only, so it can be unit tested
@@ -211,7 +227,12 @@ class GateioOrderBook:
 
     @property
     def snapshots_stale(self) -> int:
-        """REST snapshots rejected as older than the state the book already held."""
+        """Snapshots rejected as older than the state the book already held.
+
+        Counts both REST snapshots (which raise :class:`SnapshotStaleError`) and
+        superseded ``full`` pushes (which are discarded silently, because the
+        stream needs nothing from the caller).
+        """
         return self._snapshots_stale
 
     @property
@@ -392,14 +413,17 @@ class GateioOrderBook:
         self._buffer.clear()
         changes: list[BookChange] = []
         for index, result in enumerate(buffered):
-            if result.get("full") is True:
-                changes.extend(self._apply_full(result))
-                continue
-            last_id = _int_or_none(result.get("u"))
-            if last_id is not None and last_id <= self._last_update_id:
-                self._updates_dropped += 1
-                continue
             try:
+                if result.get("full") is True:
+                    # Unreachable through `apply_update`, which handles a full
+                    # push before it ever buffers; kept so that a future caller
+                    # feeding the buffer directly cannot skip the sequencing.
+                    changes.extend(self._apply_full(result))
+                    continue
+                last_id = _int_or_none(result.get("u"))
+                if last_id is not None and last_id <= self._last_update_id:
+                    self._updates_dropped += 1
+                    continue
                 changes.extend(self._apply_incremental(result))
             except OrderBookSequenceError:
                 self._buffer.extend(buffered[index:])
@@ -407,7 +431,40 @@ class GateioOrderBook:
         return changes
 
     def _apply_full(self, result: dict[str, Any]) -> list[BookChange]:
-        """Replace both sides wholesale, reporting the transition as changes."""
+        """Replace both sides wholesale, reporting the transition as changes.
+
+        Raises
+        ------
+        OrderBookSequenceError
+            If the message carries no update id. The depth is real, but without
+            an id it cannot be placed in the stream: keeping the previous id
+            would leave the book holding one state while claiming another, so
+            every later notification is measured against the wrong expectation
+            and is either discarded as old or reported as a gap — with the local
+            book already wrong in between. A resnapshot is the only way back to a
+            known position, and only the caller can order one.
+        """
+        last_id = _int_or_none(result.get("u"))
+        if last_id is None:
+            self._gaps_detected += 1
+            self._synced = False
+            raise OrderBookSequenceError(
+                f"full order book push for {self.symbol!r} carries no update id 'u'; "
+                f"the book cannot be placed in the stream and must be resnapshotted"
+            )
+
+        if self._synced and last_id <= self._last_update_id:
+            # Gate.io documents that a full snapshot may be re-pushed at any
+            # time. One that is not newer than the local state describes depth
+            # the stream has already replaced; applying it would roll the book
+            # backwards and, because callers republish on
+            # `last_apply_was_snapshot`, send that superseded depth downstream as
+            # a fresh snapshot. Same reasoning as `SnapshotStaleError` on the
+            # REST path (step 7 of the module docstring), but the caller has
+            # nothing to do about it, so it is counted rather than raised.
+            self._snapshots_stale += 1
+            return []
+
         bids = {price: size for price, size in _parse_levels(result.get("b")) if size > _ZERO}
         asks = {price: size for price, size in _parse_levels(result.get("a")) if size > _ZERO}
 
@@ -422,9 +479,7 @@ class GateioOrderBook:
 
         self._bids = bids
         self._asks = asks
-        last_id = _int_or_none(result.get("u"))
-        if last_id is not None:
-            self._last_update_id = last_id
+        self._last_update_id = last_id
         self._last_update_ms = _normalise_ms(result.get("t"))
         self._synced = True
         self._snapshots_applied += 1

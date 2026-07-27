@@ -19,10 +19,26 @@ Nautilus subscription                   Gate.io source
 ``_subscribe_quote_ticks``              ``{spot,futures,options}.book_ticker``
 ``_subscribe_order_book_deltas``        REST snapshot + ``*.order_book_update``
 ``_subscribe_bars``                     ``*.candlesticks`` (closed bars only)
-``_subscribe_mark_prices``              ``futures.tickers.mark_price``
-``_subscribe_index_prices``             ``futures.tickers.index_price``
+``_subscribe_mark_prices``              ``<ticker channel>.mark_price``
+``_subscribe_index_prices``             ``<ticker channel>.index_price``
 ``_subscribe_funding_rates``            ``futures.tickers.funding_rate``
+``_request_funding_rates``              ``GET /futures/{settle}/funding_rate``
 ======================================  =======================================
+
+Reference prices
+----------------
+The ticker channel above is ``futures.tickers`` on the three futures products
+and ``options.contract_tickers`` on options (:func:`.public.tickers_channel`);
+Gate.io has no dedicated mark, index or funding channel, so one venue
+subscription serves whichever of the three a client asked for.
+
+Mark and index prices are not order prices, so they are published on the scale
+Gate.io published them with rather than rounded onto the instrument's order
+tick; see :func:`venue_price`. Funding is perpetual-only, and its next
+application time is derived from the venue's funding grid rather than served
+from the cached contract definition, which the instrument reload task refreshes
+far more slowly than funding settles; see
+:meth:`GateioDataClient._next_funding_ns`.
 
 Gate.io publishes no instrument definition channel, so instruments are refreshed
 by a polling task (``update_instruments_interval_mins``), following the same
@@ -55,6 +71,7 @@ from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.data.messages import (
     RequestBars,
+    RequestFundingRates,
     RequestInstrument,
     RequestInstruments,
     RequestOrderBookSnapshot,
@@ -104,7 +121,7 @@ from nautilus_trader.model.enums import (
 )
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, TradeId
 from nautilus_trader.model.instruments import Instrument
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.objects import FIXED_PRECISION, Price, Quantity
 
 from nautilus_gateio.books import (
     BID,
@@ -120,6 +137,7 @@ from nautilus_gateio.common.constants import (
 from nautilus_gateio.common.enums import GateioProductType
 from nautilus_gateio.common.errors import GateioError
 from nautilus_gateio.common.parsing import (
+    precision_from_increment,
     timestamp_to_nanos,
     to_decimal,
     to_float,
@@ -145,6 +163,7 @@ from nautilus_gateio.websocket.public import (
     BOOK_LEVELS,
     GateioPublicWebSocket,
     nearest_snapshot_limit,
+    tickers_channel,
 )
 
 #: Maximum rows Gate.io returns from one candlestick or trade request.
@@ -224,6 +243,62 @@ def venue_quantity(value: Any, precision: int) -> Quantity:
     except ArithmeticError:  # pragma: no cover - implausibly large venue size
         truncated = parsed
     return Quantity(truncated, precision)
+
+
+def venue_price(value: Any, floor_precision: int = 0) -> Price | None:
+    """Convert a Gate.io reference price to a ``Price`` at the venue's own scale.
+
+    Mark and index prices are not order prices. They do not sit on the
+    instrument's order tick, and Gate.io says so explicitly by publishing a
+    separate ``mark_price_round`` ("minimum unit of mark price") alongside
+    ``order_price_round``: the BTC_USDT perpetual quotes orders in 0.1 and marks
+    in 0.01, and the BTC_USDT options quote orders in 1 and marks in 0.1. Passing
+    such a value through ``Instrument.make_price`` rounds a number the venue
+    published onto a grid it does not live on — an option marked 5797.7 would be
+    published as 5798.
+
+    So the precision comes from the venue's own value, raised to
+    ``floor_precision`` where the contract states a finer grid, so the scale
+    stays constant between updates instead of shrinking on a value that happens
+    to end in a zero. This is also what the reference Python adapter does:
+    ``adapters/binance/futures/schemas/market.py`` builds mark, index and
+    estimated-settlement prices with ``Price.from_str`` on the venue string
+    rather than through the instrument.
+
+    Returns ``None`` when the field is absent, unparseable or outside what a
+    ``Price`` can hold; callers must treat that as "not published" rather than
+    publish a zero, which would be a reference price no participant ever saw.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        number = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if not number.is_finite():
+        return None
+    # A positive exponent (``1E+3``) means no fractional digits at all.
+    precision = max(-int(number.as_tuple().exponent), floor_precision, 0)
+    # Only reachable on a standard-precision wheel, whose FIXED_PRECISION is 9
+    # against the 16 of the high-precision build. Rounding is then the only
+    # option left and it is done once here rather than at each call site.
+    precision = min(precision, FIXED_PRECISION)
+    try:
+        return Price(number, precision)
+    except (ValueError, OverflowError):  # pragma: no cover - implausible magnitude
+        return None
+
+
+def _mark_price_precision(instrument: Instrument) -> int:
+    """Return the decimal scale Gate.io publishes ``instrument``'s mark price on.
+
+    ``mark_price_round`` is the contract's documented "minimum unit of mark
+    price" and is independent of ``order_price_round``. Contracts that do not
+    publish it yield ``0``, which leaves :func:`venue_price` on the scale of the
+    value itself.
+    """
+    info = instrument.info or {}
+    return precision_from_increment(info.get("mark_price_round"))
 
 
 def bar_type_to_interval(bar_type: BarType) -> str:
@@ -337,6 +412,7 @@ class GateioDataClient(LiveMarketDataClient):
         self._bar_types: dict[tuple[GateioProductType, str], BarType] = {}
         self._bar_pending: dict[BarType, _PendingBar] = {}
         self._bar_published: dict[BarType, int] = {}
+        self._dropped_candles: dict[BarType, int] = defaultdict(int)
         self._ticker_subs: dict[InstrumentId, set[str]] = defaultdict(set)
         self._update_instruments_task: asyncio.Task | None = None
         self._bar_flush_task: asyncio.Task | None = None
@@ -397,6 +473,9 @@ class GateioDataClient(LiveMarketDataClient):
             "snapshot_errors": dict(self._snapshot_errors),
             "messages": dict(self._messages),
             "published": dict(self._published),
+            "candles_dropped": {
+                str(bar_type): count for bar_type, count in self._dropped_candles.items() if count
+            },
             "book_gaps": book_gaps,
             "books": len(self._books),
             "books_synced": sum(1 for book in self._books.values() if book.is_synced),
@@ -757,24 +836,34 @@ class GateioDataClient(LiveMarketDataClient):
         except (GateioError, ValueError) as e:
             self._log.error(f"Cannot unsubscribe from {bar_type}: {e}")
 
-    # -- futures ticker derived streams ------------------------------------
+    # -- ticker-derived derivative streams ---------------------------------
 
     async def _subscribe_ticker_stream(self, instrument_id: InstrumentId, kind: str) -> None:
-        """Subscribe ``futures.tickers``, which carries mark, index and funding."""
+        """Subscribe the ticker channel, which carries mark, index and funding.
+
+        On futures that is ``futures.tickers``; on options it is
+        ``options.contract_tickers``, which publishes ``mark_price`` and
+        ``index_price`` per contract. Gate.io has no dedicated channel for any of
+        the three, so one venue subscription serves every combination of them and
+        the subscribers are reference counted per instrument.
+        """
         resolved = self._resolve(instrument_id)
         if resolved is None:
             return
         product, raw_symbol = resolved
-        if not product.is_futures:
+        if product.is_spot:
+            # A spot pair has no mark price, no index and no funding: the spot
+            # ticker is 24-hour trade statistics and nothing else.
             self._log.error(
                 f"Cannot subscribe to {kind} prices for {instrument_id}: Gate.io publishes "
-                f"them for futures products only",
+                f"them for derivative products only",
             )
             return
         if kind == _FUNDING and not product.is_perpetual:
             # A delivery contract converges on its settlement price instead of
             # paying funding, and its ticker reports a basis rather than a
-            # funding rate, so the subscription would never produce data.
+            # funding rate; an option is a premium with no funding leg at all.
+            # Either subscription would never produce data.
             self._log.error(
                 f"Cannot subscribe to funding rates for {instrument_id}: only perpetual "
                 f"contracts pay funding on Gate.io",
@@ -868,7 +957,7 @@ class GateioDataClient(LiveMarketDataClient):
                 self._handle_book_update(product, result)
             elif channel.endswith("candlesticks"):
                 self._handle_candlesticks(product, result)
-            elif channel == "futures.tickers":
+            elif channel == tickers_channel(product):
                 self._handle_tickers(product, result)
         except Exception as e:  # noqa: BLE001 - one bad message must not kill the stream
             self._log.exception(f"Error handling {channel} message", e)
@@ -1370,31 +1459,47 @@ class GateioDataClient(LiveMarketDataClient):
         product: GateioProductType,
         open_secs: int,
     ) -> Bar | None:
+        """Build one ``Bar`` from a candlestick row, or ``None`` if it is unusable.
+
+        The ``Bar`` construction is inside the guard, not after it. NautilusTrader
+        enforces the OHLC invariants in the constructor — ``high`` at least
+        ``open``/``low``/``close``, ``low`` at most ``open``/``close`` — so a
+        venue row that violates them raises ``ValueError`` there and not in the
+        parsing above. Illiquid delivery and option candles do produce such rows,
+        and letting one escape aborts an entire ``request_bars`` response: the
+        exception leaves the request coroutine, the ``DataResponse`` is never
+        sent, and a caller following the documented request-then-subscribe
+        pattern waits forever. One row is dropped instead.
+        """
         try:
             open_price = instrument.make_price(item["o"])
             high_price = instrument.make_price(item["h"])
             low_price = instrument.make_price(item["l"])
             close_price = instrument.make_price(item["c"])
-        except (KeyError, TypeError, ValueError):
+
+            # Spot reports the traded base amount in ``a`` and quote turnover in
+            # ``v``; contract products report the contract count in ``v``.
+            raw_volume = item.get("a") if product.is_spot else item.get("v")
+            if raw_volume is None:
+                raw_volume = item.get("v")
+            volume = Quantity(max(to_float(raw_volume), 0.0), instrument.size_precision)
+
+            return Bar(
+                bar_type=bar_type,
+                open=open_price,
+                high=high_price,
+                low=low_price,
+                close=close_price,
+                volume=volume,
+                ts_event=self._bar_ts_event(bar_type, open_secs),
+                ts_init=self._clock.timestamp_ns(),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            # Counted rather than warned per row: a historical request can carry
+            # a thousand candles, and the caller reports the total once.
+            self._dropped_candles[bar_type] += 1
+            self._log.debug(f"Dropped a {bar_type} candle opening at {open_secs}: {e}")
             return None
-
-        # Spot reports the traded base amount in ``a`` and quote turnover in
-        # ``v``; contract products report the contract count in ``v``.
-        raw_volume = item.get("a") if product.is_spot else item.get("v")
-        if raw_volume is None:
-            raw_volume = item.get("v")
-        volume = Quantity(max(to_float(raw_volume), 0.0), instrument.size_precision)
-
-        return Bar(
-            bar_type=bar_type,
-            open=open_price,
-            high=high_price,
-            low=low_price,
-            close=close_price,
-            volume=volume,
-            ts_event=self._bar_ts_event(bar_type, open_secs),
-            ts_init=self._clock.timestamp_ns(),
-        )
 
     def _bar_ts_event(self, bar_type: BarType, open_secs: int) -> int:
         ts_ns = open_secs * _NANOS_PER_SEC
@@ -1402,7 +1507,7 @@ class GateioDataClient(LiveMarketDataClient):
             return ts_ns
         return ts_ns + self._bar_step_ms(bar_type) * 1_000_000
 
-    # -- futures tickers ---------------------------------------------------
+    # -- ticker-derived derivative data ------------------------------------
 
     def _handle_tickers(self, product: GateioProductType, result: Any) -> None:
         items = result if isinstance(result, list) else [result]
@@ -1410,7 +1515,9 @@ class GateioDataClient(LiveMarketDataClient):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            raw_symbol = item.get("contract")
+            # ``futures.tickers`` names the contract ``contract``;
+            # ``options.contract_tickers`` names the same field ``name``.
+            raw_symbol = item.get("contract") or item.get("name")
             if not raw_symbol:
                 continue
             instrument_id = gateio_to_instrument_id(product, str(raw_symbol))
@@ -1420,39 +1527,51 @@ class GateioDataClient(LiveMarketDataClient):
             instrument = self._instrument(instrument_id)
             if instrument is None:
                 continue
+            # The options ticker carries no timestamp of its own, so its events
+            # are stamped on arrival; the futures ticker sends ``t`` in ms.
             ts_event = timestamp_to_nanos(item.get("t")) or ts_init
 
-            if _MARK in kinds and item.get("mark_price") not in (None, ""):
-                self._handle_data(
-                    MarkPriceUpdate(
-                        instrument_id=instrument_id,
-                        value=instrument.make_price(item["mark_price"]),
-                        ts_event=ts_event,
-                        ts_init=ts_init,
-                    ),
+            if _MARK in kinds:
+                mark = venue_price(
+                    item.get("mark_price"),
+                    floor_precision=_mark_price_precision(instrument),
                 )
-                self._published["mark_prices"] += 1
+                if mark is not None:
+                    self._handle_data(
+                        MarkPriceUpdate(
+                            instrument_id=instrument_id,
+                            value=mark,
+                            ts_event=ts_event,
+                            ts_init=ts_init,
+                        ),
+                    )
+                    self._published["mark_prices"] += 1
 
-            if _INDEX in kinds and item.get("index_price") not in (None, ""):
-                self._handle_data(
-                    IndexPriceUpdate(
-                        instrument_id=instrument_id,
-                        value=instrument.make_price(item["index_price"]),
-                        ts_event=ts_event,
-                        ts_init=ts_init,
-                    ),
-                )
-                self._published["index_prices"] += 1
+            if _INDEX in kinds:
+                # The index has no ``*_round`` field of its own: Gate.io states a
+                # minimum unit for order and mark prices only, so the published
+                # value's own scale is all there is to go on.
+                index = venue_price(item.get("index_price"))
+                if index is not None:
+                    self._handle_data(
+                        IndexPriceUpdate(
+                            instrument_id=instrument_id,
+                            value=index,
+                            ts_event=ts_event,
+                            ts_init=ts_init,
+                        ),
+                    )
+                    self._published["index_prices"] += 1
 
             if _FUNDING in kinds and item.get("funding_rate") not in (None, ""):
                 self._handle_data(
                     FundingRateUpdate(
                         instrument_id=instrument_id,
-                        rate=Decimal(str(item["funding_rate"])),
+                        rate=to_decimal(item["funding_rate"]),
                         ts_event=ts_event,
                         ts_init=ts_init,
                         interval=self._funding_interval_mins(instrument),
-                        next_funding_ns=self._next_funding_ns(instrument),
+                        next_funding_ns=self._next_funding_ns(instrument, ts_event),
                     ),
                 )
                 self._published["funding_rates"] += 1
@@ -1464,10 +1583,43 @@ class GateioDataClient(LiveMarketDataClient):
         return seconds // 60 if seconds > 0 else None
 
     @staticmethod
-    def _next_funding_ns(instrument: Instrument) -> int | None:
-        """Return the next funding time in nanoseconds, if the venue published one."""
-        secs = to_int(instrument.info.get("funding_next_apply")) if instrument.info else 0
-        return secs * 1_000_000_000 if secs > 0 else None
+    def _next_funding_ns(instrument: Instrument, ts_event: int) -> int | None:
+        """Return the next funding time strictly after ``ts_event``, if it is known.
+
+        Gate.io's ticker stream carries no next-funding timestamp. The only
+        source is ``funding_next_apply`` on the contract definition, which this
+        client refreshes on a timer (``update_instruments_interval_mins``,
+        60 minutes by default) while the ticker pushes about once a second.
+        Republishing that cached field verbatim therefore names the settlement
+        that has *already happened* for up to a whole refresh interval, and
+        ``next_funding_ns - clock.timestamp_ns()`` — the field's main use — comes
+        out negative right after every funding.
+
+        Rolling the anchor forward is exact rather than a guess:
+        ``funding_next_apply`` is a point on the venue's funding grid and
+        ``funding_interval`` is that grid's step (Gate.io schedules funding at
+        ``funding_offset + k * funding_interval``), so adding whole intervals
+        lands on real settlement times. Without an interval there is nothing to
+        roll a stale anchor forward with, and
+        ``concepts/data/funding_rate_update.md`` is explicit that ``interval``
+        and ``next_funding_ns`` are to be used "only when the venue publishes
+        them" — so ``None`` is the honest answer, not a timestamp in the past.
+        """
+        info = instrument.info or {}
+        anchor_secs = to_int(info.get("funding_next_apply"))
+        if anchor_secs <= 0:
+            return None
+        anchor_ns = anchor_secs * _NANOS_PER_SEC
+        if anchor_ns > ts_event:
+            return anchor_ns
+        interval_secs = to_int(info.get("funding_interval"))
+        if interval_secs <= 0:
+            return None
+        interval_ns = interval_secs * _NANOS_PER_SEC
+        # Strictly future: an anchor landing exactly on ts_event is the funding
+        # being applied now, so the next one is a whole interval later.
+        elapsed_intervals = (ts_event - anchor_ns) // interval_ns
+        return anchor_ns + (elapsed_intervals + 1) * interval_ns
 
     # -- requests ----------------------------------------------------------
 
@@ -1573,6 +1725,75 @@ class GateioDataClient(LiveMarketDataClient):
             request.params,
         )
 
+    async def _request_funding_rates(self, request: RequestFundingRates) -> None:
+        """Answer a historical funding-rate request from ``/futures/{settle}/funding_rate``.
+
+        The endpoint returns records of exactly two fields, ``{"t": <unix s>,
+        "r": <decimal ratio>}``, newest first. ``r`` is a ratio and not a
+        percentage, which is the unit ``FundingRateUpdate.rate`` wants.
+        """
+        resolved = self._resolve(request.instrument_id)
+        if resolved is None:
+            return
+        product, raw_symbol = resolved
+        if not product.is_perpetual:
+            self._log.error(
+                f"Cannot request funding rates for {request.instrument_id}: only perpetual "
+                f"contracts pay funding on Gate.io",
+            )
+            return
+        instrument = self._instrument(request.instrument_id)
+        if instrument is None:
+            self._log.error(f"Cannot find instrument for {request.instrument_id}")
+            return
+
+        limit = min(request.limit or MAX_REST_LIMIT, MAX_REST_LIMIT)
+        rows = await self._futures_http[product].funding_rate(raw_symbol, limit=limit)
+
+        start_ns = dt_to_unix_nanos(request.start) if request.start is not None else 0
+        end_ns = dt_to_unix_nanos(request.end) if request.end is not None else 0
+        interval_mins = self._funding_interval_mins(instrument)
+        ts_init = self._clock.timestamp_ns()
+        rates: list[FundingRateUpdate] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            ts_event = timestamp_to_nanos(row.get("t"))
+            rate = row.get("r")
+            if not ts_event or rate in (None, ""):
+                continue
+            if start_ns and ts_event < start_ns:
+                continue
+            if end_ns and ts_event > end_ns:
+                continue
+            rates.append(
+                FundingRateUpdate(
+                    instrument_id=request.instrument_id,
+                    rate=to_decimal(rate),
+                    ts_event=ts_event,
+                    ts_init=ts_init,
+                    # The interval is a property of the contract, so it is as
+                    # true of a past settlement as of the next one.
+                    interval=interval_mins,
+                    # No next-funding time: this endpoint publishes none, and the
+                    # record's own timestamp is the application instant rounded
+                    # up by a second, so deriving one from it would be off the
+                    # funding grid. concepts/data/funding_rate_update.md asks for
+                    # the field "only when the venue publishes them".
+                    next_funding_ns=None,
+                ),
+            )
+        rates.sort(key=lambda item: item.ts_event)
+
+        self._handle_funding_rates(
+            request.instrument_id,
+            rates,
+            request.id,
+            request.start,
+            request.end,
+            request.params,
+        )
+
     async def _request_bars(self, request: RequestBars) -> None:
         bar_type = request.bar_type
         resolved = self._resolve(bar_type.instrument_id)
@@ -1605,6 +1826,7 @@ class GateioDataClient(LiveMarketDataClient):
             limit,
         )
 
+        dropped_before = self._dropped_candles[bar_type]
         bars: list[Bar] = []
         for open_secs, row in rows:
             if open_secs + step_secs > now_secs:
@@ -1612,6 +1834,16 @@ class GateioDataClient(LiveMarketDataClient):
             bar = self._build_bar(bar_type, instrument, row, product, open_secs)
             if bar is not None:
                 bars.append(bar)
+        dropped = self._dropped_candles[bar_type] - dropped_before
+        if dropped:
+            # The response still goes out. A request that answers with nothing at
+            # all is indistinguishable from a venue with no history, and the
+            # documented request-then-subscribe pattern subscribes from inside
+            # this response's callback.
+            self._log.warning(
+                f"Dropped {dropped} of {len(rows)} {bar_type} candles the venue returned; "
+                f"responding with {len(bars)}",
+            )
         bars.sort(key=lambda b: b.ts_event)
         if limit and len(bars) > limit:
             bars = bars[-limit:]
@@ -1744,5 +1976,6 @@ __all__ = [
     "GateioDataClient",
     "bar_type_to_interval",
     "timestamp_to_nanos",
+    "venue_price",
     "venue_quantity",
 ]

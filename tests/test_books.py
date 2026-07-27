@@ -274,3 +274,93 @@ def test_seconds_and_millisecond_timestamps_are_both_normalised() -> None:
         futures_snapshot(1, [("99", "1")], [("101", "1")], update_secs=1_700_000_000.0),
     )
     assert spot_book.last_update_ms == futures_book.last_update_ms == 1_700_000_000_000
+
+
+# -- a `full` push must be placed in the stream, like a REST snapshot --------
+
+
+def full_push(
+    last_id: int | None,
+    bids: list[tuple[str, str]],
+    asks: list[tuple[str, str]],
+    ts_ms: int = 1_700_000_000_200,
+) -> dict[str, Any]:
+    """A ``full: true`` message on ``<product>.order_book_update``.
+
+    Documented for spot and perpetuals only, and documented as re-pushable at any
+    time: *"true indicates a full depth snapshot ... upon receiving it, the user
+    should replace the local depth with this data"*.
+    """
+    message: dict[str, Any] = {
+        "t": ts_ms,
+        "s": "BTC_USDT",
+        "full": True,
+        "l": "100",
+        "b": [[price, size] for price, size in bids],
+        "a": [[price, size] for price, size in asks],
+    }
+    if last_id is not None:
+        message["U"] = last_id
+        message["u"] = last_id
+    return message
+
+
+def test_a_replayed_full_push_does_not_roll_the_book_backwards() -> None:
+    """The venue may re-push a full snapshot; an older one is superseded depth.
+
+    The REST path already refuses a snapshot that is not newer than the local
+    state (:class:`SnapshotStaleError`). The stream path carries the same risk
+    for the same reason and must reach the same answer, otherwise the book is
+    replaced with depth the stream has already moved past and the publishing
+    layer sends it downstream as a fresh snapshot.
+    """
+    book = GateioOrderBook("BTC_USDT")
+    book.apply_snapshot(spot_snapshot(100, bids=[("99", "1")], asks=[("101", "1")]))
+    book.apply_update(full_push(500, bids=[("99.9", "7")], asks=[("100.1", "8")]))
+    assert book.last_update_id == 500
+
+    changes = book.apply_update(full_push(400, bids=[("50", "1")], asks=[("150", "1")]))
+
+    assert changes == []
+    assert not book.last_apply_was_snapshot  # nothing for the caller to republish
+    assert book.last_update_id == 500
+    assert book.best_bid() == (Decimal("99.9"), Decimal("7"))
+    assert book.best_ask() == (Decimal("100.1"), Decimal("8"))
+    assert book.snapshots_stale == 1
+
+
+def test_a_replayed_full_push_at_the_same_id_is_also_superseded() -> None:
+    book = GateioOrderBook("BTC_USDT")
+    book.apply_snapshot(spot_snapshot(100, bids=[("99", "1")], asks=[("101", "1")]))
+    book.apply_update(full_push(500, bids=[("99.9", "7")], asks=[("100.1", "8")]))
+
+    assert book.apply_update(full_push(500, bids=[("1", "1")], asks=[("2", "1")])) == []
+    assert book.best_bid() == (Decimal("99.9"), Decimal("7"))
+
+
+def test_a_full_push_before_the_snapshot_still_synchronises_the_book() -> None:
+    """The unsynced book has no state to protect, so any full push seeds it."""
+    book = GateioOrderBook("BTC_USDT")
+
+    book.apply_update(full_push(300, bids=[("99", "1")], asks=[("101", "1")]))
+
+    assert book.is_synced
+    assert book.last_apply_was_snapshot
+    assert book.last_update_id == 300
+
+
+def test_a_full_push_without_an_update_id_cannot_be_sequenced() -> None:
+    """Accepting the depth while keeping the previous id desynchronises silently.
+
+    The book would then hold one state and claim another, so the very next
+    notification is judged against the wrong expectation: it is either discarded
+    as old or reported as a gap, with the local book already wrong in between.
+    A message that cannot be placed in the stream is a sequence break.
+    """
+    book = GateioOrderBook("BTC_USDT")
+    book.apply_snapshot(spot_snapshot(100, bids=[("99", "1")], asks=[("101", "1")]))
+
+    with pytest.raises(OrderBookSequenceError):
+        book.apply_update(full_push(None, bids=[("99.9", "7")], asks=[("100.1", "8")]))
+
+    assert not book.is_synced  # the caller must resnapshot

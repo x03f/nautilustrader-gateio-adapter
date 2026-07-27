@@ -103,9 +103,10 @@ coverage, not about test coverage.
 | Order book snapshot request | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | Depth clamped to what the product accepts |
 | Bars (closed only) | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | 1s to 7d; delivery and options infer the close |
 | Historical bars / trades | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | Paginated REST, 1000 rows per call |
-| Mark price | n/a | yes | yes | yes | no | Implemented — not mainnet-validated | From `futures.tickers` |
-| Index price | n/a | yes | yes | yes | no | Implemented — not mainnet-validated | From `futures.tickers` |
+| Mark price | n/a | yes | yes | yes | yes | Implemented — not mainnet-validated | `futures.tickers`; `options.contract_tickers` on options |
+| Index price | n/a | yes | yes | yes | yes | Implemented — not mainnet-validated | `futures.tickers`; `options.contract_tickers` on options |
 | Funding rate | n/a | yes | yes | n/a | n/a | Implemented — not mainnet-validated | From `futures.tickers` |
+| Historical funding rates | n/a | yes | yes | n/a | n/a | Implemented — not mainnet-validated | REST `/futures/{settle}/funding_rate` |
 | Instrument updates | yes | yes | yes | yes | yes | Implemented — not mainnet-validated | Polled; Gate.io has no instrument channel |
 | Options underlying streams | n/a | n/a | n/a | n/a | yes | Partial | Reachable through the raw WebSocket client, not wired into the data engine |
 

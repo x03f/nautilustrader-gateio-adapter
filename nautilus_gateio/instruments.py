@@ -29,6 +29,17 @@ Gate.io publishes futures and options fees as **fractions** (``"0.0005"`` means
 5 bps) but the ``fee`` field on a spot currency pair is a deprecated **percent**
 string (``"0.2"`` means 0.2%, i.e. a fraction of ``0.002``). The spot parser
 converts it, and prefers the account's real fee tier when the caller supplies it.
+Maker fees are negative on every Gate.io perpetual and delivery contract — a
+rebate — and the sign is carried through unchanged, which is what the platform
+documents the field to mean.
+
+Rates that are never assumed
+----------------------------
+``maker_fee``, ``taker_fee`` and ``margin_maint`` are refused rather than
+defaulted when the payload does not carry them: zero is a valid rate for all
+three, so a substituted zero cannot be told apart afterwards from one the venue
+published, and it understates both commission and margin. See
+:func:`_required_rate`.
 
 Precision limits
 ----------------
@@ -68,9 +79,24 @@ notional at 1x — and the caller expresses the position's leverage through
 futures convention. ``margin_maint`` comes from the payload's
 ``maintenance_rate`` field, which the venue documents as the maintenance margin
 rate of the **first** risk-limit tier; larger positions fall into higher tiers,
-and the framework's margin model divides it by the account leverage as well, so
-treat the framework's maintenance figure as advisory and reconcile the real
-number from the position's ``average_maintenance_rate``.
+so reconcile the real number from the position's ``average_maintenance_rate``.
+
+The initial-margin half of that arrangement is exact: ``LeveragedMarginModel``
+computes ``notional / leverage x 1``, which is how Gate.io sizes initial margin
+at any leverage. The maintenance half is not, and the reason is worth stating
+precisely because the error is silent and scales with leverage. Gate.io applies
+``maintenance_rate`` to the notional and does **not** divide it by leverage;
+``LeveragedMarginModel.calculate_margin_maint`` does, so at 50x the locally
+computed maintenance requirement is 1/50 of the venue's and the portfolio
+understates liquidation risk by exactly the leverage factor. Switching the
+account to ``StandardMarginModel`` fixes the maintenance figure and breaks the
+initial one in the same proportion, so neither shipped model is right for this
+venue. ``MarginModel`` is a public base class and ``MarginAccount`` takes one
+through ``set_margin_model``, so a venue-shaped model — leverage division on
+initial margin, none on maintenance — is the complete answer; note that
+``MarginModelConfig`` reaches only the backtest engine in 1.230.0, so a live
+system has to set it programmatically. Until then the maintenance figure the
+framework reports is advisory.
 """
 
 from __future__ import annotations
@@ -350,9 +376,10 @@ def parse_delivery_instrument(
 
     The underlying currency is taken from the contract symbol
     (``SOL_USDT_20260731`` -> ``SOL``), and ``expiration_ns`` from the contract's
-    ``expire_time``. Gate.io does not publish a listing time for delivery
-    contracts, so ``activation_ns`` is reported as ``0`` (no activation
-    constraint) rather than being invented.
+    ``expire_time``. ``GET /delivery/{settle}/contracts`` carries no listing time
+    — unlike the perpetual payload it has no ``create_time`` — so ``activation_ns``
+    resolves to ``0``, meaning no activation constraint, rather than being
+    invented from a timestamp that means something else.
 
     Returns ``None`` if the payload cannot be represented.
     """
@@ -483,8 +510,8 @@ def parse_option_instrument(
             # expressed as Nautilus margin ratios. They remain available in `info`.
             margin_init=Decimal(0),
             margin_maint=Decimal(0),
-            maker_fee=to_decimal(contract_payload.get("maker_fee_rate")),
-            taker_fee=to_decimal(contract_payload.get("taker_fee_rate")),
+            maker_fee=_required_rate(contract_payload, "maker_fee_rate"),
+            taker_fee=_required_rate(contract_payload, "taker_fee_rate"),
             info=dict(contract_payload),
         )
     except Exception as exc:  # noqa: BLE001
@@ -546,10 +573,10 @@ def _contract_spec(payload: dict[str, Any], is_inverse: bool) -> _ContractSpec:
         multiplier=multiplier,
         min_quantity=_optional_quantity(payload.get("order_size_min"), 0, ROUND_CEILING),
         max_quantity=_optional_quantity(payload.get("order_size_max"), 0, ROUND_FLOOR),
-        maker_fee=to_decimal(payload.get("maker_fee_rate")),
-        taker_fee=to_decimal(payload.get("taker_fee_rate")),
+        maker_fee=_required_rate(payload, "maker_fee_rate"),
+        taker_fee=_required_rate(payload, "taker_fee_rate"),
         margin_init=CONTRACT_MARGIN_INIT,
-        margin_maint=_quantize_ratio(to_decimal(payload.get("maintenance_rate"))),
+        margin_maint=_quantize_ratio(_required_rate(payload, "maintenance_rate")),
     )
 
 
@@ -615,12 +642,19 @@ def _spot_fees(
     fee_maker: Decimal | None,
     fee_taker: Decimal | None,
 ) -> tuple[Decimal, Decimal]:
-    """Resolve spot fees, converting the pair's percent field when needed."""
+    """Resolve spot fees, converting the pair's percent field when needed.
+
+    Raises
+    ------
+    ValueError
+        If neither side is supplied by the caller and the pair carries no usable
+        ``fee`` field — see :func:`_required_rate` for why zero is not a fallback.
+    """
     if fee_maker is not None and fee_taker is not None:
         return fee_maker, fee_taker
 
     # The per-pair `fee` field is a PERCENT string ("0.2" == 0.2% == 0.002).
-    fallback = to_decimal(payload.get("fee")) / Decimal(100)
+    fallback = _required_rate(payload, "fee") / Decimal(100)
     return (
         fallback if fee_maker is None else fee_maker,
         fallback if fee_taker is None else fee_taker,
@@ -628,6 +662,35 @@ def _spot_fees(
 
 
 # -- value helpers -------------------------------------------------------------
+
+
+def _required_rate(payload: dict[str, Any], field: str) -> Decimal:
+    """Read a venue rate that must not be assumed.
+
+    :func:`to_decimal` answers zero for a value that is missing, empty or not a
+    number, and every field routed through here is one where zero is itself a
+    meaningful rate. A ``margin_maint`` of zero tells ``MarginAccount`` the
+    position needs no maintenance margin at all (``accounting/margin_models.pyx``
+    multiplies the notional by it), and a fee of zero tells
+    ``Account.calculate_commission`` that trading this instrument is free. Once
+    the instrument is built, neither is distinguishable from a rate the venue
+    really published.
+
+    Gate.io publishes all of them on every contract and option it lists, so a
+    payload without one is a payload this parser does not understand. It is
+    refused for the same reason an unrepresentable price scale is refused (see
+    the "Precision limits" section of the module docstring): the caller turns the
+    ``ValueError`` into a skipped instrument plus a warning naming the field,
+    which is loud, rather than a published instrument carrying a number nobody
+    chose, which is silent.
+    """
+    raw = payload.get(field)
+    if raw is None or raw == "":
+        raise ValueError(f"payload has no {field!r}, and it cannot be assumed to be zero")
+    try:
+        return Decimal(str(raw))
+    except (decimal.InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{field} {raw!r} is not a number") from exc
 
 
 def _clamp_precision(precision: int) -> int:
@@ -763,14 +826,32 @@ def _optional_quantity(value: Any, precision: int, rounding: str) -> Quantity | 
 
 
 def _optional_money(value: Any, currency: Currency, rounding: str) -> Money | None:
-    """Build an optional notional bound in ``currency``."""
+    """Build an optional notional bound in ``currency``, dropping an unusable one.
+
+    A ``Money`` carries the *currency's* precision, not the venue's, so a bound
+    finer than the quote currency can round inwards to zero — and the platform's
+    ``Instrument`` constructor requires a positive ``max_notional``
+    (``model/instruments/base.pyx``, ``Condition.positive``). Letting that reach
+    the constructor would raise inside the parser's blanket handler and discard
+    the whole instrument over an optional field, which is out of all proportion
+    to what is lost. The size bounds have refused that trade since they were
+    written; this is the same guard, for the same reason.
+    """
     if value is None or value == "":
         return None
     try:
         parsed = to_decimal(value)
         if parsed <= 0:
             return None
-        return Money(_format(parsed, currency.precision, rounding), currency)
+        bound = Money(_format(parsed, currency.precision, rounding), currency)
     except Exception as exc:  # noqa: BLE001 - an unusable bound is dropped, not fatal
         _LOG.warning(f"Ignoring unusable notional bound {value!r}: {exc}")
         return None
+
+    if bound.as_decimal() <= 0:
+        _LOG.warning(
+            f"Ignoring notional bound {value!r}: it rounds to zero at "
+            f"{currency.code}'s precision of {currency.precision}"
+        )
+        return None
+    return bound

@@ -62,10 +62,14 @@ is described below per channel. Timestamps named ``t`` are milliseconds,
     close (the data client does both).
 
 ``<product>.tickers``
-    Spot: 24-hour statistics for the pair. Futures: an array that also carries
-    ``mark_price``, ``index_price`` and ``funding_rate`` — Gate.io has no
-    separate funding channel. Options: ``options.contract_tickers``, which adds
-    mark IV and the greeks.
+    Spot: 24-hour statistics for the pair, and nothing a derivatives data type
+    is built from. Futures: an array of objects keyed by ``contract`` that also
+    carry ``mark_price``, ``index_price`` and ``funding_rate`` — Gate.io has no
+    separate mark, index or funding channel. Options:
+    ``options.contract_tickers`` (see :func:`tickers_channel`), keyed by
+    ``name`` rather than ``contract``, carrying ``mark_price`` and
+    ``index_price`` per contract plus mark IV and the greeks; options pay no
+    funding, so there is no ``funding_rate`` on it.
 """
 
 from __future__ import annotations
@@ -82,6 +86,22 @@ from nautilus_gateio.websocket.client import GateioWebSocketClient
 WS_CANDLE_INTERVALS: Final[frozenset[str]] = frozenset(
     {"10s", "1m", "5m", "15m", "30m", "1h", "4h", "8h", "1d", "7d"}
 )
+
+
+def tickers_channel(product: GateioProductType) -> str:
+    """Return the name of the ticker channel for ``product``.
+
+    Options break the ``<prefix>.<channel>`` pattern the other products follow:
+    there is no ``options.tickers``. The per-contract stream is
+    ``options.contract_tickers`` and ``options.ul_tickers`` is the
+    underlying-scoped one. The data client routes an inbound message by
+    comparing its channel against this function rather than against a literal of
+    its own, so what is subscribed and what is routed cannot drift apart.
+    """
+    if product.is_option:
+        return "options.contract_tickers"
+    return f"{CHANNEL_PREFIX[product]}.tickers"
+
 
 # -- authoritative per-product order book tables ------------------------------
 #
@@ -262,7 +282,7 @@ class GateioPublicWebSocket:
 
     @property
     def tickers_channel(self) -> str:
-        return "options.contract_tickers" if self.product.is_option else f"{self.prefix}.tickers"
+        return tickers_channel(self.product)
 
     # -- trades ------------------------------------------------------------
 

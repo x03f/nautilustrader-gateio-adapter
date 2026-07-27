@@ -326,9 +326,9 @@ GateioPublicWebSocket                    GateioHttpClient + namespaces
    OrderBookDeltas      <- REST snapshot + *.order_book_update, assembled by
                            GateioOrderBook: sequence-validated, resync on gap
    Bar                  <- *.candlesticks, closed intervals only
-   MarkPriceUpdate      <- futures.tickers
-   IndexPriceUpdate     <- futures.tickers
-   FundingRateUpdate    <- futures.tickers
+   MarkPriceUpdate      <- futures.tickers / options.contract_tickers
+   IndexPriceUpdate     <- futures.tickers / options.contract_tickers
+   FundingRateUpdate    <- futures.tickers, and REST funding_rate on request
                         |
                         v
                  Nautilus DataEngine

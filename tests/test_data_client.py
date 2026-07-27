@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,12 +25,16 @@ from nautilus_trader.data.messages import RequestOrderBookSnapshot
 from nautilus_trader.model.data import (
     Bar,
     BarType,
+    FundingRateUpdate,
+    IndexPriceUpdate,
+    MarkPriceUpdate,
     OrderBookDelta,
     OrderBookDeltas,
+    OrderBookDepth10,
     QuoteTick,
     TradeTick,
 )
-from nautilus_trader.model.enums import BookAction, OrderSide
+from nautilus_trader.model.enums import BookAction, BookType, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
 
 from nautilus_gateio import data as data_module
@@ -50,6 +55,9 @@ SPOT_ID = InstrumentId.from_str("BTC_USDT.GATE_IO")
 PERP_ID = InstrumentId.from_str("BTC_USDT-PERP.GATE_IO")
 OPTION_SYMBOL = "BTC_USDT-20260731-70000-C"
 OPTION_ID = InstrumentId.from_str(f"{OPTION_SYMBOL}.GATE_IO")
+
+#: The repository root, for the tests that check a claim against the code.
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # -- fixtures ----------------------------------------------------------------
@@ -90,6 +98,10 @@ def build_instruments() -> list[Any]:
             "mark_price_round": "0.1",
             "maker_fee_rate": "0.0002",
             "taker_fee_rate": "0.0005",
+            # Gate.io publishes a maintenance rate on every contract it lists,
+            # and the parser refuses one that is missing rather than reading it
+            # as a zero maintenance requirement.
+            "maintenance_rate": "0.003",
             "leverage_min": "1",
             "leverage_max": "100",
             "order_size_min": 1,
@@ -951,3 +963,586 @@ async def test_transient_subscribe_failure_keeps_the_local_book(harness: Harness
     assert PERP_ID in client._books, "the book was discarded on a transient failure"
     for coro in tracked:
         coro.close()
+
+
+# -- s2: the derivative data contract ----------------------------------------
+#
+# MarkPriceUpdate, IndexPriceUpdate and FundingRateUpdate are first-class
+# NautilusTrader types, and everything below pins what the adapter is allowed to
+# put in them: which products they exist for, on what scale a reference price is
+# published, and where the next funding time comes from.
+
+#: The BTC_USDT perpetual funding schedule: eight hours, in seconds.
+FUNDING_INTERVAL_SECS = 28_800
+
+
+def _perp_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "name": "BTC_USDT",
+        "quanto_multiplier": "0.0001",
+        "order_price_round": "0.1",
+        "mark_price_round": "0.01",  # the venue's mark grid is ten times finer
+        "maker_fee_rate": "0.0002",
+        "taker_fee_rate": "0.0005",
+        "maintenance_rate": "0.003",
+        "leverage_min": "1",
+        "leverage_max": "100",
+        "order_size_min": 1,
+        "order_size_max": 1_000_000,
+        "create_time": 1_700_000_000,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _install_perp(harness: Harness, **overrides: Any) -> Any:
+    """Rebuild the BTC_USDT perpetual with ``overrides`` and register it."""
+    instrument = parse_perpetual_instrument(_perp_payload(**overrides), GateioProductType.PERP)
+    assert instrument is not None
+    harness.client._instrument_provider.add(instrument)
+    return instrument
+
+
+def _install_option(harness: Harness, **overrides: Any) -> Any:
+    payload: dict[str, Any] = {
+        "name": OPTION_SYMBOL,
+        "underlying": "BTC_USDT",
+        "is_call": True,
+        "multiplier": "0.01",
+        "strike_price": "70000",
+        # The 598 BTC_USDT options quote orders in whole USDT and marks in 0.1.
+        "order_price_round": "1",
+        "mark_price_round": "0.1",
+        "maker_fee_rate": "0.0003",
+        "taker_fee_rate": "0.0003",
+        "order_size_min": 1,
+        "order_size_max": 100_000,
+        "expiration_time": 1_785_000_000,
+        "create_time": 1_700_000_000,
+    }
+    payload.update(overrides)
+    instrument = parse_option_instrument(payload)
+    assert instrument is not None
+    harness.client._instrument_provider.add(instrument)
+    return instrument
+
+
+def _futures_ticker(ts_ms: int, **fields: Any) -> dict[str, Any]:
+    return {
+        "channel": "futures.tickers",
+        "event": "update",
+        "result": [{"contract": "BTC_USDT", "t": ts_ms, **fields}],
+    }
+
+
+def _options_ticker(**fields: Any) -> dict[str, Any]:
+    """``options.contract_tickers`` keys the contract on ``name``, not ``contract``."""
+    return {
+        "channel": "options.contract_tickers",
+        "event": "update",
+        "result": [{"name": OPTION_SYMBOL, **fields}],
+    }
+
+
+def _marks(harness: Harness) -> list[MarkPriceUpdate]:
+    return [item for item in harness.published if isinstance(item, MarkPriceUpdate)]
+
+
+def _indexes(harness: Harness) -> list[IndexPriceUpdate]:
+    return [item for item in harness.published if isinstance(item, IndexPriceUpdate)]
+
+
+def _fundings(harness: Harness) -> list[FundingRateUpdate]:
+    return [item for item in harness.published if isinstance(item, FundingRateUpdate)]
+
+
+# -- next funding time -------------------------------------------------------
+
+
+def test_a_stale_next_funding_time_is_rolled_onto_the_funding_grid(harness: Harness) -> None:
+    """Regression: ``next_funding_ns`` used to be a timestamp in the past.
+
+    ``funding_next_apply`` reaches this client only through the instrument
+    reload task (60 minutes by default) while the ticker pushes about once a
+    second, so for up to an hour after every settlement the cached field names a
+    funding that has already been applied. A strategy computing
+    ``next_funding_ns - clock.timestamp_ns()`` — the whole point of the field —
+    got a negative time to funding.
+    """
+    ts_secs = 1_784_995_205  # five seconds after a settlement
+    settled = 1_784_995_200  # the grid point that has just passed
+    _install_perp(
+        harness,
+        funding_interval=FUNDING_INTERVAL_SECS,
+        funding_next_apply=settled,
+    )
+    harness.client._ticker_subs[PERP_ID] = {"funding"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.PERP,
+        _futures_ticker(ts_secs * 1_000, funding_rate="0.000028"),
+    )
+
+    (update,) = _fundings(harness)
+    assert update.ts_event == ts_secs * 1_000_000_000
+    assert update.next_funding_ns == (settled + FUNDING_INTERVAL_SECS) * 1_000_000_000
+    assert update.next_funding_ns > update.ts_event, "next funding was in the past"
+    assert update.interval == FUNDING_INTERVAL_SECS // 60
+    assert update.rate == Decimal("0.000028")
+
+
+def test_a_long_stale_next_funding_time_rolls_to_the_first_grid_point_ahead(
+    harness: Harness,
+) -> None:
+    """Three whole intervals of drift must land on the next settlement, not the next-but-three."""
+    anchor = 1_784_995_200
+    ts_secs = anchor + 3 * FUNDING_INTERVAL_SECS + 5
+    _install_perp(
+        harness,
+        funding_interval=FUNDING_INTERVAL_SECS,
+        funding_next_apply=anchor,
+    )
+    harness.client._ticker_subs[PERP_ID] = {"funding"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.PERP,
+        _futures_ticker(ts_secs * 1_000, funding_rate="0.0001"),
+    )
+
+    (update,) = _fundings(harness)
+    expected = anchor + 4 * FUNDING_INTERVAL_SECS
+    assert update.next_funding_ns == expected * 1_000_000_000
+    assert expected - FUNDING_INTERVAL_SECS < ts_secs, "not the first grid point ahead"
+
+
+def test_a_next_funding_time_still_ahead_is_published_verbatim(harness: Harness) -> None:
+    """Rolling forward must not move a timestamp that is already correct."""
+    ts_secs = 1_784_990_000
+    next_apply = 1_784_995_200
+    _install_perp(
+        harness,
+        funding_interval=FUNDING_INTERVAL_SECS,
+        funding_next_apply=next_apply,
+    )
+    harness.client._ticker_subs[PERP_ID] = {"funding"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.PERP,
+        _futures_ticker(ts_secs * 1_000, funding_rate="0.0001"),
+    )
+
+    (update,) = _fundings(harness)
+    assert update.next_funding_ns == next_apply * 1_000_000_000
+
+
+def test_next_funding_time_is_omitted_when_the_grid_step_is_unknown(harness: Harness) -> None:
+    """No interval means no way to roll a stale anchor forward.
+
+    ``concepts/data/funding_rate_update.md`` asks for ``next_funding_ns`` "only
+    when the venue publishes them", so ``None`` is the answer rather than a
+    timestamp known to be wrong.
+    """
+    ts_secs = 1_784_995_205
+    _install_perp(harness, funding_next_apply=1_784_995_200)  # no funding_interval
+    harness.client._ticker_subs[PERP_ID] = {"funding"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.PERP,
+        _futures_ticker(ts_secs * 1_000, funding_rate="0.0001"),
+    )
+
+    (update,) = _fundings(harness)
+    assert update.next_funding_ns is None
+    assert update.interval is None
+
+
+# -- reference price scale ---------------------------------------------------
+
+
+def test_a_mark_price_keeps_the_venue_scale_instead_of_the_order_tick(
+    harness: Harness,
+) -> None:
+    """Regression: a mark price used to be quantised onto the order tick.
+
+    Gate.io publishes ``order_price_round`` and ``mark_price_round`` as two
+    independent minimum units — 0.1 and 0.01 on the BTC_USDT perpetual — and a
+    mark price is not an order price. Rounding it onto the order grid publishes a
+    number the venue never sent.
+    """
+    _install_perp(harness)
+    harness.client._ticker_subs[PERP_ID] = {"mark"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.PERP,
+        _futures_ticker(1_784_995_205_000, mark_price="64000.05"),
+    )
+
+    (update,) = _marks(harness)
+    assert str(update.value) == "64000.05"
+    assert update.value.precision == 2
+
+
+def test_a_mark_price_scale_does_not_wobble_between_updates(harness: Harness) -> None:
+    """``mark_price_round`` is a floor, so a round number keeps the same scale."""
+    _install_perp(harness)
+    harness.client._ticker_subs[PERP_ID] = {"mark"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.PERP,
+        _futures_ticker(1_784_995_205_000, mark_price="64000"),
+    )
+
+    (update,) = _marks(harness)
+    assert update.value.precision == 2
+    assert str(update.value) == "64000.00"
+
+
+def test_an_index_price_keeps_the_venue_scale(harness: Harness) -> None:
+    """The venue states no minimum unit for the index, so its own scale is used."""
+    _install_perp(harness)
+    harness.client._ticker_subs[PERP_ID] = {"index"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.PERP,
+        _futures_ticker(1_784_995_205_000, index_price="63999.123"),
+    )
+
+    (update,) = _indexes(harness)
+    assert str(update.value) == "63999.123"
+
+
+def test_an_unparseable_reference_price_is_not_published_as_zero(harness: Harness) -> None:
+    _install_perp(harness)
+    harness.client._ticker_subs[PERP_ID] = {"mark", "index"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.PERP,
+        _futures_ticker(1_784_995_205_000, mark_price="", index_price="n/a"),
+    )
+
+    assert _marks(harness) == []
+    assert _indexes(harness) == []
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("nan", None),
+        ("abc", None),
+    ],
+)
+def test_venue_price_reports_absence_rather_than_a_price(value: Any, expected: Any) -> None:
+    assert data_module.venue_price(value) is expected
+
+
+# -- options: mark and index -------------------------------------------------
+
+
+def test_mark_and_index_prices_are_published_for_options(harness: Harness) -> None:
+    """Regression: options were refused, so an option position had no mark price.
+
+    Gate.io publishes both per contract on ``options.contract_tickers``, keyed on
+    ``name``. Without them a node configured with ``use_mark_prices=True`` has no
+    PnL basis on exactly the instrument class where mark and last diverge most.
+    """
+    _install_option(harness)
+    harness.client._ticker_subs[OPTION_ID] = {"mark", "index"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.OPT,
+        _options_ticker(mark_price="5797.7", index_price="64123.45"),
+    )
+
+    (mark,) = _marks(harness)
+    (index,) = _indexes(harness)
+    assert mark.instrument_id == OPTION_ID
+    # The order tick is 1 and the mark tick 0.1: on the order grid this would
+    # have been published as 5798.
+    assert str(mark.value) == "5797.7"
+    assert str(index.value) == "64123.45"
+
+
+async def test_an_option_may_subscribe_to_mark_and_index_prices(harness: Harness) -> None:
+    client = harness.client
+
+    class StubWs:
+        def __init__(self) -> None:
+            self.subscribed: list[str] = []
+
+        async def subscribe_tickers(self, symbol: str) -> None:
+            self.subscribed.append(symbol)
+
+    ws = StubWs()
+    client._ws_clients[GateioProductType.OPT] = ws  # type: ignore[assignment]
+
+    await client._subscribe_mark_prices(
+        data_module.SubscribeMarkPrices(OPTION_ID, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0),
+    )
+    await client._subscribe_index_prices(
+        data_module.SubscribeIndexPrices(OPTION_ID, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0),
+    )
+
+    # One venue subscription serves both; the client reference-counts them.
+    assert ws.subscribed == [OPTION_SYMBOL]
+    assert client._ticker_subs[OPTION_ID] == {"mark", "index"}
+
+
+async def test_an_option_may_not_subscribe_to_funding_rates(harness: Harness) -> None:
+    """Options pay no funding, so the subscription is refused rather than left silent."""
+    client = harness.client
+
+    class StubWs:
+        def __init__(self) -> None:
+            self.subscribed: list[str] = []
+
+        async def subscribe_tickers(self, symbol: str) -> None:
+            self.subscribed.append(symbol)
+
+    ws = StubWs()
+    client._ws_clients[GateioProductType.OPT] = ws  # type: ignore[assignment]
+
+    await client._subscribe_funding_rates(
+        data_module.SubscribeFundingRates(OPTION_ID, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0),
+    )
+
+    assert ws.subscribed == []
+    assert not client._ticker_subs.get(OPTION_ID)
+
+
+async def test_spot_may_not_subscribe_to_any_of_the_three(harness: Harness) -> None:
+    client = harness.client
+
+    class StubWs:
+        def __init__(self) -> None:
+            self.subscribed: list[str] = []
+
+        async def subscribe_tickers(self, symbol: str) -> None:
+            self.subscribed.append(symbol)
+
+    ws = StubWs()
+    client._ws_clients[GateioProductType.SPOT] = ws  # type: ignore[assignment]
+
+    await client._subscribe_mark_prices(
+        data_module.SubscribeMarkPrices(SPOT_ID, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0),
+    )
+
+    assert ws.subscribed == []
+    assert not client._ticker_subs.get(SPOT_ID)
+
+
+def test_the_ticker_channel_name_comes_from_the_transport() -> None:
+    """Routing and subscribing must read the same name, or one of them is dead code."""
+    assert public_module.tickers_channel(GateioProductType.OPT) == "options.contract_tickers"
+    assert public_module.tickers_channel(GateioProductType.PERP) == "futures.tickers"
+    assert data_module.tickers_channel is public_module.tickers_channel
+
+
+# -- historical requests -----------------------------------------------------
+
+
+def _bar_request(bar_type: BarType, limit: int = 0) -> Any:
+    return data_module.RequestBars(
+        bar_type=bar_type,
+        start=None,
+        end=None,
+        limit=limit,
+        client_id=GATEIO_CLIENT_ID,
+        venue=GATEIO_VENUE,
+        callback=lambda data: None,
+        request_id=UUID4(),
+        ts_init=0,
+        params=None,
+    )
+
+
+async def test_one_malformed_candle_does_not_abort_the_whole_bar_request(
+    harness: Harness,
+) -> None:
+    """Regression: a single bad row used to make the entire response disappear.
+
+    NautilusTrader enforces the OHLC invariants inside the ``Bar`` constructor,
+    which used to sit outside the parse guard. In ``_request_bars`` nothing
+    caught the ``ValueError``, so it escaped the request coroutine, the
+    ``DataResponse`` was never sent, and a strategy following the documented
+    ``request_bars(..., callback=lambda _: self.subscribe_bars(bar_type))``
+    pattern waited forever on one exception line in the log.
+    """
+    client = harness.client
+    bar_type = _option_bar_type()
+    responses: list[list[Bar]] = []
+    client._handle_bars = lambda bt, bars, *args: responses.append(bars)  # type: ignore[method-assign]
+
+    now_secs = client._clock.timestamp_ns() // 1_000_000_000
+    first = (now_secs // 60) * 60 - 600
+    broken = dict(_candle(first + 60), h="4.0")  # high below open: illegal OHLC
+    rows = [
+        (first, _candle(first)),
+        (first + 60, broken),
+        (first + 120, _candle(first + 120)),
+    ]
+
+    async def _fetch(*args: Any, **kwargs: Any) -> list[tuple[int, dict[str, Any]]]:
+        return rows
+
+    client._fetch_candles = _fetch  # type: ignore[method-assign]
+
+    await client._request_bars(_bar_request(bar_type))
+
+    assert responses, "the request produced no response at all"
+    (bars,) = responses
+    assert [bar.ts_event for bar in bars] == [
+        (first + 60) * 1_000_000_000,
+        (first + 180) * 1_000_000_000,
+    ]
+    assert client.metrics()["candles_dropped"][str(bar_type)] == 1
+
+
+async def test_a_malformed_candle_in_the_live_stream_is_still_only_counted(
+    harness: Harness,
+) -> None:
+    """The live path already dropped the row; it must keep doing so, and say so."""
+    client = harness.client
+    bar_type = _option_bar_type()
+    client._bar_types[(GateioProductType.OPT, f"1m_{OPTION_SYMBOL}")] = bar_type
+
+    now_secs = client._clock.timestamp_ns() // 1_000_000_000
+    closed_bucket = (now_secs // 60) * 60 - 600
+
+    client._handle_ws_message(
+        GateioProductType.OPT,
+        {
+            "channel": "options.contract_candlesticks",
+            "event": "update",
+            "result": [dict(_candle(closed_bucket), l="9.9")],  # low above close
+        },
+    )
+
+    assert harness.bars() == []
+    assert client.metrics()["candles_dropped"][str(bar_type)] == 1
+
+
+class StubFundingHttp:
+    """Records the funding-rate history call and replays a canned response."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.calls: list[dict[str, Any]] = []
+
+    async def funding_rate(self, contract: str, limit: int | None = None) -> list[dict[str, Any]]:
+        self.calls.append({"contract": contract, "limit": limit})
+        return self.rows
+
+
+def _funding_request(instrument_id: InstrumentId, limit: int = 0) -> Any:
+    return data_module.RequestFundingRates(
+        instrument_id=instrument_id,
+        start=None,
+        end=None,
+        limit=limit,
+        client_id=GATEIO_CLIENT_ID,
+        venue=GATEIO_VENUE,
+        callback=lambda data: None,
+        request_id=UUID4(),
+        ts_init=0,
+        params=None,
+    )
+
+
+async def test_funding_rate_history_is_requested_and_published(harness: Harness) -> None:
+    """Regression: the hook was unimplemented while its REST wrapper had no callers.
+
+    Five in-tree adapters implement ``_request_funding_rates``; the historical
+    series is what a funding-carry backtest is built from.
+    """
+    client = harness.client
+    _install_perp(harness, funding_interval=FUNDING_INTERVAL_SECS)
+    http = StubFundingHttp(
+        [
+            {"r": "0.000028", "t": 1_784_966_401},
+            {"r": "0.000023", "t": 1_784_937_601},
+        ],
+    )
+    client._futures_http[GateioProductType.PERP] = http  # type: ignore[assignment]
+    responses: list[list[FundingRateUpdate]] = []
+    client._handle_funding_rates = (  # type: ignore[method-assign]
+        lambda iid, rates, *args: responses.append(rates)
+    )
+
+    await client._request_funding_rates(_funding_request(PERP_ID))
+
+    assert http.calls == [{"contract": "BTC_USDT", "limit": 1000}]
+    (rates,) = responses
+    # Gate.io answers newest-first; the response is oldest-first.
+    assert [item.ts_event for item in rates] == [
+        1_784_937_601 * 1_000_000_000,
+        1_784_966_401 * 1_000_000_000,
+    ]
+    assert [item.rate for item in rates] == [Decimal("0.000023"), Decimal("0.000028")]
+    assert rates[0].interval == FUNDING_INTERVAL_SECS // 60
+    # The endpoint publishes {t, r} and nothing about the next application.
+    assert all(item.next_funding_ns is None for item in rates)
+
+
+async def test_funding_rate_history_is_refused_for_a_product_without_funding(
+    harness: Harness,
+) -> None:
+    client = harness.client
+    http = StubFundingHttp([])
+    client._futures_http[GateioProductType.PERP] = http  # type: ignore[assignment]
+    responses: list[Any] = []
+    client._handle_funding_rates = (  # type: ignore[method-assign]
+        lambda iid, rates, *args: responses.append(rates)
+    )
+
+    await client._request_funding_rates(_funding_request(OPTION_ID))
+
+    assert http.calls == []
+    assert responses == []
+
+
+# -- the failure mode of an unimplemented subscribe hook ---------------------
+
+
+async def test_an_unimplemented_depth_subscription_leaves_a_phantom_subscription(
+    harness: Harness,
+) -> None:
+    """Regression for a documentation claim, checked against the platform itself.
+
+    ``docs/market-data.md`` used to say the base class's ``NotImplementedError``
+    made ``subscribe_order_book_depth`` "fail visibly rather than sitting there
+    delivering nothing". It does both. ``LiveMarketDataClient`` records the
+    subscription *before* it creates the task that raises, and
+    ``DataEngine._handle_subscribe_order_book`` then skips any instrument already
+    in ``subscribed_order_book_depth()``, so the failure is logged once and the
+    phantom subscription is never retried or cleared.
+    """
+    client = harness.client
+    client._loop = asyncio.get_running_loop()
+
+    command = data_module.SubscribeOrderBook(
+        instrument_id=SPOT_ID,
+        book_data_type=OrderBookDepth10,
+        book_type=BookType.L2_MBP,
+        client_id=GATEIO_CLIENT_ID,
+        venue=GATEIO_VENUE,
+        command_id=UUID4(),
+        ts_init=0,
+        depth=10,
+    )
+    client.subscribe_order_book_depth(command)
+    await asyncio.sleep(0)  # let the task that raises run to completion
+    await asyncio.sleep(0)
+
+    assert client.subscribed_order_book_depth() == [SPOT_ID], (
+        "the platform no longer records the subscription before the task raises; "
+        "the documented failure mode has to be re-checked"
+    )
+
+    page = (REPO_ROOT / "docs" / "market-data.md").read_text(encoding="utf-8")
+    assert "failure is **not** clean" in page, (
+        "market-data.md must state that an unimplemented depth subscription both "
+        "raises and leaves a subscription the client keeps reporting"
+    )
+    assert "the subscription fails visibly" not in page, "the retracted claim is still on the page"

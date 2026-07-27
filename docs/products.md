@@ -128,6 +128,36 @@ disallowed side and collect an opaque venue rejection.
 Gate.io lists thousands of option contracts. Restrict loading with
 `options_underlyings=("BTC_USDT",)` unless you genuinely want all of them.
 
+### Margin and fee rates
+
+| Field | Source | What it means here |
+|---|---|---|
+| `margin_init` (contracts) | not venue-derived | Fixed at `1`. Gate.io publishes no initial-margin rate — `leverage_max` is a cap, not a requirement — and NautilusTrader's default `LeveragedMarginModel` computes `notional / leverage x margin_init`, so `1` reserves exactly what the venue reserves at whatever leverage the account is set to |
+| `margin_maint` (contracts) | `maintenance_rate` | The **first** risk-limit tier's rate. Larger positions fall into higher tiers; reconcile the real figure from the position's `average_maintenance_rate` |
+| `margin_init` / `margin_maint` (spot) | — | `0`. Correct for a cash ledger; see [account modes](#account-modes-spot-margin-cross-margin-unified) for the margin ledgers, where it is a known gap |
+| `margin_init` / `margin_maint` (options) | — | `0`. Gate.io's option coefficients (`init_margin_high`, `init_margin_low`, `maint_margin_base`) are ratios of the **underlying** price applied to short positions, not of the premium notional, so they are not Nautilus margin ratios. They remain in `info` |
+| `maker_fee` / `taker_fee` | `maker_fee_rate` / `taker_fee_rate`, or the pair's `fee` percent on spot | Fractions. Negative on every perpetual and delivery contract — a maker rebate — and the sign is carried through |
+
+One asymmetry is worth stating plainly, because the error is silent and grows
+with leverage. Gate.io divides **initial** margin by leverage and does **not**
+divide maintenance margin by it; `LeveragedMarginModel` divides both. The initial
+figure is therefore exact at any leverage, and the maintenance figure is the
+venue's requirement divided by the account leverage — at 50x it understates
+liquidation risk fifty-fold. Switching to `StandardMarginModel` corrects
+maintenance and breaks initial by the same factor, so neither shipped model fits
+this venue. `MarginModel` is a public base class and `MarginAccount.set_margin_model()`
+accepts one, so a venue-shaped model is the complete answer; note that
+`MarginModelConfig` reaches only the backtest engine in NautilusTrader 1.230.0,
+so a live system must set it programmatically. Until then, read the framework's
+maintenance figure as advisory and the venue's as authoritative.
+
+None of these rates is ever assumed. Gate.io publishes `maintenance_rate`,
+`maker_fee_rate` and `taker_fee_rate` on every contract and option it lists, and
+a payload missing one is skipped with a warning naming the field rather than
+published with a zero: a zero maintenance rate tells the account the position
+needs no margin, and a zero fee tells it that trading is free, and neither is
+distinguishable afterwards from a rate the venue really published.
+
 ## Order types by product
 
 `SUPPORTED_ORDER_TYPES` is the authority in code; this table is its per-product
@@ -470,18 +500,25 @@ mock-tested*.
 | Order book snapshot request | yes | yes | yes | yes | yes | REST `order_book`, depth clamped per product | Implemented and mock-tested |
 | `Bar` (closed bars only) | yes | yes | yes | yes | yes | `<prefix>.candlesticks`; options use `options.contract_candlesticks` | Implemented and mock-tested |
 | Historical bars and trades | yes | yes | yes | yes | yes | Paginated REST, 1000 rows per call | Implemented, mainnet validation pending |
-| `MarkPriceUpdate` | Not applicable | yes | yes | yes | Unsupported | `futures.tickers` | Implemented, mainnet validation pending |
-| `IndexPriceUpdate` | Not applicable | yes | yes | yes | Unsupported | `futures.tickers` | Implemented, mainnet validation pending |
+| `MarkPriceUpdate` | Not applicable | yes | yes | yes | yes | `futures.tickers`; `options.contract_tickers` on options | Implemented, mainnet validation pending |
+| `IndexPriceUpdate` | Not applicable | yes | yes | yes | yes | `futures.tickers`; `options.contract_tickers` on options | Implemented, mainnet validation pending |
 | `FundingRateUpdate` | Not applicable | yes | yes | Not applicable | Not applicable | `futures.tickers` | Implemented, mainnet validation pending |
+| Historical `FundingRateUpdate` | Not applicable | yes | yes | Not applicable | Not applicable | REST `/futures/{settle}/funding_rate` | Implemented, mainnet validation pending |
 | Instrument updates | yes | yes | yes | yes | yes | Periodic REST reload; Gate.io has no instrument channel | Implemented and mock-tested (loading and filtering); implemented, mainnet validation pending (the reload timer) |
 | Book types other than `L2_MBP` | Unsupported on every product | | | | | | Unsupported |
 | Options underlying, ticker and greeks streams | Not applicable | Not applicable | Not applicable | Not applicable | raw subscription only | `GateioPublicWebSocket.client`, not routed into the data engine | Experimental |
 
 Gate.io has no dedicated mark, index or funding channel: all three are fields of
-the futures ticker, so one subscription serves them and the client reference
-counts it. A funding subscription on a delivery contract is refused with an
-explanation rather than silently producing nothing, because a delivery contract
-converges on its settlement price instead of paying funding.
+the ticker stream — `futures.tickers` on the futures products,
+`options.contract_tickers` on options — so one subscription serves them and the
+client reference counts it. A funding subscription is refused with an explanation
+rather than silently producing nothing on any product that does not pay funding:
+a delivery contract converges on its settlement price, and an option has no
+funding leg. Mark and index prices are published on the scale the venue used
+rather than on the instrument's order tick, and the next funding time is derived
+from the venue's funding grid rather than replayed from the cached contract
+definition; both are described in
+[market-data.md](market-data.md#mark-price-index-price-and-funding-rate).
 
 Bars come only from closed candlesticks and only for the `LAST` price type. The
 WebSocket candlestick channel serves `10s` upwards, so 1-second bars are

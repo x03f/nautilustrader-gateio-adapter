@@ -25,8 +25,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A strategy matching on `OrderRejected` for these cases must handle
   `on_order_denied` instead.
 
+- **A contract or option whose payload omits a margin or fee rate is skipped,
+  not published at zero.** `maintenance_rate`, `maker_fee_rate` and
+  `taker_fee_rate` were read through a converter that answers zero for a missing
+  or unparseable value, and zero is a valid rate for all three: it tells
+  `MarginAccount` that a position needs no maintenance margin and tells
+  `Account.calculate_commission` that trading is free, neither of which is
+  distinguishable afterwards from a rate Gate.io really published. Gate.io
+  carries all three on every contract and option it lists, so a payload without
+  one is a payload the parser does not understand; it is now skipped with a
+  warning naming the field, the same answer an unrepresentable price scale
+  already got. A spot pair is likewise refused when it carries no `fee` and the
+  caller supplied no account fee tier.
+
 ### Fixed
 
+- **A re-pushed `full` order book snapshot no longer rolls the book backwards.**
+  Gate.io documents that a full depth snapshot may be pushed on the incremental
+  channel at any time. One whose `u` was not newer than the local update id was
+  applied unconditionally, replacing the book with depth the stream had already
+  superseded and republishing it downstream as a fresh snapshot batch — the exact
+  case the REST path has refused since it was written. It is now discarded and
+  counted in `snapshots_stale`. A `full` push carrying no `u` at all was accepted
+  while the previous update id was kept, leaving the book holding one state and
+  claiming another so that the next notification was measured against the wrong
+  expectation; it now raises `OrderBookSequenceError` and the book is rebuilt
+  from REST.
+- **An optional notional bound that cannot be represented no longer discards the
+  whole instrument.** `Money` carries the quote currency's precision, so a
+  `max_quote_amount` finer than that currency floors to zero, and the platform
+  requires a positive `max_notional`; the constructor error was swallowed by the
+  parser's blanket handler and a tradable pair was lost over an optional field.
+  The bound is now dropped with a warning, as the size bounds already were.
+- **`FundingRateUpdate.next_funding_ns` no longer names a settlement that has
+  already happened.** Gate.io's ticker stream carries no next-funding timestamp;
+  the only source is `funding_next_apply` on the contract definition, which the
+  instrument reload task refreshes hourly by default while the ticker pushes
+  about once a second. Republished verbatim, the field pointed into the past for
+  up to a whole refresh interval after every settlement, so
+  `next_funding_ns - clock.timestamp_ns()` — the number anyone actually reads it
+  for — came out negative, and because the field participates in the platform's
+  equality and hashing for that data type, a stale value changed deduplication
+  as well. The cached value is now treated as what it is, an exact point on the
+  venue's funding grid, and rolled forward by whole `funding_interval` steps to
+  the first settlement after the update's own timestamp. A contract that
+  publishes no interval leaves the field unset rather than wrong.
+- **One malformed candle no longer aborts an entire bar request.** NautilusTrader
+  enforces the OHLC invariants inside the `Bar` constructor, and that
+  construction sat outside the parser's guard, so a row from an illiquid delivery
+  or option contract that violated them raised out of the request coroutine. The
+  live path caught it one level up and lost only the candle; a historical request
+  lost the whole response, and a strategy following the documented
+  request-then-subscribe pattern never subscribed and sat silent. Such a row is
+  now dropped and counted in the new `candles_dropped` health counter, and the
+  request answers with the rest after logging how many it lost.
+- **Mark and index prices keep the scale the venue published them with.** Both
+  were built through `Instrument.make_price()`, whose precision comes from
+  `order_price_round` — the grid orders must sit on. Gate.io publishes
+  `mark_price_round` as a separate and finer minimum unit, so a BTC_USDT option
+  marked 5797.7 was published as 5798 against a 1-unit order tick. A reference
+  price is not an order price and does not live on the order grid; it is now
+  built from the venue's own decimal string, at that string's precision raised to
+  the scale the contract states so it cannot wobble between updates. A field the
+  venue sends empty or unparseable now produces no update rather than a zero,
+  which would be a price no participant ever saw.
 - **A post-only termination no longer breaks the order state machine.** A
   terminal order message carrying `finish_as=poc` produced `OrderRejected`
   unconditionally, including for an order this client had already booked a fill
@@ -116,6 +178,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mark and index prices for options.** Gate.io publishes both per contract on
+  `options.contract_tickers`, but the subscription guard admitted futures
+  products only and the router matched the literal `futures.tickers`, so an
+  options position had no mark price in the cache — and a node configured to
+  value positions on mark prices lost its unrealized-PnL basis on exactly the
+  instrument class where mark and last diverge most. Options now subscribe like
+  any other derivative. Funding stays perpetual-only, because an option has no
+  funding leg. The channel name is resolved by one function that both the
+  subscribe path and the router read, so what is subscribed and what is routed
+  cannot drift apart again.
+- **Historical funding rates.** `request_funding_rates` answers from
+  `GET /futures/{settle}/funding_rate`, a REST wrapper that had been in the
+  package with no callers. The platform ships the whole path and five in-tree
+  adapters implement the hook, so leaving it unimplemented was a gap rather than
+  a choice. Perpetual-only, with the same refusal as the subscription; records
+  are filtered to the requested window client-side, since the endpoint takes no
+  time range. Each update carries the contract's funding `interval` but no next
+  funding time — the endpoint publishes nothing about the next application, and
+  deriving one from record timestamps that sit a second off the grid would
+  reintroduce the approximation removed above.
 - **Every instrument carries a tick scheme.** `Instrument.next_bid_price()`,
   `next_ask_price()` and their plural forms raised `ValueError` on every Gate.io
   instrument because none named one. Power-of-ten grids use NautilusTrader's
@@ -126,6 +208,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **What an unimplemented subscribe hook really does.** `docs/market-data.md`
+  said the missing `OrderBookDepth10` subscription would "fail visibly rather
+  than sitting there delivering nothing". It does both. The live client records
+  the subscription before it starts the task that raises, and the data engine
+  skips any instrument already in that list, so the caller gets one exception in
+  the log and a phantom subscription the client reports as held for the rest of
+  its life, never retried and never mentioned again. The page now says so, names
+  the two platform call sites that cause it, and tells the reader to trust the
+  log line rather than the subscription list. A test drives the real platform
+  path, so the paragraph fails if a later NautilusTrader changes the ordering.
+- **The order book's depth window is documented as an open question, not an
+  answer.** The venue describes the incremental channel's `level` as the
+  "optional depth level interested", which does not say whether a level pushed
+  out of the top-N window is reported as removed. The adapter assumes neither
+  reading — trimming would discard depth Gate.io may still be maintaining — and
+  both the module and the page now state that, along with the one observation
+  that would settle it.
 - **Order emulation is documented.** Every order type this adapter denies —
   trailing stops, conditional orders on options — and every contingency
   relationship can be traded against Gate.io by letting NautilusTrader emulate
