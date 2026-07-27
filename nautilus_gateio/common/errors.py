@@ -34,6 +34,34 @@ class WalletNotProvisionedError(Exception):
     internal transfer into them, and reports ``USER_NOT_FOUND`` until then. The
     adapter treats this as a recoverable configuration state rather than a
     failure, so that an account trading only spot can still start cleanly.
+
+    This is a statement about the ledger: a wallet the venue has not created
+    holds nothing, so a caller may read it as an absence. The venue *declining
+    to answer* is a different fact and carries the subclass
+    :class:`WalletQueryRefusedError`; a caller for which the difference matters
+    must catch that one first.
+    """
+
+
+class WalletQueryRefusedError(WalletNotProvisionedError):
+    """Gate.io would not answer the query, and said nothing about the ledger.
+
+    ``FORBIDDEN`` means the API key lacks the permission the endpoint needs;
+    ``INVALID_UNIFIED_ACCOUNT`` and ``UNIFIED_ACCOUNT_NOT_ACTIVATED`` mean the
+    account is not in the mode the endpoint needs. In all three the venue
+    rejected the *question*. Nothing follows about what the wallet holds — it may
+    hold an open position of any size.
+
+    The distinction is not cosmetic, because for one class of caller the two
+    facts have opposite consequences. Balances may treat both alike: a ledger
+    that cannot be read keeps its previous figures either way, which is why this
+    derives from :class:`WalletNotProvisionedError` rather than standing beside
+    it — every existing handler stays correct. A position query may not, because
+    NautilusTrader reads the absence of a position report as flatness
+    (``LiveExecutionEngine._create_flat_position_report``) and squares the local
+    book against it with a reconciliation order and an inferred fill. Filing a
+    refusal as an absence there closes a live position with an execution nobody
+    made.
     """
 
 

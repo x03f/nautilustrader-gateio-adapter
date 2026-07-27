@@ -4,7 +4,9 @@ Three groups of guarantees are checked here.
 
 1. **Import health.** Every module in the package tree imports cleanly. The
    module list is derived by walking the tree, never hand-maintained, so a new
-   module is covered the moment it is added.
+   module is covered the moment it is added. The test suite itself is held to
+   the same standard: it must import only modules the package still has, and it
+   must collect as a whole.
 2. **Source cleanliness.** No released source file references internal
    infrastructure and every file is English-only. The scan walks the tree
    recursively; a lower bound on the number of scanned files makes a future
@@ -16,6 +18,7 @@ Three groups of guarantees are checked here.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import os
@@ -49,6 +52,9 @@ def find_repo_root() -> Path:
 
 
 REPO_ROOT = find_repo_root()
+
+#: The test suite's own directory, scanned by the layout guard below.
+TESTS_DIR = Path(__file__).resolve().parent
 
 #: The sub-packages introduced by the v0.2.0 layout. Each must be importable and
 #: must survive the wheel build.
@@ -121,6 +127,105 @@ class TestImports:
             if candidate not in walked and candidate.removesuffix(".__init__") not in walked
         }
         assert not missing, f"source files with no walked module: {sorted(missing)}"
+
+
+# -- the test suite must target the layout the package actually has -----------
+#
+# When the package was split into sub-packages, the test modules were left
+# importing the retired flat ones. `pytest` then stopped at "errors during
+# collection", so for as long as it lasted nothing validated the new code at
+# all - and a collection error is easy to step around by naming a subset on the
+# command line, which is how it survived. The guards below name the offending
+# file and the module it wants, instead of failing on whichever module pytest
+# happened to import first.
+
+
+def _adapter_imports_in(path: Path) -> list[tuple[str, str]]:
+    """Return ``(module, imported name)`` for the adapter imports in one file.
+
+    Parsed rather than imported: a module that imports something removed is
+    precisely the case this has to report, and importing it to find out would
+    raise before anything could be reported. ``ast`` also sees imports inside
+    functions and fixtures, which a collection run reaches only if the test
+    that holds them is selected.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found += [
+                (alias.name, "")
+                for alias in node.names
+                if alias.name == PACKAGE_NAME or alias.name.startswith(f"{PACKAGE_NAME}.")
+            ]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                continue  # a relative import, which never names the adapter
+            if module != PACKAGE_NAME and not module.startswith(f"{PACKAGE_NAME}."):
+                continue
+            found += [(module, alias.name) for alias in node.names]
+    return found
+
+
+def suite_adapter_imports() -> list[tuple[str, str, str]]:
+    """``(test module, adapter module, imported name)`` for the whole suite."""
+    return [
+        (path.name, module, name)
+        for path in sorted(TESTS_DIR.glob("*.py"))
+        for module, name in _adapter_imports_in(path)
+    ]
+
+
+class TestSuiteTargetsTheCurrentLayout:
+    def test_the_scan_reaches_the_test_modules(self):
+        """A scan that finds nothing would let the guard below pass vacuously."""
+        imports = suite_adapter_imports()
+        scanned = {source for source, _, _ in imports}
+        assert len(scanned) >= 10, f"only {len(scanned)} test modules import the adapter"
+        assert len(imports) >= MIN_MODULES, f"only {len(imports)} adapter imports found"
+
+    def test_every_adapter_import_in_the_suite_resolves(self):
+        offenders: list[str] = []
+        for source, module, name in suite_adapter_imports():
+            try:
+                imported = importlib.import_module(module)
+            except ImportError as exc:
+                offenders.append(f"{source}: {module} ({exc})")
+                continue
+            if name and not hasattr(imported, name):
+                offenders.append(f"{source}: {module} has no attribute {name!r}")
+        assert not offenders, "the test suite imports what the package does not have: " + "; ".join(
+            offenders,
+        )
+
+    def test_the_whole_suite_collects(self):
+        """The condition the 0.1.0 layout broke: `pytest` must reach every test.
+
+        Deliberately a whole-suite collection rather than an import of each
+        module in turn: collection is what a contributor and CI actually run,
+        and it fails on a broken fixture or a conftest as well as on an import.
+        """
+        result = subprocess.run(  # noqa: S603 - fixed argv, our own suite
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                str(TESTS_DIR),
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            "the test suite does not collect:\n" + (result.stdout + result.stderr)[-2000:]
+        )
 
 
 class TestPublicApi:

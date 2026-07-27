@@ -1655,6 +1655,237 @@ class TestReconnectReconciliation:
         assert OrderStatus.PARTIALLY_FILLED not in safe
         assert OrderStatus.CANCELED not in safe
 
+    @staticmethod
+    def _partly_filled_perp(env) -> Any:
+        """A local order of 10 lots with 4 already booked against it."""
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "900001")
+        text = f"t-{order.client_order_id.value}"
+        env.client._register_text(order.client_order_id, text)
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-BOOKED", -4, text=text),
+        )
+        env.drain(order)
+        assert order.filled_qty == Quantity.from_int(4)
+        return order
+
+    @staticmethod
+    def _listing_report(env, order, *, status, quantity, filled) -> Any:
+        """The venue's own statement of ``order``, as the order listing gives it."""
+        from nautilus_trader.core.uuid import UUID4
+        from nautilus_trader.execution.reports import OrderStatusReport
+
+        ts_now = env.clock.timestamp_ns()
+        return OrderStatusReport(
+            account_id=env.client.account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=status,
+            price=order.price,
+            quantity=quantity,
+            filled_qty=filled,
+            report_id=UUID4(),
+            ts_accepted=ts_now,
+            ts_last=ts_now,
+            ts_init=ts_now,
+        )
+
+    def test_a_partly_filled_order_the_venue_reduced_is_restated(self, perp_harness):
+        """The restatement guard is about inferred fills, so it must follow them.
+
+        The old guard admitted an ACCEPTED report only, which never fires for an
+        order that already carries a fill. That leaves the case the platform's own
+        duplicate filter creates: ``_deduplicate_mass_status_orders`` (installed
+        live/execution_engine.py:2028-2120) compares status, filled quantity,
+        instrument and side and **not** quantity, so a snapshot that has reduced
+        the order while still reporting the filled quantity the cache holds is
+        deleted as an exact duplicate, along with the trades grouped under it. The
+        sweep is then the only thing left, and without a restatement it applies the
+        surviving trade to a quantity the venue has already cut — leaving the order
+        open for ever against a remainder nobody will fill.
+
+        Nothing can be inferred here: ``_handle_fill_quantity_mismatch`` (:3164)
+        generates a fill only on ``report.filled_qty > order.filled_qty`` with the
+        order still open, and these two are equal.
+        """
+        env = perp_harness
+        order = self._partly_filled_perp(env)
+        env.reports.clear()
+
+        env.client._restate_from_listing(
+            self._listing_report(
+                env,
+                order,
+                status=OrderStatus.PARTIALLY_FILLED,
+                quantity=Quantity.from_int(7),
+                filled=Quantity.from_int(4),
+            ),
+        )
+
+        assert [report.quantity for report in env.reports] == [Quantity.from_int(7)]
+
+    def test_a_report_claiming_more_fills_than_the_order_holds_is_not_restated(
+        self,
+        perp_harness,
+    ):
+        """This is the one shape that reaches the inferred-fill branch.
+
+        ``report.filled_qty > order.filled_qty`` on an open order is exactly where
+        ``_handle_fill_quantity_mismatch`` mints a fill with a synthetic trade id —
+        an execution the venue never reported, which the real trade this sweep is
+        about to re-offer would then duplicate.
+        """
+        env = perp_harness
+        order = self._partly_filled_perp(env)
+        env.reports.clear()
+
+        env.client._restate_from_listing(
+            self._listing_report(
+                env,
+                order,
+                status=OrderStatus.PARTIALLY_FILLED,
+                quantity=Quantity.from_int(7),
+                filled=Quantity.from_int(6),
+            ),
+        )
+
+        assert env.reports == []
+
+    @pytest.mark.parametrize(
+        "status",
+        [OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED, OrderStatus.TRIGGERED],
+    )
+    def test_a_terminal_report_is_left_to_the_grouped_hand_over(self, perp_harness, status):
+        """These cannot infer a fill either, and are still not sent alone.
+
+        Their branches in ``_handle_order_status_transitions`` do not restate the
+        order, they *act* on it — reject, trigger, cancel, expire. Sent on their
+        own, ahead of the trade the sweep is about to re-offer, they close the
+        order before its execution is booked, which is the reverse of the order
+        ``_reconcile_execution_mass_status`` uses: there the trades grouped under
+        the report are reconciled first.
+        """
+        env = perp_harness
+        order = self._partly_filled_perp(env)
+        env.reports.clear()
+
+        env.client._restate_from_listing(
+            self._listing_report(
+                env,
+                order,
+                status=status,
+                quantity=Quantity.from_int(7),
+                filled=Quantity.from_int(4),
+            ),
+        )
+
+        assert env.reports == []
+
+    def test_every_unbooked_trade_of_one_order_goes_over_in_one_hand_over(self, perp_harness):
+        """Regression: one trade at a time makes the engine invent the rest.
+
+        Gate.io matches an aggressive order across price levels, so several trades
+        against one order id is the ordinary answer. ``_reconcile_execution_mass_status``
+        applies every trade grouped under an order report *before*
+        ``_handle_fill_quantity_mismatch`` compares the totals; hand it a subset
+        and the comparison disagrees by the trades left out, so the engine closes
+        the difference with an inferred fill carrying a synthetic id and no
+        commission. The real trade that was left out is then rejected on top of it
+        as a duplicate or an overfill: a venue trade id and the fee it paid, both
+        gone.
+        """
+        env = perp_harness
+        mass_statuses = self._capture_mass_status(env)
+        self._wire_gap(env, fill_order_id="900777")
+        env.perp.responses["my_trades"] = lambda **kwargs: (
+            [
+                _futures_fill_payload("T-GAP-1", -2, order_id="900777"),
+                _futures_fill_payload("T-GAP-2", -1, order_id="900777"),
+            ]
+            if kwargs.get("offset", 0) == 0
+            else []
+        )
+        env.perp.responses["get_order"] = _futures_order_payload(
+            id=900777,
+            id_string="900777",
+            left=-7,
+            status="open",
+        )
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
+        env.run(_drain_tasks(env))
+
+        # One re-read and one hand-over for the order, not one per trade.
+        assert [call.args[0] for call in env.perp.calls_named("get_order")] == ["900777"]
+        assert len(mass_statuses) == 2
+        recovered = mass_statuses[1]
+        assert [fill.trade_id for fill in recovered.fill_reports[VenueOrderId("900777")]] == [
+            TradeId("T-GAP-1"),
+            TradeId("T-GAP-2"),
+        ]
+
+    def test_an_order_the_venue_reports_under_another_id_is_rebased_first(self, perp_harness):
+        """A conditional that fired during the outage speaks under a new id.
+
+        Gate.io creates a brand-new order when a trigger fires, so the cached
+        order still holds the armed id while the venue's listing — and every trade
+        it produced — names the fired one. Nothing in reconciliation bridges that:
+        ``create_order_filled_event`` (live/reconciliation.py:381) stamps the fill
+        with ``report.venue_order_id``, ``Order.apply`` refuses an ``OrderFilled``
+        whose venue order id differs from the order's, and the engine logs the
+        ``ValueError`` away. ``_should_update`` (live/execution_engine.py:3307)
+        compares quantity, price and trigger price and never the venue order id,
+        so the rebase has to come from this client before the reports go over.
+        """
+        env = perp_harness
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "900001")
+        env.client._register_text(order.client_order_id, f"t-{order.client_order_id.value}")
+        env.client._register_trigger_link(
+            GateioProductType.PERP,
+            "900001",
+            order.client_order_id,
+        )
+        self._wire_gap(env, fill_order_id="900777")
+        env.perp.responses["list_orders"] = lambda **kwargs: (
+            [
+                _futures_order_payload(
+                    id=900777,
+                    id_string="900777",
+                    left=-7,
+                    text=f"t-{order.client_order_id.value}",
+                ),
+            ]
+            if kwargs.get("status") == "open"
+            else []
+        )
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
+
+        assert env.cache.venue_order_id(order.client_order_id) == VenueOrderId("900777")
+        rebases = [
+            event
+            for event in env.events_of(OrderUpdated)
+            if event.venue_order_id == VenueOrderId("900777")
+        ]
+        assert len(rebases) == 1
+        assert env.client.trigger_links[order.client_order_id].fired_id == "900777"
+
     def test_a_trade_already_on_its_order_is_not_reported_a_second_time(self, perp_harness):
         """The sweep is a repair, not a second delivery.
 

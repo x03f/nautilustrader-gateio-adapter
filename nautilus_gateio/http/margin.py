@@ -25,7 +25,9 @@ The endpoints in this module are the ones most likely to fail for reasons that
 are *configuration*, not error: an unprovisioned wallet, an account still in
 classic mode, or an API key without unified permission. :func:`require_wallet`
 turns those responses into
-:class:`~nautilus_gateio.common.errors.WalletNotProvisionedError` with an
+:class:`~nautilus_gateio.common.errors.WalletNotProvisionedError` — or, where the
+venue refused the query rather than reporting an empty ledger, its subclass
+:class:`~nautilus_gateio.common.errors.WalletQueryRefusedError` — with an
 actionable message, so a caller trading only spot can degrade gracefully instead
 of failing to start.
 """
@@ -40,6 +42,7 @@ from nautilus_gateio.common.errors import (
     WALLET_NOT_PROVISIONED_LABELS,
     GateioClientError,
     WalletNotProvisionedError,
+    WalletQueryRefusedError,
 )
 from nautilus_gateio.http.client import GateioHttpClient
 
@@ -69,9 +72,24 @@ async def require_wallet[T](awaitable: Awaitable[T], description: str) -> T:
 
     Gate.io reports "this wallet does not exist yet", "this account is not in the
     required mode" and "this key lacks permission" as ordinary 4xx errors with
-    distinctive labels. Those three conditions are configuration states rather
-    than failures, and they all have the same consequence for a caller: the
-    ledger is simply unavailable.
+    distinctive labels. All three are configuration states rather than failures,
+    and for a caller that only wants to read a balance they have the same
+    consequence: the ledger is unavailable and the previous figures stand.
+
+    They are **not** the same fact, and the two are raised as two types, because
+    for a caller that turns silence into a claim the difference decides whether
+    an execution is invented. ``USER_NOT_FOUND`` says the wallet does not exist,
+    so it holds nothing; that is an absence, and
+    :class:`WalletNotProvisionedError` states it. The account-mode labels say the
+    venue rejected the question, so nothing at all is known about the ledger;
+    :class:`WalletQueryRefusedError` states that, and being a subclass it is
+    still caught by every handler that legitimately treats both alike.
+
+    Deciding this here rather than at the catch sites is the point. The label is
+    the only place the two are distinguishable, a caller that re-derived the
+    distinction from ``__cause__`` would be one call site away from getting it
+    wrong, and a new call site would inherit "absence" as its default reading —
+    which is the wrong way round for the one consequence that cannot be undone.
 
     Parameters
     ----------
@@ -82,16 +100,24 @@ async def require_wallet[T](awaitable: Awaitable[T], description: str) -> T:
 
     Raises
     ------
+    WalletQueryRefusedError
+        If the venue refused the query (an account-mode or permission label), so
+        that nothing is known about the ledger.
     WalletNotProvisionedError
-        If the venue answered with a wallet-provisioning or account-mode label.
+        If the venue reported the wallet as not yet created, which is a statement
+        that it holds nothing.
     GateioError
         Unchanged, for every other failure.
     """
     try:
         return await awaitable
     except GateioClientError as exc:
-        if exc.label in WALLET_NOT_PROVISIONED_LABELS or exc.label in ACCOUNT_MODE_LABELS:
-            remedy = _REMEDIES.get(exc.label, "the account is not configured for this ledger")
+        remedy = _REMEDIES.get(exc.label, "the account is not configured for this ledger")
+        if exc.label in ACCOUNT_MODE_LABELS:
+            raise WalletQueryRefusedError(
+                f"{description} could not be read ({exc.label}): {remedy}"
+            ) from exc
+        if exc.label in WALLET_NOT_PROVISIONED_LABELS:
             raise WalletNotProvisionedError(
                 f"{description} is unavailable ({exc.label}): {remedy}"
             ) from exc

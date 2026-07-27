@@ -444,14 +444,18 @@ def _ask(env, instrument_id):
 class TestPositionQueryRefusal:
     """A refusal is not an answer, and never a FLAT position.
 
-    `require_wallet` raises one exception for two different facts. Only
-    ``USER_NOT_FOUND`` is a statement about positions — the wallet does not exist,
-    so nothing is in it. ``FORBIDDEN`` and the unified-account labels say the key
-    or the account mode may not look, which says nothing at all about what is
-    open. Reading them as "no position" reaches the FLAT fallback and hands the
-    engine a claim nobody made; the engine then squares the book against it with
-    a RECONCILIATION order and an inferred fill, closing a position that is still
-    open at the venue.
+    Only ``USER_NOT_FOUND`` is a statement about positions — the wallet does not
+    exist, so nothing is in it. ``FORBIDDEN`` and the unified-account labels say
+    the key or the account mode may not look, which says nothing at all about
+    what is open. Reading them as "no position" reaches the FLAT fallback and
+    hands the engine a claim nobody made; the engine then squares the book
+    against it with a RECONCILIATION order and an inferred fill, closing a
+    position that is still open at the venue.
+
+    ``require_wallet`` separates the two at the source, so the distinction is a
+    type rather than a rule each catch site has to remember. These tests hold the
+    behaviour at the client; ``tests/test_errors.py`` holds the typing that makes
+    it the default.
     """
 
     @pytest.mark.parametrize("label", REFUSAL_LABELS)

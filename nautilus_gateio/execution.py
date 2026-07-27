@@ -173,12 +173,12 @@ from nautilus_gateio.common.enums import (
     time_in_force_to_gateio,
 )
 from nautilus_gateio.common.errors import (
-    ACCOUNT_MODE_LABELS,
     GateioError,
     GateioServerError,
     OrderValidationError,
     UnsupportedOrderError,
     WalletNotProvisionedError,
+    WalletQueryRefusedError,
 )
 from nautilus_gateio.common.parsing import timestamp_to_nanos, to_decimal, to_float, to_int
 from nautilus_gateio.common.signing import generate_client_order_id
@@ -471,6 +471,35 @@ FILLABLE_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
 RESTATABLE_ORDER_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
     {OrderStatus.INITIALIZED, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED},
 )
+
+#: Report statuses for which ``_handle_order_status_transitions`` returns a
+#: verdict instead of falling through to ``_handle_fill_quantity_mismatch``.
+#:
+#: Read off the installed engine (live/execution_engine.py:3237-3305): each of
+#: these has a branch ending in ``return True``, so no report carrying one of
+#: them can reach the inferred-fill path. They are still not interchangeable —
+#: every branch but ACCEPTED's *acts* on the order (rejects, triggers, cancels or
+#: expires it) rather than merely restating its quantity, which is why
+#: :meth:`GateioExecutionClient._restate_from_listing` sends only ACCEPTED alone
+#: and leaves the rest to the grouped hand-over, where the trades under the
+#: report are reconciled before the terminal event is generated.
+SHORT_CIRCUIT_REPORT_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+    {
+        OrderStatus.REJECTED,
+        OrderStatus.ACCEPTED,
+        OrderStatus.TRIGGERED,
+        OrderStatus.CANCELED,
+        OrderStatus.EXPIRED,
+    },
+)
+
+#: How many event-loop turns to give a rebasing ``OrderUpdated`` before declaring
+#: that it did not arrive. Three would do — the engine's enqueuer schedules the
+#: put with ``call_soon_threadsafe``, its queue task then wakes and applies the
+#: event — and the margin is there so the bound never becomes the reason a
+#: correct rebase is reported as lost. The point of the bound is only that a
+#: stopped engine costs a log line instead of a hang.
+VENUE_ORDER_ID_REBASE_TURNS: Final[int] = 100
 
 #: Local order statuses an ``OrderRejected`` can still be applied from.
 #:
@@ -1025,6 +1054,12 @@ class GateioExecutionClient(LiveExecutionClient):
             if report.venue_order_id is not None
         }
 
+        # The venue may be reporting an order under an id the local order does
+        # not hold — a conditional that fired during the outage is the ordinary
+        # case — and every execution grouped under that id would be refused by
+        # the order until it is rebased.
+        await self._adopt_reported_venue_order_ids(order_reports)
+
         self._send_mass_status_report(mass_status)
         await self._hand_over_unapplied_fills(fill_reports, listed_orders)
 
@@ -1084,18 +1119,104 @@ class GateioExecutionClient(LiveExecutionClient):
         a worse outcome than the missed trade this sweep exists to repair, so the
         order is restated first (:meth:`_restate_from_listing`) and the trade is
         only re-offered alone once the order can actually take it
-        (:meth:`_reoffer_recovered_fill`).
+        (:meth:`_reoffer_recovered_fills`).
+
+        The sweep works **per order, not per trade**. An aggressive order walks
+        the book, so Gate.io routinely answers with several trades against one
+        order id, and a trade re-offered on its own would then be handed to
+        ``_reconcile_execution_mass_status`` alongside an order report claiming
+        the *total* filled quantity: the engine closes that difference with an
+        inferred fill carrying a synthetic trade id and no commission
+        (``_handle_fill_quantity_mismatch``, live/execution_engine.py:3164), and
+        the next real trade is rejected on top of it as a duplicate or an
+        overfill. Losing a real venue trade id to a fabricated one costs the fee
+        that trade paid — a spot buy's fee is withheld in the base currency, so
+        the position is overstated by it — and destroys the only key by which a
+        later replay of that trade could be recognised.
         """
+        unapplied: dict[VenueOrderId | None, list[FillReport]] = {}
         for report in fill_reports:
             if self._fill_is_booked(report):
                 continue
+            unapplied.setdefault(report.venue_order_id, []).append(report)
+
+        for venue_order_id, reports in unapplied.items():
             self._log.warning(
-                f"Recovered trade {report.trade_id.value} was not booked by the grouped "
-                f"hand-over for {report.venue_order_id!r}; re-offering it with the venue's "
-                f"own statement of the order",
+                f"{len(reports)} recovered trade(s) "
+                f"({', '.join(r.trade_id.value for r in reports)}) were not booked by the "
+                f"grouped hand-over for {venue_order_id!r}; re-offering them with the "
+                f"venue's own statement of the order",
             )
-            self._restate_from_listing(listed_orders.get(report.venue_order_id))
-            await self._reoffer_recovered_fill(report)
+            self._restate_from_listing(listed_orders.get(venue_order_id))
+            await self._reoffer_recovered_fills(reports)
+
+    async def _adopt_reported_venue_order_ids(
+        self,
+        order_reports: list[OrderStatusReport],
+    ) -> None:
+        """Move local orders onto the venue order id the venue is reporting them under.
+
+        Gate.io arms a price-triggered order under one id and creates a **new
+        order with a different id** when the trigger fires. Across a restart the
+        cached order still holds the armed id, while the venue's order listing —
+        and every trade it produced — speaks under the fired one. Nothing in
+        reconciliation bridges that: ``create_order_filled_event``
+        (live/reconciliation.py:381) stamps the fill with
+        ``report.venue_order_id``, ``Order.apply`` refuses an ``OrderFilled``
+        whose venue order id differs from the order's, and ``_reconcile_fill_report``
+        (live/execution_engine.py:3379-3383) catches that ``ValueError`` and logs
+        it away. The execution is simply gone.
+
+        ``OrderUpdated`` is the one carrier the platform lets change a venue
+        order id, and the engine emits one only through ``_should_update``
+        (:3307-3318), which compares quantity, price and trigger price and never
+        the venue order id. So the rebase has to come from this client, before
+        the reports are handed over — which is what
+        :meth:`_maybe_swap_trigger_venue_order_id` already does for stream
+        events, and this is the same call on the reconciliation path.
+
+        The wait afterwards is not a delay, it is the outcome check. A client's
+        events reach the order through ``ExecEngine.process``, which
+        ``LiveExecutionEngine.process`` (:467-482) hands to a ``ThrottledEnqueuer``
+        that schedules the put with ``loop.call_soon_threadsafe`` for a separate
+        task to drain — so the update is applied a few loop turns later, whereas
+        the reports go over ``msgbus.send`` and are reconciled inline. Yielding
+        until the order object actually carries the new id is the only way to
+        know the fill that follows can land, and it is bounded so that an engine
+        which is not draining its queue costs a log line rather than a hang.
+        """
+        pending: list[tuple[Order, VenueOrderId]] = []
+        ts_now = self._clock.timestamp_ns()
+        for report in order_reports:
+            venue_order_id = report.venue_order_id
+            if venue_order_id is None:
+                continue
+            order = self._order_of_report(report)
+            if order is None or order.is_closed:
+                continue
+            if order.venue_order_id is None or order.venue_order_id == venue_order_id:
+                continue
+            self._maybe_swap_trigger_venue_order_id(order, venue_order_id, ts_now)
+            if self._cache.venue_order_id(order.client_order_id) == venue_order_id:
+                # The rebase was accepted (or had already been emitted): the
+                # cache mapping is written synchronously by it, so it is the one
+                # signal that does not depend on event delivery. Where it was
+                # declined the order is left alone and nothing is waited for.
+                pending.append((order, venue_order_id))
+
+        for _ in range(VENUE_ORDER_ID_REBASE_TURNS):
+            if all(order.venue_order_id == value for order, value in pending):
+                return
+            await asyncio.sleep(0)
+
+        for order, value in pending:
+            if order.venue_order_id != value:
+                self._log.error(
+                    f"{order.client_order_id!r} still holds venue order id "
+                    f"{order.venue_order_id} after the rebase onto {value} was emitted; "
+                    f"every execution Gate.io reports under {value} will be refused by the "
+                    f"order and lost",
+                )
 
     def _restate_from_listing(self, order_report: OrderStatusReport | None) -> None:
         """Put the venue's own order quantity on the order, before its trade lands.
@@ -1112,45 +1233,102 @@ class GateioExecutionClient(LiveExecutionClient):
         ``_should_update`` -> ``_generate_order_updated`` -> ``_handle_event``,
         all inline, before this method returns.
 
-        Only an ACCEPTED report is used, and only against a local order that has
-        not been filled yet. That is not caution for its own sake: ACCEPTED is
-        the one status whose branch in ``_handle_order_status_transitions``
-        restates the quantity and returns "reconciled" without generating an
-        event the FSM would refuse and without falling through to
-        ``_handle_fill_quantity_mismatch``, which would close the gap between the
-        report's filled quantity and the order's with an INFERRED fill carrying a
-        synthetic trade id — an execution the venue never reported, and the very
-        damage the trade about to be re-offered would then duplicate.
+        What may be restated is decided by one question — *can this report make
+        the engine mint an inferred fill?* — answered off the installed engine
+        rather than guessed. ``_reconcile_order_report``
+        (live/execution_engine.py:3093-3107) reaches
+        ``_handle_fill_quantity_mismatch`` only when
+        ``_handle_order_status_transitions`` returns ``None``, and that method
+        (:3237-3305) returns a verdict instead — short-circuiting — for REJECTED,
+        ACCEPTED, TRIGGERED, CANCELED and EXPIRED reports. Inside
+        ``_handle_fill_quantity_mismatch`` (:3164-3235) an inferred fill is
+        generated on exactly one branch: ``report.filled_qty > order.filled_qty``
+        with the order still open. Equal quantities return having generated
+        nothing, and a report claiming *fewer* fills than the order holds logs a
+        diagnostic and returns False without generating anything either.
+
+        So the guard admits:
+
+        * an ACCEPTED report against an order in :data:`RESTATABLE_ORDER_STATUSES`
+          — the branch short-circuits, and the status set is what keeps the
+          ``OrderAccepted`` it also emits from being one the FSM refuses;
+        * any report that falls through, provided its filled quantity does not
+          exceed the order's — the one combination in which the inferred fill
+          cannot be reached.
+
+        and refuses the remaining short-circuiting statuses. Not for the inferred
+        fill, which they cannot produce either, but because their branches do
+        something other than restate: they reject, trigger, cancel or expire the
+        order. Sent alone, ahead of the trade this sweep is about to re-offer,
+        a CANCELED or EXPIRED report closes the order *before* its execution is
+        booked — the reverse of the order ``_reconcile_execution_mass_status``
+        uses, where those branches reconcile the trades grouped under the report
+        first. Those reports reach the order through the grouped hand-over,
+        which is where they belong.
+
+        The old guard was ACCEPTED-only, which is far narrower than its own
+        stated reason and misses the pairing that matters most: a local order
+        that already carries a fill. ``_deduplicate_mass_status_orders``
+        (:2028-2120) compares status, filled quantity, instrument and side, and
+        **not** quantity, so a venue snapshot that has reduced the order while
+        still reporting the filled quantity the cache holds is deleted as an
+        exact duplicate together with every trade grouped under it. That is
+        precisely ``report.filled_qty == order.filled_qty`` — the branch that
+        generates nothing — and refusing to restate there leaves the order
+        working against a remainder the venue has already cut.
         """
-        if order_report is None or order_report.order_status != OrderStatus.ACCEPTED:
+        if order_report is None:
             return
         order = self._order_of_report(order_report)
-        if order is None or order.status not in RESTATABLE_ORDER_STATUSES:
+        if order is None or order.is_closed:
             return
         if order.quantity == order_report.quantity:
+            return  # Nothing to restate
+        if order.is_quote_quantity:
+            # A Gate.io spot market buy is submitted as a quote-currency cash
+            # amount, so its quantity is not comparable with the base-denominated
+            # quantity of the venue's own report; the conversion belongs to the
+            # grouped hand-over, which restates and applies in one pass.
+            return
+        if order_report.order_status == OrderStatus.ACCEPTED:
+            if order.status not in RESTATABLE_ORDER_STATUSES:
+                return
+        elif order_report.order_status in SHORT_CIRCUIT_REPORT_STATUSES:
+            return
+        elif order_report.filled_qty > order.filled_qty:
             return
         self._log.info(
             f"Restating {order.client_order_id!r} from {order.quantity} to "
-            f"{order_report.quantity} before re-offering its recovered trade: Gate.io's own "
-            f"order listing is what the recovered execution has to add up to",
+            f"{order_report.quantity} before re-offering its recovered trades: Gate.io's own "
+            f"order listing is what the recovered executions have to add up to",
         )
         self._send_order_status_report(order_report)
 
-    async def _reoffer_recovered_fill(self, report: FillReport) -> None:
-        """Re-offer one recovered trade by the route that can actually book it."""
-        order = self._order_of_report(report)
-        if order is None or order.is_closed or not self._order_can_take(order, report):
-            # Either the order is not this client's to restate, or its quantity
-            # cannot hold this execution (a venue-side reduction the listing did
-            # not carry, or a spot market buy still denominated in the quote
-            # currency, whose quantity is a cash amount and not a quantity at
-            # all). A lone fill would be applied to it regardless and the order
-            # could never reach a terminal status again, so the order is re-read
-            # and the two are handed over together, which is the one path that
-            # restates before it applies.
-            await self._hand_over_fill_with_its_order(report)
-            return
-        self._send_fill_report(report)
+    async def _reoffer_recovered_fills(self, reports: list[FillReport]) -> None:
+        """Re-offer one order's recovered trades by the route that can book them.
+
+        Each trade is offered on its own for as long as the order can take it,
+        which is the cheapest route and the one that keeps every venue trade id.
+        The moment one cannot be taken, that trade and every trade after it go
+        over together with the venue's own statement of the order — together,
+        because a hand-over carrying one trade of several makes the engine infer
+        the rest.
+        """
+        for index, report in enumerate(reports):
+            order = self._order_of_report(report)
+            if order is None or order.is_closed or not self._order_can_take(order, report):
+                # Either the order is not this client's to restate, or its
+                # quantity cannot hold this execution (a venue-side reduction the
+                # listing did not carry, or a spot market buy still denominated
+                # in the quote currency, whose quantity is a cash amount and not
+                # a quantity at all). A lone fill would be applied to it
+                # regardless and the order could never reach a terminal status
+                # again, so the order is re-read and they are handed over
+                # together, which is the one path that restates before it
+                # applies.
+                await self._hand_over_fills_with_their_order(reports[index:])
+                return
+            self._send_fill_report(report)
 
     def _order_of_report(self, report: OrderStatusReport | FillReport) -> Order | None:
         """Return the local order a report is about, if this client holds one.
@@ -1208,17 +1386,30 @@ class GateioExecutionClient(LiveExecutionClient):
             self._send_fill_report(report)
             return
         self.create_task(
-            self._hand_over_fill_with_its_order(report),
+            self._hand_over_fills_with_their_order([report]),
             log_msg=f"hand_over_fill_{report.trade_id.value}",
         )
 
-    async def _hand_over_fill_with_its_order(self, report: FillReport) -> None:
-        """Re-read the order a trade belongs to and hand both over together."""
+    async def _hand_over_fills_with_their_order(self, reports: list[FillReport]) -> None:
+        """Re-read one order and hand it over with every trade recovered for it.
+
+        ``reports`` must all name the same venue order: the engine groups trades
+        under an order report by venue order id, and the whole benefit of the
+        grouped path is that ``_reconcile_execution_mass_status`` applies *all* of
+        them, each under its own trade id and its own commission, before
+        ``_handle_fill_quantity_mismatch`` compares the totals. Handing over a
+        subset makes that comparison disagree by the trades left out, and the
+        engine closes the difference with an inferred fill carrying a synthetic
+        id and no commission — replacing real executions with a fabricated one.
+        """
+        if not reports:
+            return
+        first = reports[0]
         order_report = await self.generate_order_status_report(
             GenerateOrderStatusReport(
-                instrument_id=report.instrument_id,
+                instrument_id=first.instrument_id,
                 client_order_id=None,
-                venue_order_id=report.venue_order_id,
+                venue_order_id=first.venue_order_id,
                 command_id=UUID4(),
                 ts_init=self._clock.timestamp_ns(),
             ),
@@ -1232,39 +1423,44 @@ class GateioExecutionClient(LiveExecutionClient):
                 ts_init=self._clock.timestamp_ns(),
             )
             # The engine groups trades under an order report by venue order id,
-            # so the fill has to be added alongside the report of the very order
-            # the venue attributed it to — which is the one that was just
+            # so the fills have to be added alongside the report of the very
+            # order the venue attributed them to — which is the one that was just
             # queried by that id.
             mass_status.add_order_reports(reports=[order_report])
-            mass_status.add_fill_reports(reports=[report])
+            mass_status.add_fill_reports(reports=reports)
             self._send_mass_status_report(mass_status)
-            if self._fill_is_booked(report):
-                return
 
-        if self._cache.client_order_id(report.venue_order_id) is None:
-            self._log.error(
-                f"Trade {report.trade_id.value} on {report.instrument_id} cannot be booked: "
-                f"Gate.io did not answer for order {report.venue_order_id!r}, and the execution "
-                f"engine discards a fill report whose venue order id it has never seen. "
-                f"{report.last_qty} at {report.last_px} is traded and missing from the position",
-            )
+        unbooked = [report for report in reports if not self._fill_is_booked(report)]
+        if not unbooked:
             return
 
-        # The grouped hand-over did not book it either — the re-read answered
+        if self._cache.client_order_id(first.venue_order_id) is None:
+            for report in unbooked:
+                self._log.error(
+                    f"Trade {report.trade_id.value} on {report.instrument_id} cannot be booked: "
+                    f"Gate.io did not answer for order {report.venue_order_id!r}, and the "
+                    f"execution engine discards a fill report whose venue order id it has never "
+                    f"seen. {report.last_qty} at {report.last_px} is traded and missing from "
+                    f"the position",
+                )
+            return
+
+        # The grouped hand-over did not book them either — the re-read answered
         # with a status that short-circuits the trade loop, or the engine's
         # duplicate filter removed the order report and its trades with it. The
         # order is at least indexed, so the single-report path can still attach
-        # the execution. It is taken last and never silently: the order may be
+        # the executions. It is taken last and never silently: the order may be
         # left with a quantity it can no longer reach, and an execution recorded
         # against an order that stays open is a smaller loss than an execution
         # not recorded at all.
-        self._log.error(
-            f"Trade {report.trade_id.value} of {report.last_qty} at {report.last_px} on "
-            f"{report.instrument_id} could only be booked without the venue's statement of "
-            f"order {report.venue_order_id!r}; if Gate.io has since reduced that order it will "
-            f"stay open in the cache until it is cancelled",
-        )
-        self._send_fill_report(report)
+        for report in unbooked:
+            self._log.error(
+                f"Trade {report.trade_id.value} of {report.last_qty} at {report.last_px} on "
+                f"{report.instrument_id} could only be booked without the venue's statement of "
+                f"order {report.venue_order_id!r}; if Gate.io has since reduced that order it "
+                f"will stay open in the cache until it is cancelled",
+            )
+            self._send_fill_report(report)
 
     def _handle_late_fill(
         self,
@@ -4068,6 +4264,12 @@ class GateioExecutionClient(LiveExecutionClient):
             self._log.exception("Cannot reconcile execution state", failure)
             return None
 
+        # A restart destroys the armed/fired identity map, so the cached order
+        # still holds the id it was placed under while the venue reports it — and
+        # its trades — under the id the trigger created. The engine reconciles a
+        # mass status inline, so the rebase has to land before it is handed over.
+        await self._adopt_reported_venue_order_ids(orders)
+
         mass_status.add_order_reports(reports=orders)
         mass_status.add_fill_reports(reports=fills)
 
@@ -5255,22 +5457,23 @@ class GateioExecutionClient(LiveExecutionClient):
                 continue  # Spot balances are not positions; nothing to query
             try:
                 reports += await self._position_reports_for_product(product, requested)
+            except WalletQueryRefusedError as e:
+                # The venue was asked and would not answer: the key lacks the
+                # permission, or the account is not in the mode the endpoint
+                # needs. Nothing follows about what the ledger holds, so this
+                # client declines to speak for the product at all — the same
+                # refusal `_refuse_incomplete_account_sweep` makes below for the
+                # products it structurally cannot route. Reading it as "no
+                # position here" is how it would reach the FLAT fallback and
+                # close a position that is still open.
+                self._log_report_error(e, f"{product.value} PositionStatusReports")
+                failures.append(e)
             except WalletNotProvisionedError as e:
-                if _is_refusal(e):
-                    # The venue was asked and would not answer. `require_wallet`
-                    # folds three different labels into this one exception, and
-                    # only USER_NOT_FOUND is a statement about positions;
-                    # FORBIDDEN and the unified-account labels say the key or the
-                    # account mode is not allowed to look. Treating those as
-                    # "no position here" is how a refusal becomes the FLAT
-                    # fallback below and closes a position that is still open.
-                    self._log_report_error(e, f"{product.value} PositionStatusReports")
-                    failures.append(e)
-                    continue
                 # A wallet Gate.io has not created yet holds no position: the
                 # venue creates it on the first transfer in and says
                 # USER_NOT_FOUND until then, which is a definite absence rather
-                # than an unanswered question.
+                # than an unanswered question. This clause must stay *below* the
+                # refusal clause, which is a subclass of it.
                 self._log.warning(f"Skipping {product.value} position reports: {e}")
             except asyncio.CancelledError:
                 raise
@@ -5477,25 +5680,6 @@ def _accumulate(
     """Add a wallet's contribution to the aggregated per-currency balance."""
     previous_total, previous_free = balances.get(currency, (Decimal(0), Decimal(0)))
     balances[currency] = (previous_total + total, previous_free + max(Decimal(0), free))
-
-
-def _is_refusal(error: WalletNotProvisionedError) -> bool:
-    """Return whether the venue refused to answer rather than reported an absence.
-
-    ``require_wallet`` raises one exception type for two different facts:
-    ``USER_NOT_FOUND`` ("this wallet does not exist yet", so there is nothing in
-    it) and the account-mode labels ``FORBIDDEN``,
-    ``INVALID_UNIFIED_ACCOUNT``, ``UNIFIED_ACCOUNT_NOT_ACTIVATED`` ("this key or
-    this account mode may not read that ledger", which says nothing about what
-    the ledger holds). Balances can treat both as "skip this wallet"; a position
-    report cannot, because the absence of a report is read as flatness.
-
-    The distinguishing label is on the original venue error, which
-    ``require_wallet`` chains with ``raise ... from``, so it is read from
-    ``__cause__`` rather than by re-parsing the message.
-    """
-    label = getattr(error.__cause__, "label", None)
-    return label in ACCOUNT_MODE_LABELS
 
 
 def _is_cross_margin(position: dict[str, Any]) -> bool:

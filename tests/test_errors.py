@@ -13,9 +13,11 @@ from nautilus_gateio.common.errors import (
     OrderValidationError,
     UnsupportedOrderError,
     WalletNotProvisionedError,
+    WalletQueryRefusedError,
     error_from_response,
     should_retry,
 )
+from nautilus_gateio.http.margin import require_wallet
 
 
 class TestErrorFromResponse:
@@ -107,10 +109,66 @@ class TestLabelSets:
         assert not WALLET_NOT_PROVISIONED_LABELS & ACCOUNT_MODE_LABELS
 
 
+async def _raise(error: Exception):
+    raise error
+
+
+class TestRefusalIsTypedApartFromAbsence:
+    """A missing wallet and a refused query are two different facts.
+
+    Only the first says anything about what the ledger holds. Collapsing them
+    into one type makes "absence" the default reading of a refusal at every catch
+    site, and where that site is the position query the absence becomes a FLAT
+    report the venue never made — the engine then squares a live book with a
+    reconciliation order and an inferred fill.
+    """
+
+    @pytest.mark.parametrize("label", sorted(ACCOUNT_MODE_LABELS))
+    async def test_a_refusal_carries_the_refusal_type(self, label):
+        with pytest.raises(WalletQueryRefusedError) as excinfo:
+            await require_wallet(_raise(GateioClientError(403, label, "nope")), "the wallet")
+
+        assert label in str(excinfo.value)
+
+    @pytest.mark.parametrize("label", sorted(WALLET_NOT_PROVISIONED_LABELS))
+    async def test_an_unprovisioned_wallet_does_not(self, label):
+        with pytest.raises(WalletNotProvisionedError) as excinfo:
+            await require_wallet(_raise(GateioClientError(400, label, "nope")), "the wallet")
+
+        assert not isinstance(excinfo.value, WalletQueryRefusedError)
+
+    @pytest.mark.parametrize("label", sorted(ACCOUNT_MODE_LABELS))
+    async def test_a_refusal_is_still_caught_as_an_unavailable_wallet(self, label):
+        """The subclass is what keeps every existing handler correct.
+
+        A caller that only reads balances is right to treat both alike: a ledger
+        it cannot read keeps its previous figures whichever fact it is. Making
+        the refusal a sibling type instead would turn a permission error on a
+        secondary wallet into a hard start-up failure.
+        """
+        with pytest.raises(WalletNotProvisionedError):
+            await require_wallet(_raise(GateioClientError(403, label, "nope")), "the wallet")
+
+    async def test_an_unrelated_venue_error_passes_through_untouched(self):
+        with pytest.raises(GateioClientError):
+            await require_wallet(
+                _raise(GateioClientError(400, "INVALID_PARAM_VALUE", "bad")),
+                "the wallet",
+            )
+
+    def test_the_refusal_type_is_not_retryable_either(self):
+        assert should_retry(WalletQueryRefusedError("the key may not read that ledger")) is False
+
+
 class TestAdapterLevelErrors:
     @pytest.mark.parametrize(
         "error_class",
-        [WalletNotProvisionedError, OrderValidationError, UnsupportedOrderError],
+        [
+            WalletNotProvisionedError,
+            WalletQueryRefusedError,
+            OrderValidationError,
+            UnsupportedOrderError,
+        ],
     )
     def test_adapter_errors_are_plain_exceptions_not_venue_errors(self, error_class):
         """They describe local conditions, so they carry no HTTP status."""
