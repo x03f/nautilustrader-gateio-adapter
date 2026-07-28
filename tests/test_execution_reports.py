@@ -18,6 +18,7 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
 )
+from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.model.enums import (
     LiquiditySide,
     OmsType,
@@ -36,6 +37,7 @@ from nautilus_gateio.common.errors import GateioError, WalletNotProvisionedError
 from nautilus_gateio.execution import (
     REPORT_PAGE_LIMIT,
     FillReportsUnavailable,
+    OrderReportsUnavailable,
     PositionStatusUnavailable,
 )
 
@@ -942,11 +944,40 @@ class TestStalePositionAnswersAfterRecovery:
         assert [report.position_side for report in reports] == [PositionSide.LONG]
         assert PERP_BTC_USDT not in env.client._recovery_booked
 
-    def test_a_disagreement_the_bookings_do_not_explain_is_reported(self, perp_env):
-        """A difference beyond the booked trades is a genuine discrepancy: the
-        engine must see it, or position reconciliation would be blinded."""
+    def test_a_disagreement_not_provably_fresh_is_withheld_until_fresher(self, perp_env):
+        """Round seven REPORTED any disagreement the bookings did not explain,
+        and the parity refutation proved that reading wrong: an answer staler
+        than the memory itself (an absent row, a zero-size row predating a
+        pre-existing position) matches neither book and was believed as
+        current, erasing the position with a fabricated execution while
+        reconciliation reported success. The repaired doctrine (REC-05): an
+        answer that cannot contain the trades this pass just booked and cannot
+        be shown to postdate them supports NO claim, whatever it reads. The
+        engine hears a withheld answer as an unanswered query, so the node
+        refuses to start until the venue produces a fresher row — the same
+        fail-safe trade the zero-pre-book slice already made."""
         env = perp_env
         self._after_recovery_booked(env, 4, booked_ts_ns=2**62)
+        env.perp.responses["position"] = [
+            {
+                "contract": "BTC_USDT",
+                "size": 9,
+                "entry_price": "60000",
+                "update_time": INSIDE_SECS,
+            },
+        ]
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_a_fresher_disagreement_is_reported(self, perp_env):
+        """A genuine discrepancy the engine must see arrives with a stamp the
+        booked trades cannot refute; freshness, not agreement, is what lets a
+        disagreement through."""
+        env = perp_env
+        self._after_recovery_booked(env, 4, booked_ts_ns=1)
         env.perp.responses["position"] = [
             {
                 "contract": "BTC_USDT",
@@ -962,6 +993,590 @@ class TestStalePositionAnswersAfterRecovery:
 
         assert [report.position_side for report in reports] == [PositionSide.LONG]
         assert reports[0].quantity == Quantity.from_int(9)
+        assert PERP_BTC_USDT not in env.client._recovery_booked
+
+    # -- REC-05: the refuted direction — a pre-existing position ------------
+
+    @staticmethod
+    def _booked_over_a_preexisting_position(
+        env: ExecHarness,
+        cache_lots: int,
+        delta: int,
+        booked_ts_ns: int,
+    ) -> None:
+        """The state the parity refutation demonstrated: the cache holds MORE
+        than this pass booked, because part of the position pre-dates the
+        recovery (booked in a previous session). An answer equal to neither
+        the pre-booking book (cache - delta) nor the post-booking book (cache)
+        is staler than the memory itself, not fresher than it."""
+        _cache_open_position(env, PERP_BTC_USDT, Quantity.from_int(cache_lots))
+        env.client._recovery_booked[PERP_BTC_USDT] = (Decimal(delta), booked_ts_ns)
+
+    def test_an_absent_row_cannot_erase_a_preexisting_position(self, perp_env):
+        env = perp_env
+        self._booked_over_a_preexisting_position(env, cache_lots=6, delta=4, booked_ts_ns=2**62)
+        env.perp.responses["position"] = []
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_a_zero_row_staler_than_the_memory_is_withheld(self, perp_env):
+        """Gate.io keeps zero-size rows for traded contracts, so this shape is
+        one the venue produces; stamped no later than the booked trades it is
+        a stale read, not a statement that the position is gone."""
+        env = perp_env
+        self._booked_over_a_preexisting_position(env, cache_lots=6, delta=4, booked_ts_ns=2**62)
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 0, "entry_price": "0", "update_time": INSIDE_SECS},
+        ]
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_a_row_matching_neither_book_is_withheld(self, perp_env):
+        env = perp_env
+        self._booked_over_a_preexisting_position(env, cache_lots=6, delta=4, booked_ts_ns=2**62)
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 1, "entry_price": "60000", "update_time": INSIDE_SECS},
+        ]
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    # -- R7C-02: an unreadable row timestamp is not freshness ---------------
+
+    def test_a_row_with_no_readable_timestamp_is_not_read_as_fresh(self, perp_env):
+        """The report's ``ts_last`` falls back to local now — a value the
+        platform needs — but local now stamped by this client postdates any
+        real booked trade by construction, so feeding it to the staleness rule
+        silently bypassed the protection (R7C-02). The rule reads the venue's
+        own stamp, and a row that carries none is an answer that cannot be
+        shown to postdate the booked trades: unprovable, handled the
+        unavailable way."""
+        env = perp_env
+        self._after_recovery_booked(
+            env,
+            4,
+            booked_ts_ns=INSIDE_SECS * 1_000_000_000,
+        )
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 0, "entry_price": "0"},  # no update_time
+        ]
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_an_unstamped_row_stands_when_no_memory_is_armed(self, perp_env):
+        """Control: outside a recovery pass nothing is armed, and a readable
+        genuine zero row stays believed even without a venue timestamp."""
+        env = perp_env
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 0, "entry_price": "0"},  # no update_time
+        ]
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.FLAT]
+
+    # -- R7C-01: fresh-cache bookings arm nothing ---------------------------
+
+    def test_bookings_for_orders_this_node_never_held_arm_no_memory(self, perp_env):
+        """The staleness memory refutes a venue answer against the book as it
+        stood before the bookings — a comparison that is only knowledge when
+        this node HELD that book. A fill booked onto an order adopted during
+        the same pass (fresh-cache recovery of ancient history, an external
+        order) reconstructs venue state instead of extending local state, so
+        it must not arm the memory: the venue's current answer is the better
+        authority there, and arming was what froze the fresh-cache restart of
+        R7C-01 for the length of the lookback. End-to-end behaviour (the node
+        starts, first pass and every pass) is proven by the release gate's
+        fresh-cache cell on the real engine; this pins the arming rule."""
+        env = perp_env
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "900001")
+        instrument = env.cache.instrument(PERP_BTC_USDT)
+        known = FillReport(
+            account_id=env.client.account_id,
+            instrument_id=PERP_BTC_USDT,
+            venue_order_id=VenueOrderId("900001"),
+            client_order_id=order.client_order_id,
+            trade_id=TradeId("T-KNOWN"),
+            order_side=OrderSide.SELL,
+            last_qty=instrument.make_qty(Decimal(4)),
+            last_px=instrument.make_price(Decimal("59000")),
+            commission=Money(0, instrument.quote_currency),
+            liquidity_side=LiquiditySide.TAKER,
+            report_id=UUID4(),
+            ts_event=1_000,
+            ts_init=1_000,
+        )
+        adopted = FillReport(
+            account_id=env.client.account_id,
+            instrument_id=PERP_BTC_USDT,
+            venue_order_id=VenueOrderId("999999"),
+            client_order_id=None,
+            trade_id=TradeId("T-ADOPTED"),
+            order_side=OrderSide.SELL,
+            last_qty=instrument.make_qty(Decimal(4)),
+            last_px=instrument.make_price(Decimal("59000")),
+            commission=Money(0, instrument.quote_currency),
+            liquidity_side=LiquiditySide.TAKER,
+            report_id=UUID4(),
+            ts_event=2_000,
+            ts_init=2_000,
+        )
+
+        env.client._record_recovery_bookings(
+            [known, adopted],
+            known_before={order.client_order_id},
+        )
+
+        delta, latest_ts = env.client._recovery_booked[PERP_BTC_USDT]
+        assert delta == Decimal(-4)  # the known order's fill, and nothing else
+        assert latest_ts == 1_000
+
+
+def _futures_order_row(**overrides: Any) -> dict[str, Any]:
+    """One resting perpetual order row, venue-shaped, with field overrides.
+
+    ``...`` (Ellipsis) as an override value removes the key, so the same
+    builder expresses both an unreadable value and an absent field.
+    """
+    payload: dict[str, Any] = {
+        "id": 900001,
+        "id_string": "900001",
+        "contract": "BTC_USDT",
+        "size": -10,
+        "left": -6,
+        "price": "59000.0",
+        "tif": "gtc",
+        "status": "open",
+        "text": "t-x",
+        "create_time": INSIDE_SECS,
+        "update_time": INSIDE_SECS,
+    }
+    for key, value in overrides.items():
+        if value is ...:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    return payload
+
+
+def _spot_order_row(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": "700001",
+        "currency_pair": "BTC_USDT",
+        "side": "buy",
+        "type": "limit",
+        "amount": "0.010000",
+        "filled_amount": "0.004000",
+        "left": "0.006000",
+        "price": "59000.00",
+        "time_in_force": "gtc",
+        "status": "open",
+        "text": "t-s",
+        "create_time": INSIDE_SECS,
+        "update_time": INSIDE_SECS,
+    }
+    for key, value in overrides.items():
+        if value is ...:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    return payload
+
+
+def _futures_fill_row(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": "T-1",
+        "contract": "BTC_USDT",
+        "order_id": "900001",
+        "size": -4,
+        "price": "59000.0",
+        "role": "taker",
+        "fee": "0.05",
+        "create_time": INSIDE_SECS,
+        "text": "t-x",
+    }
+    for key, value in overrides.items():
+        if value is ...:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    return payload
+
+
+def _spot_fill_row(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": "TS-1",
+        "currency_pair": "BTC_USDT",
+        "order_id": "700001",
+        "side": "buy",
+        "amount": "0.010000",
+        "price": "59000.00",
+        "role": "taker",
+        "fee": "0.000010",
+        "fee_currency": "BTC",
+        "create_time": INSIDE_SECS,
+        "text": "t-s",
+    }
+    for key, value in overrides.items():
+        if value is ...:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    return payload
+
+
+class TestUnreadableContractOrderFields:
+    """Regression (REC-06 / CZ-1, CZ-3, CZ-6): every deciding contract-order field is strict.
+
+    Round seven hardened exactly one field (``Position.size``); the refutation
+    fed the same unreadable-shape family through the other deciding fields and
+    the real engine turned the silent defaults into money-state defects: an
+    unreadable ``left`` became a confident full fill (the engine fabricated the
+    difference and closed the order locally while the venue holds it open), an
+    unreadable ``size`` collapsed into the genuine close-position zero and the
+    report vanished with a debug line. A deciding field that cannot be read now
+    fails the listing loudly (``OrderReportsUnavailable``), which the startup
+    path turns into a refused mass status — a fail-safe refusal instead of a
+    fabricated execution. An explicit, readable zero stays believed.
+    """
+
+    @staticmethod
+    def _wire(env: ExecHarness, row: dict[str, Any], *, status: str = "open") -> None:
+        env.perp.responses["list_orders"] = lambda **kwargs: (
+            [row] if kwargs.get("status") == status else []
+        )
+
+    UNREADABLE = [
+        (_futures_order_row(left=None), "left is null"),
+        (_futures_order_row(left=...), "left is absent"),
+        (_futures_order_row(left=""), "left is an empty string"),
+        (_futures_order_row(left="abc"), "left is a non-numeric string"),
+        (_futures_order_row(left={}), "left is an object"),
+        (_futures_order_row(left="-2.5"), "left is fractional (enable_decimal)"),
+        (_futures_order_row(size=None), "size is null"),
+        (_futures_order_row(size="abc"), "size is a non-numeric string"),
+        (_futures_order_row(size="-2.5", left="-1.5"), "size is fractional"),
+    ]
+
+    @pytest.mark.parametrize(("row", "why"), UNREADABLE)
+    def test_an_unreadable_deciding_field_fails_the_listing(self, perp_env, row, why):
+        env = perp_env
+        self._wire(env, row)
+
+        with pytest.raises(OrderReportsUnavailable):
+            env.run(env.client.generate_order_status_reports(_order_reports_command(True)))
+
+    def test_a_venue_canceled_order_with_unreadable_left_is_not_reported_filled(self, perp_env):
+        """CZ-3: the refuted tree reported this order FILLED 10 of 10; the
+        engine's FILLED path then fabricated the six unmatched lots and the
+        terminal states disagreed with the venue forever."""
+        env = perp_env
+        row = _futures_order_row(status="finished", finish_as="cancelled", left=None)
+        self._wire(env, row, status="finished")
+
+        with pytest.raises(OrderReportsUnavailable):
+            env.run(env.client.generate_order_status_reports(_order_reports_command(False)))
+
+    @pytest.mark.parametrize(("left", "filled"), [(-6, "4"), ("-6", "4"), (0, "10"), ("0", "10")])
+    def test_a_readable_remainder_reads_exactly(self, perp_env, left, filled):
+        """Controls, including v4.106.0 stringified integers and the explicit
+        readable zero, which stays believed."""
+        env = perp_env
+        self._wire(env, _futures_order_row(left=left))
+
+        reports = env.run(
+            env.client.generate_order_status_reports(_order_reports_command(True)),
+        )
+
+        assert [str(report.filled_qty) for report in reports] == [filled]
+
+    def test_a_close_position_order_is_still_skipped_quietly(self, perp_env):
+        """The genuine close-position order states size 0 affirmatively; it has
+        no quantity of its own and yields no report — and no failure."""
+        env = perp_env
+        self._wire(env, _futures_order_row(size=0, left=0, is_close=True))
+
+        reports = env.run(
+            env.client.generate_order_status_reports(_order_reports_command(True)),
+        )
+
+        assert reports == []
+
+
+class TestUnreadableSpotOrderFields:
+    """Regression (REC-06): the spot order parse decides side, type and quantity strictly.
+
+    A mangled ``side`` flipped BUY to SELL, a mangled ``type`` misclassified a
+    cash market buy past the REC-04 guard, and an unreadable ``amount`` made
+    the venue's order vanish from the mass status with no log line at all —
+    a venue-closed order then stays open locally, an open/closed disagreement
+    nothing repairs.
+    """
+
+    @staticmethod
+    def _wire(env: ExecHarness, row: dict[str, Any]) -> None:
+        env.spot.responses["open_orders"] = lambda **kwargs: (
+            [{"currency_pair": "BTC_USDT", "orders": [row]}] if kwargs.get("page", 1) == 1 else []
+        )
+
+    UNREADABLE = [
+        (_spot_order_row(side=None), "side is null"),
+        (_spot_order_row(side="b0y"), "side is mangled"),
+        (_spot_order_row(type=None), "type is null"),
+        (_spot_order_row(type="stop"), "type is not a spot order type"),
+        (_spot_order_row(amount=None), "amount is null"),
+        (_spot_order_row(amount=...), "amount is absent"),
+        (_spot_order_row(amount="abc"), "amount is a non-numeric string"),
+        (_spot_order_row(filled_amount="abc"), "filled_amount is a non-numeric string"),
+        (_spot_order_row(filled_amount=None), "filled_amount is null"),
+        (_spot_order_row(price="abc"), "price is a non-numeric string"),
+        (
+            _spot_order_row(type="market", price="0", status="wat", time_in_force="ioc"),
+            "a cash market buy whose status cannot be classified",
+        ),
+    ]
+
+    @pytest.mark.parametrize(("row", "why"), UNREADABLE)
+    def test_an_unreadable_deciding_field_fails_the_listing(self, spot_env, row, why):
+        env = spot_env
+        self._wire(env, row)
+
+        with pytest.raises(OrderReportsUnavailable):
+            env.run(env.client.generate_order_status_reports(_order_reports_command(True)))
+
+    def test_a_readable_row_still_parses_exactly(self, spot_env):
+        env = spot_env
+        self._wire(env, _spot_order_row())
+
+        reports = env.run(
+            env.client.generate_order_status_reports(_order_reports_command(True)),
+        )
+
+        assert len(reports) == 1
+        assert reports[0].order_side == OrderSide.BUY
+        assert str(reports[0].filled_qty) == "0.004000"
+
+
+class TestUnreadableFillRows:
+    """Regression (REC-06 / CZ-2, CZ-4, CZ-5): a fill row that cannot be read fails loudly.
+
+    ``generate_fill_reports`` raising is the one signal that arms the engine's
+    brake (``had_fill_query_errors``); a silently dropped row is a lost
+    execution the engine replaces with a commission-less inferred stand-in.
+    The raise carries every row the venue did answer readably, so the failure
+    costs availability, never data.
+    """
+
+    @staticmethod
+    def _wire_perp(env: ExecHarness, rows: list[dict[str, Any]]) -> None:
+        env.perp.responses["my_trades"] = lambda **kwargs: (
+            rows if kwargs.get("offset", 0) == 0 else []
+        )
+
+    @staticmethod
+    def _wire_spot(env: ExecHarness, rows: list[dict[str, Any]]) -> None:
+        env.spot.responses["my_trades"] = lambda **kwargs: (
+            rows if kwargs.get("page", 1) == 1 else []
+        )
+
+    UNREADABLE_PERP = [
+        (_futures_fill_row(size=None), "size is null"),
+        (_futures_fill_row(size=...), "size is absent"),
+        (_futures_fill_row(size=""), "size is an empty string"),
+        (_futures_fill_row(size="abc"), "size is a non-numeric string"),
+        (_futures_fill_row(size={}), "size is an object"),
+        (_futures_fill_row(size=[-4]), "size is a list"),
+        (_futures_fill_row(size="-0.5"), "size truncates below one lot"),
+        (_futures_fill_row(size="-2.5"), "size is fractional (enable_decimal)"),
+        (_futures_fill_row(price="abc"), "price is a non-numeric string"),
+        (_futures_fill_row(price=None), "price is null"),
+        (_futures_fill_row(price=...), "price is absent"),
+        (_futures_fill_row(fee="abc"), "fee is a non-numeric string"),
+        (_futures_fill_row(create_time="abc"), "the execution time is unreadable"),
+        (_futures_fill_row(create_time=...), "the execution time is absent"),
+        (_futures_fill_row(id=...), "the venue trade id is absent"),
+        (_futures_fill_row(order_id=...), "the venue order id is absent"),
+    ]
+
+    @pytest.mark.parametrize(("row", "why"), UNREADABLE_PERP)
+    def test_an_unreadable_futures_fill_fails_the_listing(self, perp_env, row, why):
+        env = perp_env
+        self._wire_perp(env, [row])
+
+        with pytest.raises(FillReportsUnavailable):
+            env.run(env.client.generate_fill_reports(_fill_reports_command()))
+
+    def test_the_failure_carries_the_rows_the_venue_did_answer_readably(self, perp_env):
+        """CZ-2's shape: T-A readable, T-B unreadable. The venue's readable
+        execution must ride the exception, not drown with the bad row."""
+        env = perp_env
+        good = _futures_fill_row(id="T-A", size=-4)
+        bad = _futures_fill_row(id="T-B", size=None)
+        self._wire_perp(env, [good, bad])
+
+        with pytest.raises(FillReportsUnavailable) as excinfo:
+            env.run(env.client.generate_fill_reports(_fill_reports_command()))
+
+        assert [report.trade_id.value for report in excinfo.value.reports] == ["T-A"]
+        assert "T-B" in str(excinfo.value)
+
+    UNREADABLE_SPOT = [
+        (_spot_fill_row(amount=None), "amount is null"),
+        (_spot_fill_row(amount=...), "amount is absent"),
+        (_spot_fill_row(amount="abc"), "amount is a non-numeric string"),
+        (_spot_fill_row(side="b0y"), "side is mangled"),
+        (_spot_fill_row(side=None), "side is null"),
+        (_spot_fill_row(price="abc"), "price is a non-numeric string"),
+    ]
+
+    @pytest.mark.parametrize(("row", "why"), UNREADABLE_SPOT)
+    def test_an_unreadable_spot_fill_fails_the_listing(self, spot_env, row, why):
+        env = spot_env
+        self._wire_spot(env, [row])
+
+        with pytest.raises(FillReportsUnavailable):
+            env.run(env.client.generate_fill_reports(_fill_reports_command()))
+
+    def test_a_stringified_size_reads_exactly(self, perp_env):
+        env = perp_env
+        self._wire_perp(env, [_futures_fill_row(size="-4")])
+
+        reports = env.run(env.client.generate_fill_reports(_fill_reports_command()))
+
+        assert [report.order_side for report in reports] == [OrderSide.SELL]
+        assert str(reports[0].last_qty) == "4"
+
+    def test_a_readable_zero_size_is_skipped_loudly_not_raised(self, perp_env):
+        """The explicit zero stays believed: a zero-quantity row is not an
+        execution, so it yields no report — and it does not fail the listing,
+        because the venue's statement was read."""
+        env = perp_env
+        self._wire_perp(env, [_futures_fill_row(id="T-0", size=0), _futures_fill_row(size=-4)])
+
+        reports = env.run(env.client.generate_fill_reports(_fill_reports_command()))
+
+        assert [report.trade_id.value for report in reports] == ["T-1"]
+
+    def test_an_absent_fee_is_a_zero_commission(self, perp_env):
+        """Options REST fills carry no fee field at all: absence is the venue
+        making no fee statement, which is a commission of zero — unlike an
+        unreadable fee, which is a statement this client failed to read."""
+        env = perp_env
+        self._wire_perp(env, [_futures_fill_row(fee=...)])
+
+        reports = env.run(env.client.generate_fill_reports(_fill_reports_command()))
+
+        assert reports[0].commission == Money(0, reports[0].commission.currency)
+
+
+class TestOpenCashMarketBuySingleOrderQuery:
+    """Regression (R7C-03): the inflight check gets an honest answer, not silence.
+
+    REC-04 made the still-open spot cash market buy yield no order status
+    report, which is right for the listings (no base-denominated quantity
+    exists to report) and wrong for the single-order query: the engine's
+    inflight check resolves an unacknowledged SUBMITTED order through
+    ``generate_order_status_report``, and five consecutive ``None`` answers
+    fabricate ``OrderRejected(reason="UNKNOWN")`` for an order the venue is
+    working (installed live/execution_engine.py:701-797). While the local
+    order is still quote-denominated and unfilled, the venue's own statement
+    of the order — ACCEPTED, quantity in the quote units both sides currently
+    use — is honest and restates nothing.
+    """
+
+    @staticmethod
+    def _submitted_cash_buy(env: ExecHarness) -> Any:
+        order = env.order_factory.market(
+            SPOT_BTC_USDT,
+            OrderSide.BUY,
+            Quantity.from_str("590.00"),
+            quote_quantity=True,
+        )
+        env.cache.add_order(order)
+        env.client.generate_order_submitted(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            ts_event=env.clock.timestamp_ns(),
+        )
+        env.drain(order)
+        return order
+
+    @staticmethod
+    def _open_cash_buy_row(order: Any) -> dict[str, Any]:
+        return _spot_order_row(
+            type="market",
+            side="buy",
+            amount="590.00",
+            left="590.00",
+            filled_amount="0",
+            price="0",
+            time_in_force="ioc",
+            status="open",
+            text=f"t-{order.client_order_id.value}",
+        )
+
+    def test_the_single_order_query_answers_accepted_in_quote_units(self, spot_env):
+        env = spot_env
+        order = self._submitted_cash_buy(env)
+        env.spot.responses["get_order"] = self._open_cash_buy_row(order)
+
+        report = env.run(
+            env.client.generate_order_status_report(
+                GenerateOrderStatusReport(
+                    instrument_id=SPOT_BTC_USDT,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=VenueOrderId("700001"),
+                    command_id=UUID4(),
+                    ts_init=0,
+                ),
+            ),
+        )
+
+        assert report is not None
+        assert report.order_status == OrderStatus.ACCEPTED
+        # The REC-04 constraint holds: the quantity is the venue's own quote
+        # cash statement, equal to the local order's, so the engine's
+        # `_should_update` finds nothing to restate.
+        assert report.quantity == order.quantity
+        assert str(report.filled_qty) == "0.000000"
+
+    def test_the_listing_path_still_skips_the_open_cash_buy(self, spot_env):
+        """REC-04's protection is untouched where it matters: a listing row for
+        a working cash buy still yields no report, because inside a mass
+        status a quote-denominated quantity would be restated onto the
+        converted base order after the sweep books its fills."""
+        env = spot_env
+        order = self._submitted_cash_buy(env)
+        row = self._open_cash_buy_row(order)
+        env.spot.responses["open_orders"] = lambda **kwargs: (
+            [{"currency_pair": "BTC_USDT", "orders": [row]}] if kwargs.get("page", 1) == 1 else []
+        )
+
+        reports = env.run(
+            env.client.generate_order_status_reports(_order_reports_command(True)),
+        )
+
+        assert reports == []
 
 
 class TestFailedFillQueriesAreSurfaced:
@@ -1015,16 +1630,21 @@ class TestFailedFillQueriesAreSurfaced:
 
         assert env.run(env.client.generate_fill_reports(_fill_reports_command())) == []
 
-    def test_the_startup_mass_status_survives_a_failed_trade_listing(self, spot_and_perp_env):
-        """One 5xx on one product's trade listing may not cost the order recovery."""
+    def test_a_failed_trade_listing_fails_the_startup_mass_status(self, spot_and_perp_env):
+        """Restated in round eight to the platform's own posture (installed
+        live/execution_client.py:440-514: any report exception nukes the mass
+        status; the kernel then refuses to start). The previous behaviour —
+        recover what did answer — was refuted through the engine: order
+        reports claim filled quantities, the backing trade rows are missing,
+        and ``_handle_fill_quantity_mismatch`` mints commission-less inferred
+        stand-ins while reconciliation reports success. A refused start is
+        recoverable; a fabricated execution standing in for a venue trade is
+        not."""
         env = spot_and_perp_env
         env.spot.responses["my_trades"] = RuntimeError("500 from the spot trade listing")
         env.perp.responses["list_orders"] = lambda **kwargs: (
             _open_futures_orders() if kwargs.get("status") == "open" else []
         )
-        # `generate_mass_status` with no lookback uses the client's own default
-        # window, so the trade has to be inside it rather than at the module's
-        # fixed epoch.
         recent = int(env.clock.timestamp_ns() // 1_000_000_000) - 60
         env.perp.responses["my_trades"] = lambda **kwargs: (
             _futures_fills(1, create_time=recent) if kwargs.get("offset", 0) == 0 else []
@@ -1032,13 +1652,7 @@ class TestFailedFillQueriesAreSurfaced:
 
         mass_status = env.run(env.client.generate_mass_status())
 
-        assert mass_status is not None
-        assert [str(key) for key in mass_status.order_reports] == ["900001"]
-        assert [
-            report.trade_id.value
-            for reports in mass_status.fill_reports.values()
-            for report in reports
-        ] == ["T-0"]
+        assert mass_status is None
 
 
 # -- contract report parsing --------------------------------------------------

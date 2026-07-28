@@ -72,6 +72,30 @@ def to_decimal(value: Any, default: str = "0") -> Decimal:
         return Decimal(default)
 
 
+def to_exact_decimal(value: Any) -> Decimal:
+    """Read a decimal amount or price that must be exact, or refuse to read it.
+
+    The decimal-aware sibling of :func:`to_lot_count`, for the deciding fields
+    whose values are not whole contract counts: spot amounts, fill quantities
+    and prices. ``to_decimal`` above answers ``0`` for anything it cannot read,
+    which is right where ``0`` means "nothing here" — but on a deciding field
+    ``0`` is a confident claim (nothing filled, a price of zero) that the
+    reconciliation engine acts on with fabricated or lost executions. Absence
+    is the caller's question to answer: this function is only ever handed a
+    value the payload actually stated.
+    """
+    if isinstance(value, bool):
+        # bool is accepted by Decimal via str(); it is never a venue number.
+        raise ValueError(f"unreadable decimal value: {value!r}")
+    try:
+        number = Decimal(str(value))
+    except Exception:
+        raise ValueError(f"unreadable decimal value: {value!r}") from None
+    if not number.is_finite():
+        raise ValueError(f"unreadable decimal value: {value!r}")
+    return number
+
+
 def secs_to_nanos(value: Any) -> int:
     """Unix seconds (possibly fractional, possibly a string) -> nanoseconds."""
     return int(to_float(value) * NANOSECONDS_IN_SECOND)

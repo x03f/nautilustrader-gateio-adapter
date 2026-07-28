@@ -114,6 +114,15 @@ class TestOrderSide:
     def test_round_trip(self, side):
         assert order_side_from_gateio(order_side_to_gateio(side)) == side
 
+    @pytest.mark.parametrize("wire", [None, "", "b0y", "long", 1])
+    def test_anything_else_raises(self, wire):
+        """Round eight (REC-06): the old default read anything not exactly
+        "buy" — including ``None`` — as SELL, and every caller uses this value
+        to decide an order's or an execution's side. A flipped side through
+        the real engine is a wrong position."""
+        with pytest.raises(ValueError, match="unreadable order side"):
+            order_side_from_gateio(wire)
+
 
 class TestTimeInForce:
     @pytest.mark.parametrize(
@@ -197,11 +206,19 @@ class TestOrderType:
             ("market", OrderType.MARKET),
             ("MARKET", OrderType.MARKET),
             ("limit", OrderType.LIMIT),
-            (None, OrderType.LIMIT),
         ],
     )
     def test_from_gateio(self, wire, expected):
         assert order_type_from_gateio(wire) == expected
+
+    @pytest.mark.parametrize("wire", [None, "", "stop", "iceberg"])
+    def test_anything_else_raises(self, wire):
+        """Restated in round eight (REC-06): the old ``None -> LIMIT`` default
+        was a confident claim on a deciding field — a misclassified market buy
+        skips the cash-buy quantity protection. Every caller decides order
+        type from this value, so an unreadable one refuses to read."""
+        with pytest.raises(ValueError, match="unreadable order type"):
+            order_type_from_gateio(wire)
 
 
 class TestFinishAs:
@@ -330,7 +347,17 @@ class TestOrderStatusMapping:
         )
 
     def test_unknown_state_without_amounts_is_accepted(self):
+        """An ABSENT state is the venue making no statement (the ack shape),
+        which is different from a state it stated and this client cannot read."""
         assert order_status_from_gateio(None, None, filled=0.0, amount=0.0) is OrderStatus.ACCEPTED
+
+    def test_an_unreadable_state_raises_instead_of_reading_accepted(self):
+        """Round eight (REC-06): a non-empty state outside the venue's own
+        vocabulary, with no readable reason and no completing quantities, used
+        to fall back to ACCEPTED — a closed order reported live. Unreadable
+        refuses to read; the listing fails loudly instead."""
+        with pytest.raises(ValueError, match="unreadable order status"):
+            order_status_from_gateio("finishedd", None, filled=0.0, amount=10.0)
 
     @pytest.mark.parametrize("reason", [r.value for r in GateioFinishAs if r.value != "_unknown"])
     @pytest.mark.parametrize("filled", [0.0, 4.0, 10.0])

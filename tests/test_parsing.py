@@ -24,6 +24,7 @@ from nautilus_gateio.common.parsing import (
     secs_to_nanos,
     timestamp_to_nanos,
     to_decimal,
+    to_exact_decimal,
     to_float,
     to_int,
     to_lot_count,
@@ -252,3 +253,40 @@ class TestLotCount:
     def test_anything_else_raises_naming_the_value(self, value):
         with pytest.raises(ValueError, match="unreadable contract count"):
             to_lot_count(value)
+
+
+class TestExactDecimal:
+    """Regression (REC-06): a decimal amount or price is exact or it is refused.
+
+    The decimal-aware sibling of :func:`to_lot_count`, for the spot amounts,
+    fill quantities and prices that decide money on the report surface.
+    ``to_decimal`` answers ``0`` for everything it cannot read, and on those
+    fields ``0`` is not a default — it is a confident claim (nothing filled, a
+    price of zero) that the reconciliation engine acts on with fabricated or
+    lost executions.
+    """
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("0.010000", Decimal("0.010000")),
+            ("-2.5", Decimal("-2.5")),  # enable_decimal contracts publish these
+            ("59000.0", Decimal("59000.0")),
+            (4, Decimal(4)),
+            ("0", Decimal(0)),
+            ("0.0", Decimal("0.0")),
+        ],
+    )
+    def test_exact_values_read(self, value, expected):
+        assert to_exact_decimal(value) == expected
+
+    def test_preserves_the_published_scale(self):
+        assert str(to_exact_decimal("1.10")) == "1.10"
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "abc", {"amount": "1"}, ["1"], True, False, "NaN", "Infinity", "-Infinity"],
+    )
+    def test_anything_else_raises_naming_the_value(self, value):
+        with pytest.raises(ValueError, match="unreadable decimal value"):
+            to_exact_decimal(value)

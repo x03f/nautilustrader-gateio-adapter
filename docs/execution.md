@@ -871,30 +871,75 @@ What was built, and one repair that was tried and taken back out:
 
   Booking first has one consequence that deserves its own statement: a position
   answer read before the booked trades landed. The rule
-  (`_position_answer_is_stale`) withholds a position answer only when trades
-  were booked for the instrument in this recovery, the answer is *exactly* the
-  book as it stood before them, and the answer cannot be shown to be stamped
-  after them — equal second-granular stamps do not qualify, because the reading
-  that cannot misstate money is the trade listing's. Such an answer is a stale
-  read, and the query is answered `PositionStatusUnavailable` until the venue
-  produces a row the rule can tell apart; a genuinely fresher row wins whatever
-  it says, and a disagreement the booked trades do not explain is handed to the
-  engine untouched. The residual risk is stated on the method: a compensating
-  unseen trade landing in the same second as the row nets back to the old book
-  and is withheld with it, pausing position reconciliation for that instrument
-  — never booking or unbooking anything — until a distinguishable answer
-  arrives.
-* **A position row whose size this client cannot read was reported as flat.**
-  The row *shapes* were covered first: a row that is not an object, a row
-  missing its symbol field, an unresolvable instrument and an empty `200` body
-  make the query fail rather than answer, because a row that was not read
-  supports no claim at all. The field that carries the answer is now covered
-  too: `size` is read strictly (`to_lot_count`), so a missing key, null, an
-  empty string, a non-numeric string, a boolean and any value that is not an
-  exact whole number of lots raise `PositionStatusUnavailable` naming the row
-  and the field, while a row that genuinely reads zero — including the
-  stringified zeros Gate.io sends since v4.106.0 moved futures sizes from
-  integer to string — still parses to FLAT and still squares the book.
+  (`_position_answer_is_stale`) was restated in the eighth round after its
+  first form was refuted in both directions (`REC-05`), and now reads: once
+  trades were booked in this recovery for orders this node already held, a
+  position answer stands only if it *contains* those trades — it equals the
+  book as it now stands — or is stamped strictly after them. Equal
+  second-granular stamps do not qualify, because the reading that cannot
+  misstate money is the trade listing's, and the stamp judged is the venue's
+  own: a row stating none is never promoted to local now, which would outrank
+  every booked trade by construction (R7C-02). **Every other answer is
+  withheld**, not only the one equal to the pre-booking book: the refuted form
+  believed any answer staler than its own memory — an absent row, or the kept
+  zero-size row Gate.io serves for a traded contract — and the engine squared
+  a pre-existing position to FLAT with a fabricated execution while reporting
+  success. A withheld query is answered `PositionStatusUnavailable` until the
+  venue produces a row the rule can tell apart, which at startup degrades to a
+  refused node start — the fail-safe trade. The memory arms only for bookings
+  that extended orders the cache held when recovery began: bookings that
+  reconstruct venue history onto adopted orders (a fresh-cache start, an
+  external order) arm nothing, because the pre-booking book for them is not
+  knowledge this node holds — arming there is what froze an ordinary
+  no-database restart of a closed partial-window round trip against the
+  venue's *current* flat row for the length of the lookback (R7C-01). Two
+  residuals are stated rather than hidden: a compensating unseen trade landing
+  in the same second as the row is withheld with it until a distinguishable
+  answer arrives; and the memory dies with the process, so a venue still
+  serving the stale row across a full restart cycle meets a pass that books
+  nothing new, arms nothing, and squares to the row — protection is exactly
+  one restart deep. The arming exception itself is more than a residual: one
+  fill booked onto an order this node did not hold leaves the *whole
+  instrument* unarmed, so a stale answer arriving in the same pass erases the
+  pre-existing position together with the adopted bookings, in a node that
+  then starts — the open, blocking finding `REC-07` in the
+  [review matrix](review-matrix.md#recovery-findings-raised-after-this-review),
+  demonstrated by the eighth round's audit. Withholding itself never books or
+  unbooks anything.
+* **A value this client cannot read was reported as a confident number.** The
+  row *shapes* were covered first: a row that is not an object, a row missing
+  its symbol field, an unresolvable instrument and an empty `200` body make
+  the query fail rather than answer, because a row that was not read supports
+  no claim at all. The seventh round read the position `size` field strictly
+  (`to_lot_count`) and stopped there; the refutation fed the same unreadable
+  shapes through the other deciding fields and the real engine turned the
+  silent defaults into every category the bar names, so the eighth round
+  closed the class (`REC-06`). **Every deciding field of the report surface is
+  now read strictly**: futures/delivery/options order `size`, `left` and
+  `price`; spot order `side`, `type`, `amount`, `filled_amount`, `price` and
+  the cash-buy `status` guard; fill `size`, `amount`, `price`, `side`, `fee`
+  and the execution time; the armed price-order fields; and the shared status
+  arithmetic on the stream path. Unreadable — a null, an empty string, a
+  non-numeric string, a wrong-typed value, or a fractional contract count
+  (decimal-sized `enable_decimal` contracts are not supported and refuse
+  loudly rather than truncate) — raises: position queries answer
+  `PositionStatusUnavailable`, trade listings answer `FillReportsUnavailable`
+  (the raise carries every row that did read, and it is the one signal that
+  arms the engine's brake against squaring positions on an incomplete
+  answer), order listings answer `OrderReportsUnavailable`, and at startup any
+  of the three refuses the mass status, so the kernel refuses to start rather
+  than book a partial account — the platform's own posture for a failed
+  report query. A value the venue affirmatively states as zero — the FLAT
+  position row, the close-position order's `size 0`, a zero-quantity trade
+  row, an absent fee — stays believed, including the stringified forms
+  Gate.io sends since v4.106.0. On the live stream the same strict readers
+  drop the one unreadable frame loudly (never the socket), leaving the state
+  to the next frame or to reconciliation, which re-reads the listings under
+  the rules above. Three edges the eighth round's audit found still ride
+  forgiving readers and are recorded as residual risks in the
+  [review matrix](review-matrix.md#residual-risks): the order report's
+  average price, the spot fill's fee currency, and the spot stream's
+  inferred `finished` for a payload stating neither status nor event.
 * **A quote-denominated spot market buy read while the venue was still matching
   it lost trades**, on either route. Gate.io publishes no base-denominated
   quantity for an unfinished market buy, so the listing's `filled_amount` is a
@@ -908,20 +953,20 @@ What was built, and one repair that was tried and taken back out:
   up again by the time recovery runs, so the window is the venue's own matching
   latency, not the outage.
 
-The refutation of the seventh round kept those mechanisms and re-opened two
-boundaries, both tracked as open, blocking findings (`REC-05`, `REC-06`) in the
-[review matrix](review-matrix.md#recovery-findings-raised-after-this-review).
-The read-skew rule recognises staleness only by equality with the book as it
-stood before the recovered trades were booked: an answer staler than that
-memory — an absent row, or a kept zero-size row — erases a *pre-existing*
-position with a fabricated execution while the same shapes over a flat book are
-withheld, and a current answer that happens to equal that memory is refused,
-holding a fresh-cache startup down until its trades age out of the lookback.
-And the strict reading stops at the position `size` field: the fields that
-decide fills and orders — futures `left` and `size`, fill `size`, spot
-`amount`, every fill `price` — keep their silent defaults. Until both close,
-the recovery described above is exact over a flat pre-outage book and readable
-payloads, and is not claimed beyond that.
+The refutation of the seventh round re-opened both of those boundaries as
+blocking findings (`REC-05`, `REC-06`). The eighth round closed the parsing
+surface in full, and closed the staleness rule for instruments whose
+recovered trades extended orders this node held; its audit verified those
+closures and then demonstrated the same erasure surviving through the arming
+exception — an instrument whose outage trade rode an external or adopted
+order has no memory at all, and a stale answer squares its pre-existing
+position in a node that starts. That remainder is `REC-07` in the
+[review matrix](review-matrix.md#recovery-findings-raised-after-this-review),
+open and blocking. The residuals stated there and on the methods (the
+one-restart-deep staleness memory, the same-second compensating trade, the
+refusal of decimal-sized contracts, and the below-bar parsing edges the
+audit recorded under residual risks) are, together with `REC-07`, the
+current honest boundary of the recovery claim.
 
 What the sixth round closed stands: a failed trade listing used to be reported
 to the engine as "no trades". The engine's only brake against squaring a book on
@@ -931,9 +976,13 @@ trade listing while the position query answered closed the position with a
 synthetic trade id and no commission, permanently, because by the next cycle the
 position was no longer open. `generate_fill_reports` now raises
 `FillReportsUnavailable`, carrying the reports the products that did answer
-produced, so the brake engages and one product's failure costs that product's
-fills rather than the whole recovery. A wallet Gate.io has not created is still
-an answer of none, because a ledger that does not exist holds no trades.
+produced, so the brake engages. The eighth round tightened what the recovery
+routes do with that raise: startup refuses the mass status outright (the
+platform's own posture — a partial answer books order reports whose backing
+trades are missing, and the engine infers commission-less stand-ins for the
+difference), and a reconnect pass aborts, keeping the pre-reconnect state until
+a listing answers in full. A wallet Gate.io has not created is still an answer
+of none, because a ledger that does not exist holds no trades.
 
 ### Duplicate suppression
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum, unique
-from typing import Final
+from typing import Any, Final
 
 from nautilus_trader.model.enums import (
     LiquiditySide,
@@ -145,8 +145,22 @@ def order_side_to_gateio(side: OrderSide) -> str:
     return "buy" if side == OrderSide.BUY else "sell"
 
 
-def order_side_from_gateio(side: str) -> OrderSide:
-    return OrderSide.BUY if str(side).lower() == "buy" else OrderSide.SELL
+def order_side_from_gateio(side: Any) -> OrderSide:
+    """Gate.io ``side`` string -> Nautilus order side, exactly or not at all.
+
+    Every caller uses this value to decide an order's or an execution's side,
+    and the old default — anything not exactly "buy", including ``None``, read
+    as SELL — turned an unreadable byte into a flipped side, which through the
+    real engine is a wrong position (REC-06). The venue's vocabulary is two
+    words; anything else is a value this client failed to read, and the caller
+    reports a failed read instead of a side the venue never stated.
+    """
+    text = str(side).lower()
+    if text == "buy":
+        return OrderSide.BUY
+    if text == "sell":
+        return OrderSide.SELL
+    raise ValueError(f"unreadable order side: {side!r}")
 
 
 def time_in_force_to_gateio(
@@ -207,8 +221,22 @@ def liquidity_side_from_gateio(role: str | None) -> LiquiditySide:
     return LiquiditySide.MAKER if str(role).lower() == "maker" else LiquiditySide.TAKER
 
 
-def order_type_from_gateio(order_type: str | None) -> OrderType:
-    return OrderType.MARKET if str(order_type).lower() == "market" else OrderType.LIMIT
+def order_type_from_gateio(order_type: Any) -> OrderType:
+    """Gate.io spot ``type`` string -> Nautilus order type, exactly or not at all.
+
+    The value decides more than the enum: a spot MARKET BUY denominates its
+    ``amount`` in the quote currency, so misreading the type routes a cash
+    amount through the base-quantity arithmetic (the REC-04 hazard). Gate.io's
+    spot vocabulary is two words; the old default read anything else —
+    including ``None`` — as LIMIT, a confident claim on an unreadable byte
+    (REC-06).
+    """
+    text = str(order_type).lower()
+    if text == "market":
+        return OrderType.MARKET
+    if text == "limit":
+        return OrderType.LIMIT
+    raise ValueError(f"unreadable order type: {order_type!r}")
 
 
 def order_status_from_gateio(
@@ -305,4 +333,14 @@ def order_status_from_gateio(
     # Fall back on the state when the venue omits or renames the reason.
     if state in ("cancelled", "closed", "finished"):
         return OrderStatus.CANCELED
+    if state:
+        # A non-empty state outside the venue's own vocabulary, with no
+        # readable reason and no completing quantities, is a statement this
+        # client failed to read — not an order that is resting. The old
+        # fallback answered ACCEPTED, which reports a closed order live
+        # (REC-06); the caller turns the raise into a loud listing failure.
+        raise ValueError(f"unreadable order status: {status!r} (finish_as {finish_as!r})")
+    # An absent state is the venue making no statement at all — the shape of a
+    # bare acknowledgement — and a resting order is the only reading that
+    # cannot close anything.
     return OrderStatus.ACCEPTED

@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stale position answer can no longer erase a position recovered through
+  orders this node held.** The read-skew rule guarding recovered trades
+  recognised staleness only by equality with the book as it stood before the
+  trades were booked, so an answer staler than its own memory — an absent row,
+  or the kept zero-size row Gate.io serves for a traded contract — was
+  believed as current, and the engine squared a pre-existing position to flat
+  with a fabricated execution while reconciliation reported success. The rule
+  now withholds every answer that does not contain the booked trades and
+  cannot be shown, by the venue's own stamp, to postdate them; withholding
+  degrades to a refused node start, never a fabrication. In the same change
+  the memory arms only for trades that extended orders the cache held when
+  recovery began, so an ordinary no-database restart whose closed round trip
+  straddles the lookback window starts on the venue's current flat answer
+  instead of freezing until the trades age out; and a position row with no
+  readable venue timestamp is judged as unprovably fresh instead of being
+  stamped with the local clock, which silently bypassed the rule. Residuals
+  are stated on the method: the memory lives in-process (protection is one
+  restart deep). One boundary survives as an open finding (`REC-07` in
+  docs/review-matrix.md): trades booked onto orders adopted during the same
+  pass arm no memory, so an instrument whose outage trade rode an external or
+  adopted order is unguarded, and a stale answer can still erase its
+  pre-existing position there.
+
+- **A report field this client cannot read is no longer parsed as a confident
+  number.** The strict reading introduced for the position `size` now covers
+  every deciding field of the report surface: futures/delivery/options order
+  `size`, `left` and `price`; spot order `side`, `type`, `amount`,
+  `filled_amount`, `price` and the cash-buy status guard; fill `size`,
+  `amount`, `price`, `side`, `fee` and execution time; the armed price-order
+  fields; and the status arithmetic shared with the live stream. The forgiving
+  defaults crossed the money line through the real engine: an unreadable
+  remainder became a confident full fill the engine fabricated the rest of and
+  closed locally while the venue held the order open, an unreadable fill size
+  silently replaced a venue execution with a commission-less inferred fill,
+  and an unreadable price booked an execution at zero. Unreadable now raises —
+  trade listings answer `FillReportsUnavailable` carrying every readable row,
+  order listings answer the new `OrderReportsUnavailable`, and the startup
+  mass status is refused on either, which is the platform's own posture for a
+  failed report query (a partial answer makes the engine infer stand-ins for
+  the missing trades). The venue's affirmative zeros stay believed, and
+  stringified integers parse exactly; decimal-sized (`enable_decimal`)
+  contracts are refused loudly rather than silently truncated, a documented
+  limitation of this alpha. A still-open quote-denominated spot market buy now
+  answers the single-order query with the venue's own quote-denominated
+  ACCEPTED statement — resolving the engine's inflight check honestly instead
+  of feeding it silence until it fabricated a rejection — while listings keep
+  yielding no report for it. Three edges found by the round's audit still ride
+  forgiving readers and are recorded as residual risks in
+  docs/review-matrix.md: the order report's average price, the spot fill's fee
+  currency, and the spot stream's inferred `finished` for a payload stating
+  neither status nor event.
+
 - **A restart no longer loses a venue-confirmed trade the engine's
   deduplication would drop.** The sweep that re-offers recovered executions the
   grouped hand-over did not book used to run only after a WebSocket reconnect;
@@ -57,10 +109,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commission, and the loss was permanent: a closed position is not open, so it is
   never queried again and the venue's real closing trade is never applied. The
   query now raises `FillReportsUnavailable`, carrying the reports the products
-  that did answer produced, so recovery still works from what the venue said
-  while the engine gets the failure it needs. `USER_NOT_FOUND` is unchanged: a
-  wallet Gate.io has not created holds no trades, which is a definite answer of
-  none.
+  that did answer produced, so the engine gets the failure it needs; the
+  recovery routes treat the raise as the failure it is (startup refuses the
+  mass status, a reconnect pass aborts keeping its pre-reconnect state) rather
+  than booking a partial account. `USER_NOT_FOUND` is unchanged: a wallet
+  Gate.io has not created holds no trades, which is a definite answer of none.
 
 - **A position row whose shape this client cannot read is no longer answered as
   flat.** A row that is not an object, a row carrying no venue symbol, a row

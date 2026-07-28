@@ -161,6 +161,7 @@ from nautilus_gateio.common.constants import (
     GATEIO_VENUE,
 )
 from nautilus_gateio.common.enums import (
+    GateioFinishAs,
     GateioProductType,
     GateioSpotAccountMode,
     GateioTimeInForce,
@@ -183,7 +184,7 @@ from nautilus_gateio.common.errors import (
 from nautilus_gateio.common.parsing import (
     timestamp_to_nanos,
     to_decimal,
-    to_float,
+    to_exact_decimal,
     to_int,
     to_lot_count,
 )
@@ -247,6 +248,48 @@ class FillReportsUnavailable(Exception):
         super().__init__(message)
         #: Everything the venue did answer for, before and after the failure.
         self.reports: list[FillReport] = reports
+
+
+class OrderReportsUnavailable(Exception):
+    """An order listing was asked for and could not be answered in full.
+
+    Raised both for a product whose listing endpoint failed and for a listing
+    row whose deciding field this client cannot read (REC-06). The two are the
+    same answer: what the venue holds is unknown, and a report set that merely
+    omits the unreadable part is indistinguishable from "the venue has no such
+    order" — a cached order the omitted row would have closed then stays open
+    locally with nothing but a debug line downstream (the engine's
+    ``_validate_reconciliation_state`` only warns), an open/closed disagreement
+    with the venue that nothing repairs.
+
+    The behaviour this buys from the engine cannot fabricate, verified against
+    the installed source: at startup this client's ``generate_mass_status``
+    turns the raise into a ``None`` mass status, ``reconcile_execution_state``
+    returns False, and the kernel refuses to start the trader
+    (system/kernel.py) — the same posture the platform's own base
+    ``generate_mass_status`` takes for any raising report query
+    (live/execution_client.py:440-514). On the continuous open-order check the
+    raise is swallowed per client — ``_query_order_status_reports`` gathers
+    with ``return_exceptions=True``, logs an ERROR and continues
+    (live/execution_engine.py:1571-1580) — so the check proceeds treating this
+    client's answer as empty. Under the default ``open_check_open_only=True``
+    that is harmless: orders missing from the answer are only debug-logged.
+    With ``open_check_open_only=False`` an own order whose row stays
+    unreadable is counted missing on every cycle, and once
+    ``open_check_missing_retries`` is exhausted the engine resolves it with a
+    fabricated REJECTED or CANCELED (live/execution_engine.py:1465-1516) — a
+    documented limitation of running that non-default mode against this
+    alpha. On the single-order query the caller catches and answers ``None``,
+    which the inflight check treats as an unanswered query.
+
+    The reports parsed before the failure are carried for the caller that can
+    use a partial answer loudly; the startup path deliberately does not.
+    """
+
+    def __init__(self, message: str, reports: list[OrderStatusReport]) -> None:
+        super().__init__(message)
+        #: Everything that was parsed before the failure.
+        self.reports: list[OrderStatusReport] = reports
 
 
 #: Order types this client can express on Gate.io.
@@ -363,6 +406,85 @@ def first_timestamp_ns(payload: dict[str, Any], *keys: str) -> int:
         if nanos:
             return nanos
     return 0
+
+
+def exact_first_timestamp_ns(payload: dict[str, Any], *keys: str) -> int:
+    """Like :func:`first_timestamp_ns`, but a stated-and-unreadable value raises.
+
+    For the timestamps that decide money. A fill's execution time orders the
+    fills the engine applies (reconciliation applies them in list order, and
+    the first applied fill sets a floor under which later reports are skipped
+    as already accounted for — installed live/execution_engine.py:3721-3736,
+    3400-3416), and it feeds the staleness memory's latest-booked stamp. The
+    forgiving reader skipped an unreadable value and the caller then stamped
+    the row with local now — a fabricated time that sorts the fill last and
+    outranks every honest venue stamp. Absent keys still answer 0: absence is
+    the venue making no statement, and the caller decides what that means.
+    """
+    for key in keys:
+        value = payload.get(key)
+        if value in (None, "", 0, "0"):
+            continue
+        try:
+            to_exact_decimal(value)
+        except ValueError:
+            raise ValueError(f"the '{key}' timestamp cannot be read: {value!r}") from None
+        nanos = timestamp_to_nanos(value)
+        if nanos:
+            return nanos
+    return 0
+
+
+def require_field(payload: dict[str, Any], key: str, *, what: str) -> Any:
+    """Return a field the payload must state, or refuse to read the payload.
+
+    For deciding fields only: a payload that omits one is not making a smaller
+    claim, it is a shape this client does not know how to read.
+    """
+    if key not in payload:
+        raise ValueError(f"the {what} has no '{key}' field")
+    return payload[key]
+
+
+def exact_lots(payload: dict[str, Any], key: str, *, what: str) -> int:
+    """Read a required whole-contract count strictly, naming field and value."""
+    value = require_field(payload, key, what=what)
+    try:
+        return to_lot_count(value)
+    except ValueError as e:
+        raise ValueError(f"the {what}'s '{key}' field decides the answer: {e}") from None
+
+
+def exact_decimal_field(payload: dict[str, Any], key: str, *, what: str) -> Decimal:
+    """Read a required decimal field strictly, naming field and value."""
+    value = require_field(payload, key, what=what)
+    try:
+        return to_exact_decimal(value)
+    except ValueError as e:
+        raise ValueError(f"the {what}'s '{key}' field decides the answer: {e}") from None
+
+
+def optional_exact_decimal(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    what: str,
+    absent: str = "0",
+) -> Decimal:
+    """Read an optional decimal field strictly.
+
+    Absent, ``None`` and ``""`` all mean the venue stated nothing, which takes
+    the documented default (a fee that is not charged, a price that makes the
+    order a market order). A value the venue did state and this client cannot
+    read raises — the difference between a smaller claim and a failed read.
+    """
+    value = payload.get(key)
+    if value in (None, ""):
+        return Decimal(absent)
+    try:
+        return to_exact_decimal(value)
+    except ValueError as e:
+        raise ValueError(f"the {what}'s '{key}' field decides the answer: {e}") from None
 
 
 def venue_symbol_of(payload: dict[str, Any]) -> str:
@@ -528,6 +650,12 @@ SHORT_CIRCUIT_REPORT_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
         OrderStatus.EXPIRED,
     },
 )
+
+#: The statuses Gate.io publishes on a spot order row. The cash-market-buy
+#: guard in `_parse_spot_order_fields` must classify the row before it can say
+#: whether a base-denominated quantity exists, so a status outside this set is
+#: an unreadable deciding field, not an open order.
+SPOT_ORDER_STATUSES: Final[frozenset[str]] = frozenset({"open", "closed", "cancelled"})
 
 #: How many event-loop turns to give a rebasing ``OrderUpdated`` before declaring
 #: that it did not arrive. Three would do — the engine's enqueuer schedules the
@@ -823,12 +951,19 @@ class GateioExecutionClient(LiveExecutionClient):
         #: behind `_position_answer_is_stale`: recovery reads the position
         #: listing and the trade listing at different instants, so a position
         #: row can predate a trade both listings' venue has already matched.
-        #: An entry is written by `_record_recovery_bookings` and cleared the
-        #: first time a position answer for that instrument is either
-        #: consistent with the booked trades or disagrees in a way they do not
-        #: explain — both of which are current venue statements that supersede
-        #: the memory.
+        #: An entry is written by `_record_recovery_bookings` — and only for
+        #: fills that extended orders this node already held when recovery
+        #: began (see that method for why) — and cleared the first time a
+        #: position answer for the instrument either contains the booked
+        #: trades or is stamped after them.
         self._recovery_booked: dict[InstrumentId, tuple[Decimal, int]] = {}
+        #: The venue's own timestamp of the last parsed position row, per
+        #: instrument, exactly as stated: 0 when the row stated none. The
+        #: report's `ts_last` cannot serve the staleness rule because it falls
+        #: back to local now — a stamp this client fabricated, which postdates
+        #: any booked trade by construction and silently bypassed the rule
+        #: (R7C-02).
+        self._position_row_venue_ts: dict[InstrumentId, int] = {}
 
         self._log.info(f"Products: {', '.join(p.value for p in products)}", LogColor.BLUE)
         self._log.info(f"Spot account mode: {spot_mode.value}", LogColor.BLUE)
@@ -1078,13 +1213,20 @@ class GateioExecutionClient(LiveExecutionClient):
                     ),
                 )
             except FillReportsUnavailable as e:
-                # Recovery works from what the venue did answer. A product whose
-                # trade listing failed costs that product's fills, not the whole
-                # reconnect; the failure matters where a position could be
-                # squared to flat on the strength of it, and a mass status
-                # cannot do that.
-                self._log.warning(f"Reconnect recovery is working from a partial answer: {e}")
-                fill_reports = e.reports
+                # The reconnect pass hands the engine order reports whose
+                # filled quantities the missing trades were meant to back;
+                # reconciling that partial pairing makes the engine mint
+                # commission-less inferred fills for the difference (the
+                # confident-zero refutation drove exactly this through the
+                # installed engine). Keeping the pre-reconnect state is
+                # stale-but-honest, and the next reconnect or restart repairs
+                # it from a listing that answers in full.
+                self._log.error(
+                    f"Cannot reconcile after the {product.value} reconnect: the trade "
+                    f"listing did not answer in full ({e}). Keeping local state until a "
+                    f"complete answer; the next reconnect or restart recovers it",
+                )
+                return
         except Exception as e:  # noqa: BLE001 - a failed re-query must not kill the client
             self._log.error(f"Cannot reconcile after the {product.value} reconnect: {e}")
             return
@@ -1120,13 +1262,17 @@ class GateioExecutionClient(LiveExecutionClient):
         # Snapshot which venue trades are not yet on their orders before any of
         # them is booked: everything in this list that IS booked afterwards —
         # by the grouped hand-over or by the sweep — is a recovery booking a
-        # position row read in the same window may predate.
+        # position row read in the same window may predate. The orders held
+        # right now are snapshotted with it, because only bookings that extend
+        # them arm the stale-answer memory (`_record_recovery_bookings`).
         unbooked_before = [r for r in fill_reports if not self._fill_is_booked(r)]
+        known_before = {order.client_order_id for order in self._cache.orders()}
 
         self._send_mass_status_report(mass_status)
         await self._hand_over_unapplied_fills(fill_reports, listed_orders)
         self._record_recovery_bookings(
             [r for r in unbooked_before if self._fill_is_booked(r)],
+            known_before,
         )
 
         self._log.info(
@@ -1223,17 +1369,50 @@ class GateioExecutionClient(LiveExecutionClient):
             self._restate_from_listing(listed_orders.get(venue_order_id))
             await self._reoffer_recovered_fills(reports)
 
-    def _record_recovery_bookings(self, booked_now: list[FillReport]) -> None:
+    def _record_recovery_bookings(
+        self,
+        booked_now: list[FillReport],
+        known_before: set[ClientOrderId],
+    ) -> None:
         """Remember, per instrument, what this recovery pass just booked.
 
         ``booked_now`` are the venue trades that were not on their orders when
-        recovery began and are on them now. The signed sum and the latest
-        venue timestamp feed :meth:`_position_answer_is_stale`: a position
-        answer that fails to contain these trades, and cannot be shown to be
-        newer than them, is a stale read rather than a venue statement that
-        the trades did not happen.
+        recovery began and are on them now; ``known_before`` are the orders the
+        cache held when recovery began. The signed sum and the latest venue
+        timestamp feed :meth:`_position_answer_is_stale`: a position answer
+        that fails to contain these trades, and cannot be shown to be newer
+        than them, is a stale read rather than a venue statement that the
+        trades did not happen.
+
+        Only fills that extended orders in ``known_before`` are recorded. The
+        staleness rule refutes a venue answer against the book as it stood
+        before the bookings, and that comparison is knowledge only when this
+        node *held* that book. A fill booked onto an order adopted during the
+        same pass — fresh-cache recovery of ancient history, or an external
+        order — reconstructs venue state rather than extending local state:
+        the pre-booking book for it is emptiness, not flatness, so nothing the
+        memory could refuse is refutable. Arming it anyway is what froze the
+        ordinary no-database restart of a closed partial-window round trip: the
+        venue's *current* flat row equalled the unrefutable pre-booking book
+        and was withheld on every start until the trades aged out of the
+        lookback (R7C-01). The cost of not arming is not a residual, it is the
+        open finding REC-07: one fill booked onto an order this node did not
+        hold leaves the *whole instrument* unarmed, so a stale position answer
+        arriving in the same pass is believed and erases the pre-existing
+        position together with the adopted bookings, in a node that then
+        starts. The repair has to tell the two cases apart without re-freezing
+        the R7C-01 restart; until it lands, the boundary is stated here and on
+        :meth:`_position_answer_is_stale`.
         """
         for report in booked_now:
+            order = self._order_of_report(report)
+            if order is None or order.client_order_id not in known_before:
+                self._log.debug(
+                    f"Not arming the stale-answer memory for {report.trade_id.value}: its "
+                    f"order was not in the cache when recovery began, so the pre-booking "
+                    f"book for it is not knowledge this client holds",
+                )
+                continue
             quantity = report.last_qty.as_decimal()
             signed = quantity if report.order_side == OrderSide.BUY else -quantity
             delta, latest_ts = self._recovery_booked.get(
@@ -1262,10 +1441,11 @@ class GateioExecutionClient(LiveExecutionClient):
         inferred fill (`_reconcile_position_report_netting`, installed
         live/execution_engine.py) — deleting the venue trade id, price and fee
         this client just booked and replacing them with an execution nobody
-        made. The trade listing is the finer-grained and later read, so where
-        the two disagree *by exactly the trades just booked*, the row loses.
+        made. The trade listing is the finer-grained and later read, so a row
+        that cannot contain the trades it names, and cannot be shown to
+        postdate them, loses — whatever it reads.
 
-        The test is deliberately narrow, in this order:
+        The test, in this order:
 
         * no trades were booked for the instrument in this recovery — every
           answer stands (the ordinary case, and the reason the periodic
@@ -1275,20 +1455,42 @@ class GateioExecutionClient(LiveExecutionClient):
           qualify: both listings report whole seconds, so a row written just
           before a trade in the same second is indistinguishable from one
           written just after, and the reading that cannot misstate money is
-          the trade listing's;
-        * the answer equals the local book **as it stood before** the booked
-          trades — that is a read from before them, and it is withheld;
-        * anything else — the answer either already contains the booked
-          trades or disagrees in a way they do not explain. Both are current
-          venue statements the engine must see, so the memory is also cleared:
-          keeping it could later suppress an honest answer that happens to
-          coincide with the old book.
+          the trade listing's. ``venue_ts_ns`` is the venue's own stamp; a row
+          that stated none arrives as 0, never as local now, because a stamp
+          this client fabricated postdates any booked trade by construction
+          and would bypass this rule silently (R7C-02);
+        * the answer equals the local book as it now stands — it contains the
+          booked trades, so it is current; it stands and clears the memory;
+        * **anything else is withheld.** Not only the answer equal to the
+          pre-booking book: any answer that does not contain the booked
+          trades and cannot be shown to postdate them supports no claim. The
+          previous rule withheld exactly the pre-booking book and believed
+          everything staler — an absent row, or a kept zero-size row
+          predating a position booked in an earlier session, matched neither
+          book and was taken as a current statement, so the engine squared a
+          pre-existing position to FLAT with a fabricated execution and
+          reported success (REC-05). The staler the answer, the more
+          confidently it was applied. Withholding degrades to the fail-safe
+          refusal instead: the engine hears an unanswered query, startup
+          reconciliation returns False, and the kernel refuses to start until
+          the venue produces a row this test can tell apart.
 
-        The residual risk is a venue whose position row and a compensating
-        unseen trade land in the same second and net back to the old book —
-        that answer is withheld until the venue produces a row this test can
-        tell apart. Withholding pauses position reconciliation for the
-        instrument; it never books or unbooks anything.
+        The memory is kept on a withheld answer so a later fresher or
+        agreeing answer can clear it, and it dies with the process — so the
+        protection is exactly one restart deep: a venue still serving the
+        stale row to the *next* process meets a pass that books nothing new,
+        arms nothing, and squares to the row. That residual is documented
+        rather than closed (persisting the memory means persisting it
+        somewhere a restart reads, which this alpha does not do). The mirror
+        of the arming rule is not a residual but the open finding REC-07:
+        fills booked onto orders adopted during the same pass never arm this
+        memory (see :meth:`_record_recovery_bookings`), so one such booking
+        leaves the whole instrument unguarded, and a stale row then squares
+        not only the same-pass bookings but any pre-existing position beneath
+        them — the erasure this rule exists to stop, surviving through the
+        arming door in a node that starts. Withholding itself pauses position
+        reconciliation for the instrument; it never books or unbooks
+        anything.
         """
         entry = self._recovery_booked.get(instrument_id)
         if entry is None:
@@ -1297,16 +1499,16 @@ class GateioExecutionClient(LiveExecutionClient):
         if delta == 0:
             self._recovery_booked.pop(instrument_id, None)
             return False
-        if venue_ts_ns and venue_ts_ns > latest_ts:
+        if venue_ts_ns > latest_ts:
             self._recovery_booked.pop(instrument_id, None)
             return False
         cache_net = Decimal(0)
         for position in self._cache.positions_open(venue=None, instrument_id=instrument_id):
             cache_net += position.signed_decimal_qty()
-        if signed_qty == cache_net - delta:
-            return True
-        self._recovery_booked.pop(instrument_id, None)
-        return False
+        if signed_qty == cache_net:
+            self._recovery_booked.pop(instrument_id, None)
+            return False
+        return True
 
     def _withhold_stale_position_reports(
         self,
@@ -1329,7 +1531,10 @@ class GateioExecutionClient(LiveExecutionClient):
             if self._position_answer_is_stale(
                 report.instrument_id,
                 report.signed_decimal_qty,
-                report.ts_last,
+                # The venue's own stamp of the parsed row, 0 when it stated
+                # none; `report.ts_last` falls back to local now, which would
+                # read as fresher than any booked trade (R7C-02).
+                self._position_row_venue_ts.get(report.instrument_id, 0),
             ):
                 self._log.warning(
                     f"Withholding the {report.instrument_id} position row from the mass "
@@ -1731,7 +1936,15 @@ class GateioExecutionClient(LiveExecutionClient):
         reconciliation error, so the loss is reported here instead, with
         everything needed to account for it.
         """
-        report = self._parse_fill_report(product, payload, instrument)
+        try:
+            report = self._parse_fill_report(product, payload, instrument)
+        except ValueError as e:
+            self._log.error(
+                f"Fill {trade_id.value} arrived after {order.client_order_id!r} was reported "
+                f"{order.status_string()} and cannot be read: {e}. The execution stands at "
+                f"the venue and is recovered by the next reconciliation pass",
+            )
+            return
         if report is None:
             self._log.error(
                 f"Fill {trade_id.value} arrived after {order.client_order_id!r} was reported "
@@ -3381,12 +3594,31 @@ class GateioExecutionClient(LiveExecutionClient):
         if order is None:
             if self._schedule_fired_order_resolution(product, raw_symbol, venue_order_id):
                 return
-            report = self._parse_order_status_report(product, payload, instrument)
+            try:
+                report = self._parse_order_status_report(product, payload, instrument)
+            except ValueError as e:
+                self._log.error(
+                    f"Dropping an order frame for {venue_order_id!r} on {raw_symbol}: {e}. "
+                    f"The order's state is recovered by reconciliation",
+                )
+                return
             if report is not None:
                 self._send_order_status_report(report)
             return
 
-        status = self._order_status(product, payload)
+        try:
+            status = self._order_status(product, payload)
+        except ValueError as e:
+            # An unreadable deciding field on a live frame or an ack: acting
+            # on a guessed status can close an order the venue holds open.
+            # The order keeps its last known state — for an unacknowledged
+            # submit that is SUBMITTED, which the engine's inflight check
+            # resolves through the single-order query.
+            self._log.error(
+                f"Dropping an order frame for {order.client_order_id!r}: {e}. The order "
+                f"keeps its last known state until the next frame or reconciliation",
+            )
+            return
         ts_event = (
             first_timestamp_ns(
                 payload,
@@ -3692,13 +3924,23 @@ class GateioExecutionClient(LiveExecutionClient):
         ):
             return
 
-        quantity = self._payload_quantity(order.instrument_id, payload, instrument)
-        price_value = payload.get("price")
-        price = (
-            instrument.make_price(to_decimal(price_value))
-            if price_value not in (None, "", "0")
-            else getattr(order, "price", None)
-        )
+        try:
+            quantity = self._payload_quantity(order.instrument_id, payload, instrument)
+            price_value = payload.get("price")
+            price = (
+                instrument.make_price(to_exact_decimal(price_value))
+                if price_value not in (None, "", "0")
+                else getattr(order, "price", None)
+            )
+        except ValueError as e:
+            # Restating a live order from a value this client cannot read
+            # would put a quantity or price the venue never stated on it
+            # (REC-06); skipping the restatement keeps the venue's last known
+            # statement, which reconciliation re-reads.
+            self._log.warning(
+                f"Not restating {order.client_order_id!r} from an unreadable frame: {e}",
+            )
+            return
         if quantity is None:
             return
 
@@ -3732,7 +3974,10 @@ class GateioExecutionClient(LiveExecutionClient):
         something has filled there is no base quantity to report at all.
         """
         if "size" in payload:
-            size = abs(to_int(payload.get("size")))
+            value = payload["size"]
+            if value in (None, ""):
+                return None  # No statement, so nothing to restate from
+            size = abs(to_lot_count(value))
             return Quantity(size, instrument.size_precision) if size > 0 else None
 
         is_spot_market_buy = (
@@ -3740,31 +3985,78 @@ class GateioExecutionClient(LiveExecutionClient):
             and str(payload.get("side") or "").lower() == "buy"
         )
         if is_spot_market_buy:
-            filled_base = to_decimal(payload.get("filled_amount"))
+            value = payload.get("filled_amount")
+            if value in (None, ""):
+                return None
+            filled_base = to_exact_decimal(value)
             return instrument.make_qty(filled_base) if filled_base > 0 else None
 
-        amount = to_decimal(payload.get("amount"))
+        value = payload.get("amount")
+        if value in (None, ""):
+            return None
+        amount = to_exact_decimal(value)
         if amount <= 0:
             return None
         return instrument.make_qty(amount)
 
     @staticmethod
     def _order_status(product: GateioProductType, payload: dict[str, Any]) -> OrderStatus:
-        """Map one Gate.io order object onto a Nautilus order status."""
+        """Map one Gate.io order object onto a Nautilus order status.
+
+        The quantities read here decide the order's open/closed state
+        (completion is ``filled >= amount``), so they are read strictly with
+        one distinction (REC-06): a field the payload does not state makes no
+        claim — the status falls back to the venue's own words (state and
+        ``finish_as``) with no quantity asserted — while a field the payload
+        states and this client cannot read raises. The old readers defaulted
+        both cases to 0, and a defaulted ``left`` is not 0 of anything: it is
+        a confident claim that everything filled, which reported a
+        venue-canceled order FILLED 10 of 10 (CZ-3). Shared by the REST report
+        path (which has already validated these fields strictly) and the live
+        stream/ack path, where a raise drops the one frame loudly and leaves
+        the order state to the next frame or to reconciliation.
+        """
         if product.is_spot:
             status = payload.get("status")
             if status is None:
                 # The spot stream discriminates with `event`, not `status`.
                 event = str(payload.get("event") or "").lower()
                 status = "open" if event in ("put", "update") else "finished"
-            amount = to_float(payload.get("amount"))
-            filled = to_float(payload.get("filled_amount"))
-            if not filled:
-                filled = max(0.0, amount - to_float(payload.get("left")))
+            what = f"spot order {payload.get('id')!r}"
+            amount = float(optional_exact_decimal(payload, "amount", what=what))
+            filled = float(optional_exact_decimal(payload, "filled_amount", what=what))
+            if not filled and payload.get("left") not in (None, "") and "amount" in payload:
+                left = float(optional_exact_decimal(payload, "left", what=what))
+                filled = max(0.0, amount - left)
         else:
-            status = payload.get("status") or "open"
-            amount = float(abs(to_int(payload.get("size"))))
-            filled = max(0.0, amount - float(abs(to_int(payload.get("left")))))
+            what = f"{payload.get('contract') or 'contract'} order {payload.get('id')!r}"
+            reason = GateioFinishAs.parse(payload.get("finish_as"))
+            status = payload.get("status")
+            if status is None:
+                # An absent state leaves the reason as the only statement: a
+                # terminal reason means the order is finished, anything else —
+                # including the open marker the stream uses — means it rests.
+                # The old default read every stateless payload as open, which
+                # reported a finished order live (REC-06).
+                status = "open" if reason is GateioFinishAs.UNKNOWN else "finished"
+
+            def lots(key: str) -> float:
+                try:
+                    return float(abs(to_lot_count(payload.get(key))))
+                except ValueError as e:
+                    raise ValueError(
+                        f"the {what}'s '{key}' field decides the order's state: {e}",
+                    ) from None
+
+            has_quantities = payload.get("size") not in (None, "") and payload.get("left") not in (
+                None,
+                "",
+            )
+            amount = lots("size") if payload.get("size") not in (None, "") else 0.0
+            # `filled` is only computable when both quantities are stated:
+            # subtracting an unstated remainder from a stated size is the
+            # confident-full-fill defect, not a smaller claim.
+            filled = max(0.0, amount - lots("left")) if has_quantities else 0.0
         return order_status_from_gateio(
             str(status),
             payload.get("finish_as"),
@@ -3805,7 +4097,15 @@ class GateioExecutionClient(LiveExecutionClient):
                 # once the identity is known; reporting it now would attribute it
                 # to an external order.
                 return
-            report = self._parse_fill_report(product, payload, instrument)
+            try:
+                report = self._parse_fill_report(product, payload, instrument)
+            except ValueError as e:
+                self._log.error(
+                    f"Dropping an external fill frame on {instrument_id}: {e}. The "
+                    f"execution stands at the venue and is recovered by the next "
+                    f"reconciliation pass",
+                )
+                return
             if report is not None:
                 self._hand_over_fill(report)
             return
@@ -3825,10 +4125,34 @@ class GateioExecutionClient(LiveExecutionClient):
             self._handle_late_fill(product, order, instrument, payload, trade_id)
             return
 
-        last_px = instrument.make_price(to_decimal(payload.get("price")))
-        last_qty, commission = self._fill_quantity_and_commission(product, payload, instrument)
+        try:
+            last_px = instrument.make_price(
+                exact_decimal_field(
+                    payload,
+                    "price",
+                    what=f"{product.value} fill {trade_id.value}",
+                ),
+            )
+            last_qty, commission = self._fill_quantity_and_commission(
+                product,
+                payload,
+                instrument,
+            )
+        except ValueError as e:
+            # A deciding field the venue stated and this client cannot read: a
+            # booked guess would misstate money, so the frame is dropped
+            # loudly. The execution stands at the venue, and every recovery
+            # path (reconnect, restart, position check) re-reads the trade
+            # listing, where an unreadable row fails the listing rather than
+            # vanishing (REC-06).
+            self._log.error(
+                f"Dropping the stream fill {trade_id.value} for {order.client_order_id!r}: "
+                f"{e}. The execution stands at the venue and is recovered by the next "
+                f"reconciliation pass",
+            )
+            return
         if last_qty.as_decimal() <= 0:
-            self._log.debug(f"Ignoring a zero-quantity fill {trade_id.value}")
+            self._log.warning(f"Ignoring a zero-quantity fill {trade_id.value}")
             return
 
         ts_event = (
@@ -3900,17 +4224,22 @@ class GateioExecutionClient(LiveExecutionClient):
         commissions": a buy of 1.0 BTC with a 0.001 BTC commission is a net long
         position of 0.999 BTC, *from a fill of 1.0*.
         """
-        fee = to_decimal(payload.get("fee"))
+        what = f"{product.value} fill {payload.get('id')!r}"
+        # An absent fee is the venue making no fee statement — options REST
+        # fills carry none at all — which is a commission of zero; a fee the
+        # venue stated and this client cannot read raises (REC-06), because a
+        # defaulted commission is money silently missing from realized PnL.
+        fee = optional_exact_decimal(payload, "fee", what=what)
         if product.is_spot:
             fee_currency = self._currency(
                 payload.get("fee_currency"),
                 default=instrument.quote_currency.code,
             )
-            quantity = to_decimal(payload.get("amount"))
+            quantity = exact_decimal_field(payload, "amount", what=what)
             return instrument.make_qty(quantity), Money(fee, fee_currency)
 
         settlement = getattr(instrument, "settlement_currency", instrument.quote_currency)
-        size = abs(to_int(payload.get("size")))
+        size = abs(exact_lots(payload, "size", what=what))
         # Options fills carry no fee on the REST endpoint; the stream does.
         return Quantity(size, instrument.size_precision), Money(fee, settlement)
 
@@ -4442,11 +4771,20 @@ class GateioExecutionClient(LiveExecutionClient):
         cover, and that path handles both "the venue says flat" and "the venue
         did not answer" correctly.
 
-        A trade listing that failed for one product is treated the same way and
-        for the same reason. It is raised — that is what tells the engine not to
-        square a position against a flat report it built itself — but recovery
-        works from what the venue *did* answer, so the reports gathered before
-        the failure are taken off the exception rather than thrown away.
+        A failed order or trade listing is the opposite case, and takes the
+        platform's own posture (the base ``generate_mass_status``, installed
+        live/execution_client.py:440-514, where any report exception nukes the
+        whole mass status): this method returns ``None`` and the kernel
+        refuses to start. Round eight restated this from "work from the
+        partial answer" after the refutation drove the partial path through
+        the engine: order reports state filled quantities, the trades backing
+        them are missing from the partial listing, and
+        ``_handle_fill_quantity_mismatch`` mints commission-less inferred
+        stand-ins for the difference while reconciliation reports success — a
+        fabricated execution in place of a venue trade. Positions can be left
+        out safely because the engine re-queries them per instrument with
+        correct failure semantics; orders and fills have no such second
+        chance inside one startup.
 
         The recovered executions are booked **inside this method, before it
         returns** — see the sweep below. This is the one moment on the restart
@@ -4534,11 +4872,13 @@ class GateioExecutionClient(LiveExecutionClient):
             if isinstance(result, asyncio.CancelledError):
                 raise result
 
-        if isinstance(fills, FillReportsUnavailable):
-            self._log.warning(f"Startup recovery is working from a partial answer: {fills}")
-            fills = fills.reports
-
         if isinstance(orders, BaseException) or isinstance(fills, BaseException):
+            # The platform posture (see the docstring): an order or trade
+            # listing that did not answer in full - a failed endpoint, or a
+            # row whose deciding field could not be read - fails the whole
+            # mass status. Booking a partial account and letting the engine
+            # square the gaps fabricates executions; refusing to start does
+            # not.
             failure = orders if isinstance(orders, BaseException) else fills
             self._log.exception("Cannot reconcile execution state", failure)
             return None
@@ -4565,9 +4905,13 @@ class GateioExecutionClient(LiveExecutionClient):
         }
         unbooked_before = [r for r in fills if not self._fill_is_booked(r)]
         if unbooked_before:
+            # The orders held before the sweep books anything: only bookings
+            # that extend them arm the stale-answer memory
+            # (`_record_recovery_bookings`).
+            known_before = {order.client_order_id for order in self._cache.orders()}
             await self._hand_over_unapplied_fills(unbooked_before, listed_orders)
             booked_now = [r for r in unbooked_before if self._fill_is_booked(r)]
-            self._record_recovery_bookings(booked_now)
+            self._record_recovery_bookings(booked_now, known_before)
             orders = self._prune_reports_the_sweep_outran(orders, booked_now)
 
         mass_status.add_order_reports(reports=orders)
@@ -4601,8 +4945,24 @@ class GateioExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
-        """Generate order status reports across every enabled product."""
+        """Generate order status reports across every enabled product.
+
+        A product whose listing failed — the endpoint, or a row whose deciding
+        field could not be read — makes this method raise
+        :class:`OrderReportsUnavailable` carrying what did parse. Swallowing
+        the failure and returning the rest is indistinguishable from "the
+        venue holds no such orders": a cached order the missing row would have
+        closed then stays open locally with only a debug line downstream, an
+        open/closed disagreement with the venue (REC-06). The raise cannot
+        fabricate anywhere it lands: the startup path refuses the mass status
+        (kernel refuses to start), the open-order check skips one cycle, and
+        the single-order path answers ``None``.
+
+        A wallet Gate.io has not created is not a failure: it holds no orders,
+        which is a definite answer of none.
+        """
         reports: list[OrderStatusReport] = []
+        failures: list[str] = []
         start_secs, end_secs = self._window(command.start, command.end)
 
         for product in self._products:
@@ -4616,10 +4976,21 @@ class GateioExecutionClient(LiveExecutionClient):
                 )
             except WalletNotProvisionedError as e:
                 self._log.warning(f"Skipping {product.value} order reports: {e}")
-            except (asyncio.CancelledError, Exception) as e:  # noqa: BLE001
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - reported below, after every product
                 self._log_report_error(e, f"{product.value} OrderStatusReports")
+                failures.append(f"{product.value}: {e}")
 
         self._log_report_receipt(len(reports), "OrderStatusReport", command.log_receipt_level)
+
+        if failures:
+            raise OrderReportsUnavailable(
+                f"Gate.io did not answer the order listing"
+                f"{f' for {command.instrument_id}' if command.instrument_id is not None else ''}: "
+                f"{'; '.join(failures)}",
+                reports,
+            )
         return reports
 
     async def _order_reports_for_product(
@@ -5064,7 +5435,15 @@ class GateioExecutionClient(LiveExecutionClient):
             self._log_report_error(e, "OrderStatusReport")
             return None
 
-        return await self._report_from_payload(product, payload, raw_symbol)
+        try:
+            return await self._report_from_payload(product, payload, raw_symbol)
+        except ValueError as e:
+            # An unreadable deciding field on the one-order read. ``None`` is
+            # the honest single-order answer — the engine treats it as an
+            # unanswered query — and the failure is loud enough to name the
+            # field and the value.
+            self._log_report_error(e, "OrderStatusReport")
+            return None
 
     async def _get_order(
         self,
@@ -5089,7 +5468,14 @@ class GateioExecutionClient(LiveExecutionClient):
         payload: Any,
         raw_symbol: str,
     ) -> OrderStatusReport | None:
-        """Turn one order payload into a report, loading its instrument if needed."""
+        """Turn one order payload into a report, loading its instrument if needed.
+
+        This is the single-order path (the direct read behind
+        ``generate_order_status_report``), which is what ``single_order``
+        declares: it changes only the still-open spot cash market buy, which
+        gets the honest quote-denominated ACCEPTED answer here and silence in
+        the listings (R7C-03; see ``_open_cash_buy_as_quote``).
+        """
         if not isinstance(payload, dict):
             return None
         instrument = await self._instrument_or_load(
@@ -5097,7 +5483,7 @@ class GateioExecutionClient(LiveExecutionClient):
         )
         if instrument is None:
             return None
-        return self._parse_order_status_report(product, payload, instrument)
+        return self._parse_order_status_report(product, payload, instrument, single_order=True)
 
     def _known_venue_text(self, client_order_id: ClientOrderId) -> str | None:
         """Return the ``text`` this order was submitted under, without minting one.
@@ -5184,11 +5570,35 @@ class GateioExecutionClient(LiveExecutionClient):
         product: GateioProductType,
         payload: dict[str, Any],
         instrument: Instrument | None,
+        *,
+        single_order: bool = False,
     ) -> OrderStatusReport | None:
-        """Build an :class:`OrderStatusReport`, skipping a payload it cannot express."""
+        """Build an :class:`OrderStatusReport`, or refuse a payload it cannot read.
+
+        ``ValueError`` — an unreadable deciding field, or a report the platform
+        itself refuses to construct — propagates, enriched with the order id,
+        because a batch that silently omits an order the venue reported is
+        answering a different question than it was asked (REC-06): the listing
+        callers turn it into :class:`OrderReportsUnavailable`. Anything else is
+        an internal error, logged and skipped so one bug cannot fail a batch.
+
+        ``single_order`` marks the one-order query path (the engine's inflight
+        check), where the still-open spot cash market buy gets the honest
+        quote-denominated answer the listings must not give — see
+        :meth:`_parse_spot_order_fields`.
+        """
         try:
-            return self._build_order_status_report(product, payload, instrument)
-        except Exception as e:  # noqa: BLE001 - one bad order must not fail the batch
+            return self._build_order_status_report(
+                product,
+                payload,
+                instrument,
+                single_order=single_order,
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"the {product.value} order {payload.get('id')!r} cannot be read: {e}",
+            ) from e
+        except Exception as e:  # noqa: BLE001 - an internal bug must not fail the batch
             self._log.warning(f"Cannot parse the order {payload.get('id')!r}: {e}")
             return None
 
@@ -5197,6 +5607,8 @@ class GateioExecutionClient(LiveExecutionClient):
         product: GateioProductType,
         payload: dict[str, Any],
         instrument: Instrument | None,
+        *,
+        single_order: bool = False,
     ) -> OrderStatusReport | None:
         raw_symbol = venue_symbol_of(payload)
         if not raw_symbol or instrument is None:
@@ -5214,7 +5626,12 @@ class GateioExecutionClient(LiveExecutionClient):
         client_order_id = self._client_order_id_for(payload.get("text"), venue_order_id)
 
         if product.is_spot:
-            parsed = self._parse_spot_order_fields(payload, instrument)
+            parsed = self._parse_spot_order_fields(
+                payload,
+                instrument,
+                client_order_id,
+                single_order=single_order,
+            )
         else:
             parsed = self._parse_contract_order_fields(payload, instrument)
         if parsed is None:
@@ -5347,11 +5764,26 @@ class GateioExecutionClient(LiveExecutionClient):
         self,
         payload: dict[str, Any],
         instrument: Instrument,
+        client_order_id: ClientOrderId | None = None,
+        *,
+        single_order: bool = False,
     ) -> tuple[OrderSide, OrderType, Quantity, Quantity, Price | None] | None:
-        side = order_side_from_gateio(str(payload.get("side")))
-        order_type = order_type_from_gateio(payload.get("type"))
-        amount = to_decimal(payload.get("amount"))
-        filled = to_decimal(payload.get("filled_amount"))
+        """Read the deciding fields of one spot or margin order row, strictly.
+
+        Every field read here decides side, type, quantity or filled quantity,
+        and the forgiving readers turned unreadable bytes into confident
+        claims: a mangled ``side`` flipped BUY to SELL, a mangled ``type``
+        routed a cash amount past the market-buy protection, and an unreadable
+        ``amount`` silently erased the venue's order from the answer (REC-06).
+        Unreadable raises; the listing callers turn that into a loud
+        :class:`OrderReportsUnavailable`. An explicit readable zero stays
+        believed.
+        """
+        what = f"spot order {payload.get('id')!r}"
+        side = order_side_from_gateio(require_field(payload, "side", what=what))
+        order_type = order_type_from_gateio(require_field(payload, "type", what=what))
+        amount = exact_decimal_field(payload, "amount", what=what)
+        filled = exact_decimal_field(payload, "filled_amount", what=what)
 
         if order_type == OrderType.MARKET and side == OrderSide.BUY:
             # `amount` is a quote-currency cash amount here, so the only
@@ -5362,11 +5794,31 @@ class GateioExecutionClient(LiveExecutionClient):
             # it would state a quantity the venue never set, the engine would
             # restate the order to that partial figure, and every further match
             # would then be refused as an overfill (REC-04). So an unfinished
-            # cash buy yields no order status report at all. Nothing is lost by
-            # that: its executions are recovered from the trade listing, and
-            # the order's own statement is taken from a re-read once the venue
-            # has finished it (`_hand_over_fills_with_their_order`).
-            if str(payload.get("status") or "").lower() == "open":
+            # cash buy yields no order status report in a listing. Nothing is
+            # lost by that: its executions are recovered from the trade
+            # listing, and the order's own statement is taken from a re-read
+            # once the venue has finished it (`_hand_over_fills_with_their_order`).
+            # The status deciding all of that must itself be readable: a
+            # mangled status falling through to the `filled` branch is the
+            # restate-to-partial defect REC-04 closed.
+            status = str(require_field(payload, "status", what=what) or "").lower()
+            if status not in SPOT_ORDER_STATUSES:
+                raise ValueError(
+                    f"the {what}'s 'status' field decides whether a cash market buy has a "
+                    f"base quantity yet, and {payload.get('status')!r} is not a spot order "
+                    f"status",
+                )
+            if status == "open":
+                if single_order:
+                    quote_report = self._open_cash_buy_as_quote(
+                        payload,
+                        instrument,
+                        client_order_id,
+                        amount,
+                        filled,
+                    )
+                    if quote_report is not None:
+                        return quote_report
                 self._log.debug(
                     "Skipping the report of a spot market buy Gate.io is still working: "
                     "no base-denominated quantity exists for it until it finishes",
@@ -5389,10 +5841,15 @@ class GateioExecutionClient(LiveExecutionClient):
         # netted of a fee the fills are not would have the engine restating the
         # quantity on one pass and inferring a phantom fill on the next.
         if amount <= 0:
+            # The venue affirmatively states a non-positive quantity, which no
+            # OrderStatusReport can carry; believed, skipped, and never silent.
+            self._log.warning(
+                f"Skipping the {what} report: the venue states a non-positive amount {amount}",
+            )
             return None
         price_value = payload.get("price")
         price = (
-            instrument.make_price(to_decimal(price_value))
+            instrument.make_price(exact_decimal_field(payload, "price", what=what))
             if order_type == OrderType.LIMIT and price_value not in (None, "")
             else None
         )
@@ -5404,22 +5861,86 @@ class GateioExecutionClient(LiveExecutionClient):
             price,
         )
 
+    def _open_cash_buy_as_quote(
+        self,
+        payload: dict[str, Any],
+        instrument: Instrument,
+        client_order_id: ClientOrderId | None,
+        amount: Decimal,
+        filled: Decimal,
+    ) -> tuple[OrderSide, OrderType, Quantity, Quantity, Price | None] | None:
+        """The one honest report for a cash buy the venue is still working.
+
+        The engine's inflight check resolves an unacknowledged SUBMITTED order
+        through ``generate_order_status_report``, and five consecutive ``None``
+        answers fabricate ``OrderRejected(reason="UNKNOWN")`` for an order the
+        venue holds (installed live/execution_engine.py:701-797) — so the
+        single-order path may not stay silent just because no base quantity
+        exists yet (R7C-03).
+
+        The answer that cannot lie states the order in the venue's own units:
+        ACCEPTED, quantity = the quote cash amount, filled 0. That is only
+        honest while the local order is still quote-denominated with nothing
+        filled on either side — then ``report.quantity == order.quantity`` and
+        the engine's ``_should_update`` finds nothing to restate, which is the
+        REC-04 constraint (never state the quote amount as base). Once either
+        side has a fill the units diverge and the answer is silence again; by
+        then the order has left the inflight check's SUBMITTED state anyway.
+        """
+        if client_order_id is None or filled > 0:
+            return None
+        order = self._cache.order(client_order_id)
+        if (
+            order is None
+            or not order.is_quote_quantity
+            or order.filled_qty.as_decimal() > 0
+            or order.quantity.as_decimal() != amount
+        ):
+            return None
+        return (
+            OrderSide.BUY,
+            OrderType.MARKET,
+            instrument.make_qty(amount),
+            instrument.make_qty(Decimal(0)),
+            None,
+        )
+
     def _parse_contract_order_fields(
         self,
         payload: dict[str, Any],
         instrument: Instrument,
     ) -> tuple[OrderSide, OrderType, Quantity, Quantity, Price | None] | None:
-        size = to_int(payload.get("size"))
+        """Read the deciding fields of one futures/delivery/options order row, strictly.
+
+        ``size`` decides the side and the quantity, ``left`` decides the
+        filled quantity, ``price`` decides both the price and the order type.
+        The forgiving readers defaulted every one of them to 0, and through
+        the installed engine those defaults crossed the bar (REC-06): an
+        unreadable ``left`` became a confident full fill the engine closed
+        with a fabricated execution while the venue holds the order open
+        (CZ-1), an unreadable ``left`` on a venue-canceled order reported it
+        FILLED (CZ-3), and an unreadable ``size`` collapsed into the genuine
+        close-position zero so the report vanished behind the same debug line
+        (CZ-6). Unreadable raises; the listing callers answer
+        :class:`OrderReportsUnavailable`. The one believed zero is the value
+        the payload explicitly states as 0 — the close-position order, which
+        genuinely has no quantity of its own. Fractional sizes raise too:
+        decimal-sized (`enable_decimal`) contracts are not supported by this
+        client, and truncating them misstates the quantity silently.
+        """
+        what = f"{payload.get('contract') or 'contract'} order {payload.get('id')!r}"
+        size = exact_lots(payload, "size", what=what)
         if size == 0:
-            # A close-position order carries no quantity of its own.
+            # A close-position order carries no quantity of its own; this 0 is
+            # the venue's affirmative statement, read exactly, not a default.
             self._log.debug("Skipping a close-position order report with size 0")
             return None
         side = OrderSide.BUY if size > 0 else OrderSide.SELL
         quantity = abs(size)
-        left = abs(to_int(payload.get("left")))
+        left = abs(exact_lots(payload, "left", what=what))
         filled = max(0, quantity - left)
 
-        price_value = to_decimal(payload.get("price"))
+        price_value = optional_exact_decimal(payload, "price", what=what)
         is_market = price_value <= 0
         price = None if is_market else instrument.make_price(price_value)
         order_type = OrderType.MARKET if is_market else OrderType.LIMIT
@@ -5444,7 +5965,19 @@ class GateioExecutionClient(LiveExecutionClient):
         """
         try:
             return await self._build_trigger_order_report(product, payload, link)
-        except Exception as e:  # noqa: BLE001 - one bad order must not fail the batch
+        except ValueError as e:
+            # Same discipline as the regular order rows (REC-06): a deciding
+            # field the venue stated and this client cannot read fails the
+            # listing. An armed order adopted with a defaulted side or size
+            # would be a wrong order in the cache, and one silently omitted is
+            # invisible to reconciliation — and, with the open-order check's
+            # missing-at-venue resolution enabled, resolvable into a
+            # fabricated rejection.
+            raise ValueError(
+                f"the {product.value} price-triggered order {payload.get('id')!r} cannot "
+                f"be read: {e}",
+            ) from e
+        except Exception as e:  # noqa: BLE001 - an internal bug must not fail the batch
             self._log.warning(f"Cannot parse the price-triggered order {payload.get('id')!r}: {e}")
             return None
 
@@ -5482,19 +6015,23 @@ class GateioExecutionClient(LiveExecutionClient):
         venue_order_id = VenueOrderId(trigger_id)
         client_order_id = link.client_order_id if link is not None else None
 
+        what = f"price order {trigger_id}"
         if product.is_spot:
-            side = order_side_from_gateio(str(initial.get("side")))
-            quantity = instrument.make_qty(to_decimal(initial.get("amount")))
+            side = order_side_from_gateio(require_field(initial, "side", what=what))
+            quantity = instrument.make_qty(exact_decimal_field(initial, "amount", what=what))
             is_limit = str(initial.get("type") or "limit").lower() == "limit"
-            price_value = to_decimal(initial.get("price"))
+            price_value = optional_exact_decimal(initial, "price", what=what)
             time_in_force_value = str(initial.get("time_in_force") or "gtc")
         else:
-            size = to_int(initial.get("size"))
+            size = exact_lots(initial, "size", what=what)
             if size == 0:
+                self._log.warning(
+                    f"Skipping the {what} report: the venue states a size of 0",
+                )
                 return None
             side = OrderSide.BUY if size > 0 else OrderSide.SELL
             quantity = Quantity(abs(size), instrument.size_precision)
-            price_value = to_decimal(initial.get("price"))
+            price_value = optional_exact_decimal(initial, "price", what=what)
             is_limit = price_value > 0
             time_in_force_value = str(initial.get("tif") or "gtc")
 
@@ -5506,8 +6043,12 @@ class GateioExecutionClient(LiveExecutionClient):
         else:
             order_type = OrderType.STOP_MARKET
 
-        trigger_price_value = to_decimal(trigger.get("price"))
+        trigger_price_value = exact_decimal_field(trigger, "price", what=what)
         if trigger_price_value <= 0:
+            self._log.warning(
+                f"Skipping the {what} report: the venue states a trigger price of "
+                f"{trigger_price_value}, which no report can carry",
+            )
             return None
 
         ts_accepted = first_timestamp_ns(payload, "create_time", "ctime")
@@ -5585,6 +6126,12 @@ class GateioExecutionClient(LiveExecutionClient):
                 self._log.warning(f"Skipping {product.value} fill reports: {e}")
             except asyncio.CancelledError:
                 raise
+            except FillReportsUnavailable as e:
+                # A product whose listing held unreadable rows: keep what it
+                # did answer readably, and keep the failure.
+                self._log_report_error(e, f"{product.value} FillReports")
+                reports += e.reports
+                failures.append(f"{product.value}: {e}")
             except Exception as e:  # noqa: BLE001 - reported below, after every product
                 self._log_report_error(e, f"{product.value} FillReports")
                 failures.append(f"{product.value}: {e}")
@@ -5672,6 +6219,7 @@ class GateioExecutionClient(LiveExecutionClient):
             )
 
         reports: list[FillReport] = []
+        row_failures: list[str] = []
         for payload in payloads:
             raw_symbol = venue_symbol_of(payload)
             if not raw_symbol:
@@ -5685,12 +6233,26 @@ class GateioExecutionClient(LiveExecutionClient):
             )
             if instrument is None:
                 continue  # `_instrument_or_load` has already logged the loss
-            report = self._parse_fill_report(product, payload, instrument)
+            try:
+                report = self._parse_fill_report(product, payload, instrument)
+            except ValueError as e:
+                # A row the venue stated and this client cannot read: the rest
+                # of the listing is still parsed — a caller that can use a
+                # loud partial answer gets it off the exception — but the
+                # listing as a whole has failed (REC-06).
+                row_failures.append(str(e))
+                continue
             if report is None:
                 continue
             if not _within(report.ts_event, start_secs, end_secs):
                 continue
             reports.append(report)
+        if row_failures:
+            raise FillReportsUnavailable(
+                f"Gate.io answered the {product.value} trade listing with rows this client "
+                f"cannot read: {'; '.join(row_failures)}",
+                reports,
+            )
         return reports
 
     def _option_underlyings(self, symbol: str | None) -> list[str]:
@@ -5725,28 +6287,63 @@ class GateioExecutionClient(LiveExecutionClient):
         payload: dict[str, Any],
         instrument: Instrument,
     ) -> FillReport | None:
-        """Build a :class:`FillReport` from one Gate.io fill object."""
-        trade_id_value = payload.get("id")
-        order_id_value = payload.get("order_id") or payload.get("order")
-        if trade_id_value in (None, "") or order_id_value in (None, ""):
-            return None
+        """Build a :class:`FillReport` from one Gate.io fill object, strictly.
 
-        last_px = instrument.make_price(to_decimal(payload.get("price")))
+        Every deciding field of an execution — identity, side, quantity, price,
+        fee, time — raises when the payload states it and this client cannot
+        read it (REC-06). A silently dropped row is a lost execution: the
+        engine believes the listing was complete, replaces the missing
+        quantity with a commission-less inferred fill, and the venue's trade
+        id — the only key by which a later replay could be recognised — is
+        gone (CZ-2, CZ-4, CZ-5). The listing caller turns the raise into
+        :class:`FillReportsUnavailable`, which is the one signal that arms the
+        engine's brake against squaring positions on an incomplete answer.
+
+        ``None`` is returned only for a row whose readable content states no
+        execution — a zero size or amount the venue affirmatively published —
+        and never silently.
+        """
+        what = f"{product.value} fill {payload.get('id')!r}"
+        trade_id_value = require_field(payload, "id", what=what)
+        order_id_value = payload.get("order_id") or payload.get("order")
+        if trade_id_value in (None, ""):
+            raise ValueError(f"the {what} states no venue trade id")
+        if order_id_value in (None, ""):
+            raise ValueError(f"the {what} states no venue order id")
+
+        last_px = instrument.make_price(exact_decimal_field(payload, "price", what=what))
         if product.is_spot:
-            side = order_side_from_gateio(str(payload.get("side")))
+            side = order_side_from_gateio(require_field(payload, "side", what=what))
         else:
-            size = to_int(payload.get("size"))
+            size = exact_lots(payload, "size", what=what)
             if size == 0:
+                self._log.warning(
+                    f"Skipping the {what}: the venue states a size of 0, which is not an execution",
+                )
                 return None
             side = OrderSide.BUY if size > 0 else OrderSide.SELL
 
         last_qty, commission = self._fill_quantity_and_commission(product, payload, instrument)
         if last_qty.as_decimal() <= 0:
+            self._log.warning(
+                f"Skipping the {what}: the venue states a quantity of {last_qty}, which is "
+                f"not an execution",
+            )
             return None
 
         venue_order_id = VenueOrderId(str(order_id_value))
-        ts_event = first_timestamp_ns(payload, "create_time_ms", "create_time", "time_ms", "time")
-        ts_init = self._clock.timestamp_ns()
+        # The execution time orders the fills the engine applies and feeds the
+        # staleness memory; stated-but-unreadable raises, and a row stating no
+        # time at all cannot be ordered honestly, so it fails the same way.
+        ts_event = exact_first_timestamp_ns(
+            payload,
+            "create_time_ms",
+            "create_time",
+            "time_ms",
+            "time",
+        )
+        if not ts_event:
+            raise ValueError(f"the {what} states no readable execution time")
         return FillReport(
             account_id=self.account_id,
             instrument_id=instrument.id,
@@ -5759,8 +6356,8 @@ class GateioExecutionClient(LiveExecutionClient):
             commission=commission,
             liquidity_side=liquidity_side_from_gateio(payload.get("role")),
             report_id=UUID4(),
-            ts_event=ts_event or ts_init,
-            ts_init=ts_init,
+            ts_event=ts_event,
+            ts_init=self._clock.timestamp_ns(),
         )
 
     # -- reconciliation: positions -----------------------------------------
@@ -5886,10 +6483,13 @@ class GateioExecutionClient(LiveExecutionClient):
             # neither contains the trades this recovery just booked nor is
             # stamped after them is a read from before those trades, and the
             # only honest answer built on it is "the query is not answered yet".
+            # The stamp judged is the venue's own (0 when the row stated none);
+            # `report.ts_last` falls back to local now, which would read as
+            # fresher than any booked trade (R7C-02).
             if self._position_answer_is_stale(
                 report.instrument_id,
                 report.signed_decimal_qty,
-                report.ts_last,
+                self._position_row_venue_ts.get(report.instrument_id, 0),
             ):
                 raise PositionStatusUnavailable(
                     f"The {report.instrument_id} position row does not contain venue "
@@ -6077,6 +6677,14 @@ class GateioExecutionClient(LiveExecutionClient):
 
         entry_price = to_decimal(payload.get("entry_price"))
         ts_last = first_timestamp_ns(payload, "update_time", "time_ms", "time")
+        # What the staleness rule judges is the venue's own stamp, recorded
+        # exactly as stated — 0 when the row stated none. The report's
+        # `ts_last` below falls back to local now because the platform needs a
+        # real timestamp on the report, but local now is a stamp this client
+        # fabricated: it postdates any booked trade by construction, so
+        # feeding it to the rule would silently bypass the stale-answer
+        # protection (R7C-02).
+        self._position_row_venue_ts[instrument.id] = ts_last
         ts_init = self._clock.timestamp_ns()
         return PositionStatusReport(
             account_id=self.account_id,

@@ -54,8 +54,11 @@ Close what is already known to be wrong before adding anything.
   verifiers refuted the round. Claim accuracy held in full: the commit describes exactly what the
   tree does, every cited test fails on revert, and the gate fails the exact scenarios claimed on
   the reverted tree. What the other two broke, and what they left standing, is recorded per fix
-  below; the open remainders are `REC-05` and `REC-06` in the
-  [review matrix](review-matrix.md#recovery-findings-raised-after-this-review), and both block.
+  below; the remainders were `REC-05` and `REC-06` in the
+  [review matrix](review-matrix.md#recovery-findings-raised-after-this-review). The eighth round
+  closed `REC-06` in full and narrowed `REC-05` to one surviving door, now recorded as `REC-07`,
+  which blocks — the eighth-round block at the end of this bullet records what was claimed, what
+  the round's audit found, and what remains.
 
   **Closed.** The fill-report query now raises when a product's trade listing fails, carrying the
   reports the other products did answer. That raise is the only thing that arms the engine's brake
@@ -133,6 +136,62 @@ Close what is already known to be wrong before adding anything.
   reported a four-lot match — a state no perpetual account can be in, and the one answer under
   which a client that books the trade twice still reads as correct. That fixture now answers with
   the position the recovered trade creates, and fails on both trees.
+
+  **The eighth round: the class closed on one surface, found alive on another.** The seventh
+  round died of half-closure — the right tool applied to one field of many, and a rule wrong in
+  the direction no fixture measured — so the eighth set out to close both findings across their
+  whole surface, as one change each where the refutations showed the halves collide. Its audit
+  re-ran the round-seven refuters' own 33-cell matrix (33/33 clean, up from 29/33), ran the
+  release gate at the fixed tree (41 scenarios, 194 checks, pass) and against the reverted tree
+  (exactly the seven claimed scenarios fail), re-derived the deciding-field census (every row
+  strict or excluded with a stated reason), and verified every fixer claim and receipt. What that
+  established, per finding:
+  - `REC-05` — claimed closed; the audit found it narrowed, not closed. The staleness rule now
+    withholds every position answer that does not contain the trades this pass booked and cannot
+    be shown, by the venue's own stamp, to postdate them — not only the answer equal to the
+    pre-booking book. Believing anything staler than the memory is what erased a pre-existing
+    SHORT 6 with a fabricated execution while reconciliation reported success. Withholding
+    degrades to a refused node start, never a fabrication. In the same change the arming
+    narrowed: only bookings that extended orders the cache held when recovery began arm the
+    memory, because the pre-booking book is only refutable knowledge when this node held it —
+    arming fresh-cache and adopted-order bookings is what froze the ordinary no-database restart
+    of a partial-window round trip against the venue's current flat row (R7C-01), and broadening
+    the withhold without narrowing the arming makes that freeze strictly worse. An unreadable row
+    timestamp is judged as 0, never promoted to local now (R7C-02). The audit confirmed all of
+    that closed — and then drove the arming exception itself through the real engine: a pass
+    whose outage trade rode an external or adopted order arms nothing for its instrument, so the
+    same stale shapes erase the pre-existing position together with the adopted bookings, in a
+    node that starts (two cells, R8-F1 and R8-F2, measured by no prior round or gate scenario).
+    That remainder is `REC-07` in the review matrix, open and blocking. Residuals stated on the
+    method and in the gate receipt: the memory is one restart deep, and a same-second
+    compensating trade stays withheld until a distinguishable row.
+  - `REC-06` — claimed closed; the audit could not refute it. Every deciding field of the fill,
+    order and trigger parses — and the status arithmetic shared with the stream — is read
+    strictly, with the round-seven pattern widened by a decimal-aware sibling
+    (`to_exact_decimal`) and strict side/type/status conversions. Unreadable raises: trade
+    listings answer `FillReportsUnavailable` carrying every readable row, order listings answer
+    the new `OrderReportsUnavailable`, and startup refuses the mass status on either — the
+    platform's own posture for a failed report query, adopted after the refutation showed the
+    partial-answer path fabricating commission-less stand-ins for the missing trades. Explicit
+    readable zeros stay believed; stringified integers parse exactly; decimal-sized
+    (`enable_decimal`) contracts are refused loudly rather than truncated, a documented alpha
+    limitation. The still-open spot cash market buy answers the single-order query with the
+    venue's own quote-denominated ACCEPTED statement (closing the fabricated inflight rejection
+    of R7C-03) and stays silent in listings, which is the REC-04 constraint. The below-bar edges
+    the audit found — the order report's average price, the spot fill's fee currency, the spot
+    stream's inferred `finished` for a payload stating neither status nor event, and an
+    overstating docstring on the open-order check, since corrected — are recorded as residual
+    risks in the review matrix.
+
+  Held by the widened `TestStalePositionAnswersAfterRecovery`, the new
+  `TestUnreadableContractOrderFields` / `TestUnreadableSpotOrderFields` / `TestUnreadableFillRows`
+  / `TestOpenCashMarketBuySingleOrderQuery` / `TestExactDecimal` families, and seven release-gate
+  scenarios that port the refuters' cells — the four pre-existing-position matrix cells, the
+  fresh-cache round trip, and the confident-zero engine cases — every one of which fails against
+  the pre-round-eight tree and ends fail-safe on this one. The gate scenario named
+  `stale_position_answer_cannot_erase_a_preexisting_position` covers the cache-held-order slice
+  only; the surviving `REC-07` cells are covered by no scenario yet, and porting them is the next
+  round's first obligation, before its fix.
 - ~~Close the two open recovery defects above with a scenario that asserts the damage, and extend
   the restart scenarios to cover the pairings only the reconnect scenarios exercise today.~~ Done:
   the dual-route parity family asserts the damage per route before comparing them, the restart
