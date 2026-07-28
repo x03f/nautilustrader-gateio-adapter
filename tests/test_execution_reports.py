@@ -1049,6 +1049,83 @@ class TestStalePositionAnswersAfterRecovery:
                 env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
             )
 
+    # -- REC-07 / R8-F2: a zero-net booking set does not disarm the rule ----
+
+    def test_a_zero_net_booking_set_does_not_disarm_the_protection(self, perp_env):
+        """An ordinary zero-net outage round trip on KNOWN orders books real
+        trades, so the memory holds ``(0, latest_ts)`` — and the pre-fix
+        reader popped it at ``delta == 0`` before ever comparing the answer
+        with the book (REC-07, the zero-net door). A non-empty booking set
+        that nets to zero still cannot be contained in an answer that
+        disagrees with the post-booking book: the absent row here reads 0
+        against a cache holding 2 and carries no stamp that could prove
+        freshness, so it is withheld like any other unprovable answer."""
+        env = perp_env
+        self._booked_over_a_preexisting_position(env, cache_lots=2, delta=0, booked_ts_ns=2**62)
+        env.perp.responses["position"] = []
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_a_zero_row_in_the_same_second_as_a_zero_net_round_trip_is_withheld(self, perp_env):
+        """The kept zero-size row Gate.io serves for a traded contract,
+        stamped in the same second as the round trip's trades: equal
+        second-granular stamps prove nothing, and 0 disagrees with the
+        post-booking book of 2, so the answer is withheld."""
+        env = perp_env
+        self._booked_over_a_preexisting_position(
+            env,
+            cache_lots=2,
+            delta=0,
+            booked_ts_ns=INSIDE_SECS * 1_000_000_000,
+        )
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 0, "entry_price": "0", "update_time": INSIDE_SECS},
+        ]
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_a_fresher_disagreement_clears_a_zero_net_memory(self, perp_env):
+        """Control (passes on the pre-fix tree too): freshness still wins for
+        a zero-net entry — a row stamped strictly after the booked trades is
+        the venue's later statement, whatever it says."""
+        env = perp_env
+        self._booked_over_a_preexisting_position(env, cache_lots=2, delta=0, booked_ts_ns=1)
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 9, "entry_price": "60000", "update_time": INSIDE_SECS},
+        ]
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.LONG]
+        assert reports[0].quantity == Quantity.from_int(9)
+        assert PERP_BTC_USDT not in env.client._recovery_booked
+
+    def test_agreement_clears_a_zero_net_memory(self, perp_env):
+        """Control (passes on the pre-fix tree too): a row that equals the
+        post-booking book contains the round trip by arithmetic and stands,
+        clearing the memory, even without a provably-fresh stamp."""
+        env = perp_env
+        self._booked_over_a_preexisting_position(env, cache_lots=2, delta=0, booked_ts_ns=2**62)
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 2, "entry_price": "60000", "update_time": INSIDE_SECS},
+        ]
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.LONG]
+        assert reports[0].quantity == Quantity.from_int(2)
+        assert PERP_BTC_USDT not in env.client._recovery_booked
+
     # -- R7C-02: an unreadable row timestamp is not freshness ---------------
 
     def test_a_row_with_no_readable_timestamp_is_not_read_as_fresh(self, perp_env):
@@ -1088,20 +1165,13 @@ class TestStalePositionAnswersAfterRecovery:
 
         assert [report.position_side for report in reports] == [PositionSide.FLAT]
 
-    # -- R7C-01: fresh-cache bookings arm nothing ---------------------------
+    # -- R7C-01 and REC-07: what arms the memory, and what may not ----------
 
-    def test_bookings_for_orders_this_node_never_held_arm_no_memory(self, perp_env):
-        """The staleness memory refutes a venue answer against the book as it
-        stood before the bookings — a comparison that is only knowledge when
-        this node HELD that book. A fill booked onto an order adopted during
-        the same pass (fresh-cache recovery of ancient history, an external
-        order) reconstructs venue state instead of extending local state, so
-        it must not arm the memory: the venue's current answer is the better
-        authority there, and arming was what froze the fresh-cache restart of
-        R7C-01 for the length of the lookback. End-to-end behaviour (the node
-        starts, first pass and every pass) is proven by the release gate's
-        fresh-cache cell on the real engine; this pins the arming rule."""
-        env = perp_env
+    @staticmethod
+    def _recovery_fill_pair(env: ExecHarness) -> tuple[Any, Any, Any]:
+        """One fill extending a cache-held order, one riding an order this
+        node never held (venue order 999999, no client id — the shape an
+        adopted or external order's fill carries)."""
         order = env.order_factory.limit(
             PERP_BTC_USDT,
             OrderSide.SELL,
@@ -1140,15 +1210,60 @@ class TestStalePositionAnswersAfterRecovery:
             ts_event=2_000,
             ts_init=2_000,
         )
+        return order, known, adopted
+
+    def test_bookings_for_orders_this_node_never_held_arm_no_memory(self, perp_env):
+        """With NO pre-existing open position, a fill booked onto an order
+        adopted during the same pass (fresh-cache recovery of ancient
+        history) reconstructs venue state instead of extending local state,
+        so it must not arm the memory: nothing this node ever held could
+        refute the venue's current answer, and arming there is what froze the
+        fresh-cache restart of R7C-01 for the length of the lookback. The
+        assertions are unchanged from round eight — what changed in round
+        nine is the boundary's key: the exception is per INSTRUMENT
+        (``positions_before`` empty here), no longer per order, because the
+        per-order key left a pre-existing position unguarded the moment one
+        booking rode an adopted order (REC-07). End-to-end behaviour (the
+        node starts, first pass and every pass) is proven by the release
+        gate's fresh-cache cell on the real engine; this pins the arming
+        rule."""
+        env = perp_env
+        order, known, adopted = self._recovery_fill_pair(env)
 
         env.client._record_recovery_bookings(
             [known, adopted],
             known_before={order.client_order_id},
+            positions_before=set(),
         )
 
         delta, latest_ts = env.client._recovery_booked[PERP_BTC_USDT]
         assert delta == Decimal(-4)  # the known order's fill, and nothing else
         assert latest_ts == 1_000
+
+    def test_adopted_bookings_arm_the_memory_over_a_preexisting_position(self, perp_env):
+        """REC-07 / R8-F1: the round-eight arming skipped every fill whose
+        order was not in ``known_before``, so one outage trade riding an
+        external order left the WHOLE instrument unarmed and a stale answer
+        erased the pre-existing position together with the adopted trade,
+        with reconciliation reporting success. The pre-existing open position
+        IS knowledge this node holds — an answer that fails to contain it and
+        cannot prove freshness is refutable — so with the instrument in
+        ``positions_before`` every booking arms, whatever the provenance of
+        the order it rode. End-to-end (both stale shapes, both routes, the
+        real engine) is the release gate's adopted-order-door scenario."""
+        env = perp_env
+        order, known, adopted = self._recovery_fill_pair(env)
+        _cache_open_position(env, PERP_BTC_USDT, Quantity.from_int(2))
+
+        env.client._record_recovery_bookings(
+            [known, adopted],
+            known_before={order.client_order_id},
+            positions_before={PERP_BTC_USDT},
+        )
+
+        delta, latest_ts = env.client._recovery_booked[PERP_BTC_USDT]
+        assert delta == Decimal(-8)  # both fills, whatever order they rode
+        assert latest_ts == 2_000  # the adopted fill's stamp counts too
 
 
 def _futures_order_row(**overrides: Any) -> dict[str, Any]:
@@ -1275,6 +1390,11 @@ class TestUnreadableContractOrderFields:
         (_futures_order_row(size=None), "size is null"),
         (_futures_order_row(size="abc"), "size is a non-numeric string"),
         (_futures_order_row(size="-2.5", left="-1.5"), "size is fractional"),
+        # R8A-02: the average price is what the engine puts on the inferred
+        # stand-in fill it mints for a filled-quantity difference, so on a
+        # filled row it decides money like the quantities do.
+        (_futures_order_row(fill_price="abc"), "the average price is a non-numeric string"),
+        (_futures_order_row(fill_price={}), "the average price is an object"),
     ]
 
     @pytest.mark.parametrize(("row", "why"), UNREADABLE)
@@ -1321,6 +1441,29 @@ class TestUnreadableContractOrderFields:
 
         assert reports == []
 
+    def test_a_readable_average_price_is_reported_exactly(self, perp_env):
+        """Control (R8A-02): the venue's stated average rides the report."""
+        env = perp_env
+        self._wire(env, _futures_order_row(fill_price="59000.5"))
+
+        reports = env.run(
+            env.client.generate_order_status_reports(_order_reports_command(True)),
+        )
+
+        assert reports[0].avg_px == Decimal("59000.5")
+
+    def test_an_absent_average_price_is_no_claim(self, perp_env):
+        """Control (R8A-02): absence is the venue making no average-price
+        statement — a smaller claim, not a failed read."""
+        env = perp_env
+        self._wire(env, _futures_order_row())  # no fill_price, filled 4 of 10
+
+        reports = env.run(
+            env.client.generate_order_status_reports(_order_reports_command(True)),
+        )
+
+        assert reports[0].avg_px is None
+
 
 class TestUnreadableSpotOrderFields:
     """Regression (REC-06): the spot order parse decides side, type and quantity strictly.
@@ -1353,6 +1496,9 @@ class TestUnreadableSpotOrderFields:
             _spot_order_row(type="market", price="0", status="wat", time_in_force="ioc"),
             "a cash market buy whose status cannot be classified",
         ),
+        # R8A-02: the average price on a filled row prices the engine's
+        # inferred stand-in fills; stated-and-unreadable refuses the listing.
+        (_spot_order_row(avg_deal_price="abc"), "the average price is a non-numeric string"),
     ]
 
     @pytest.mark.parametrize(("row", "why"), UNREADABLE)
@@ -1486,6 +1632,45 @@ class TestUnreadableFillRows:
         reports = env.run(env.client.generate_fill_reports(_fill_reports_command()))
 
         assert reports[0].commission == Money(0, reports[0].commission.currency)
+
+    # -- R8A-03: a stated spot fee needs a stated currency ------------------
+
+    @pytest.mark.parametrize(
+        "fee_currency",
+        [..., None, ""],
+        ids=["absent", "null", "empty"],
+    )
+    def test_a_spot_fee_stated_without_a_currency_fails_the_listing(self, spot_env, fee_currency):
+        """Gate.io documents ``fee_currency`` on every spot trade row (REST
+        and stream alike), and it is base for the ordinary buy and quote for
+        the ordinary sell — there is no correct guess. The pre-fix reader
+        defaulted a missing currency to the quote, booking a BTC fee as USDT:
+        commission attributed to a currency the venue never named. A nonzero
+        fee whose currency is not stated is an unknown payload shape, and the
+        listing refuses it like any other unreadable deciding field."""
+        env = spot_env
+        self._wire_spot(env, [_spot_fill_row(fee_currency=fee_currency)])
+
+        with pytest.raises(FillReportsUnavailable):
+            env.run(env.client.generate_fill_reports(_fill_reports_command(SPOT_BTC_USDT)))
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [{"fee": "0", "fee_currency": ...}, {"fee": ..., "fee_currency": ...}],
+        ids=["explicit-zero-fee", "absent-fee"],
+    )
+    def test_a_zero_spot_fee_without_a_currency_is_a_zero_commission(self, spot_env, overrides):
+        """Control: a zero commission needs only a denomination, and no money
+        can be misstated by denominating zero in the quote currency."""
+        env = spot_env
+        self._wire_spot(env, [_spot_fill_row(**overrides)])
+
+        reports = env.run(
+            env.client.generate_fill_reports(_fill_reports_command(SPOT_BTC_USDT)),
+        )
+
+        assert reports[0].commission.as_decimal() == Decimal(0)
+        assert reports[0].commission.currency.code == "USDT"
 
 
 class TestOpenCashMarketBuySingleOrderQuery:

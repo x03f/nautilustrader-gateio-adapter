@@ -56,9 +56,9 @@ Close what is already known to be wrong before adding anything.
   the reverted tree. What the other two broke, and what they left standing, is recorded per fix
   below; the remainders were `REC-05` and `REC-06` in the
   [review matrix](review-matrix.md#recovery-findings-raised-after-this-review). The eighth round
-  closed `REC-06` in full and narrowed `REC-05` to one surviving door, now recorded as `REC-07`,
-  which blocks — the eighth-round block at the end of this bullet records what was claimed, what
-  the round's audit found, and what remains.
+  closed `REC-06` in full and narrowed `REC-05` to one surviving family, recorded as `REC-07`;
+  the ninth round closed that family — the eighth- and ninth-round blocks at the end of this
+  bullet record what each round claimed, what its audit found, and what remains.
 
   **Closed.** The fill-report query now raises when a product's trade listing fails, carrying the
   reports the other products did answer. That raise is the only thing that arms the engine's brake
@@ -162,9 +162,10 @@ Close what is already known to be wrong before adding anything.
     whose outage trade rode an external or adopted order arms nothing for its instrument, so the
     same stale shapes erase the pre-existing position together with the adopted bookings, in a
     node that starts (two cells, R8-F1 and R8-F2, measured by no prior round or gate scenario).
-    That remainder is `REC-07` in the review matrix, open and blocking. Residuals stated on the
-    method and in the gate receipt: the memory is one restart deep, and a same-second
-    compensating trade stays withheld until a distinguishable row.
+    That remainder was recorded as `REC-07` in the review matrix and closed by the ninth round
+    (the block below). Residuals stated on the method and in the gate receipt: the memory is one
+    restart deep, and a same-second compensating trade stays withheld until a distinguishable
+    row.
   - `REC-06` — claimed closed; the audit could not refute it. Every deciding field of the fill,
     order and trigger parses — and the status arithmetic shared with the stream — is read
     strictly, with the round-seven pattern widened by a decimal-aware sibling
@@ -188,10 +189,39 @@ Close what is already known to be wrong before adding anything.
   / `TestOpenCashMarketBuySingleOrderQuery` / `TestExactDecimal` families, and seven release-gate
   scenarios that port the refuters' cells — the four pre-existing-position matrix cells, the
   fresh-cache round trip, and the confident-zero engine cases — every one of which fails against
-  the pre-round-eight tree and ends fail-safe on this one. The gate scenario named
-  `stale_position_answer_cannot_erase_a_preexisting_position` covers the cache-held-order slice
-  only; the surviving `REC-07` cells are covered by no scenario yet, and porting them is the next
-  round's first obligation, before its fix.
+  the pre-round-eight tree and ends fail-safe on this one.
+
+  **The ninth round: the two doors closed as one class.** The audit's cells were ported first —
+  two new release-gate scenarios (`stale_answer_cannot_erase_through_the_adopted_order_door`,
+  `stale_answer_cannot_erase_through_the_zero_net_door`: the auditor's exact shapes on both
+  routes, plus a second restart on the venue's caught-up row that must release the refused
+  start) and the zero-net and adopted-arming regression tests — and proven to fail against the
+  pre-repair tree with the audit's own signatures before anything changed. The repair then
+  closed the class rather than the cells: the arming exception is keyed per instrument on prior
+  knowledge (a cached order the trade extended, or a pre-existing open position), not per
+  order, so every venue trade the pass books over prior knowledge guards the instrument
+  whatever order it rode; the snapshots and the recording happen before the pass books
+  anything, which keeps the R7C-01 fresh-cache trade (reconstruction over no prior position
+  still arms nothing) and also guards a trade the in-call sweep fails to book — the engine
+  books it from the returned mass status after any post-sweep arming would have run; and the
+  reader no longer pops the memory at delta zero, so a zero-net round trip guards like any
+  other booking set and only the two venue proofs (a strictly-later stamp, agreement with the
+  post-booking book) clear it. The auditor's matrix extension re-run on the repaired tree shows
+  all four `REC-07` cells withheld fail-safe with routes in parity and every control unchanged;
+  the round-seven 33-cell matrix stays 33/33. In the same round the audit's two closable
+  below-bar edges closed (`avg_px` strict on filled rows, spot `fee_currency` required for a
+  nonzero fee) — the review matrix's residual-risks section records what remains. The round's
+  own audit could not refute any of it: it drove the invariant as a matrix through the real
+  engine — order provenance crossed with net delta, answer shape, pre-existing position, route
+  and pass, including seven cells no round had measured (adopted-order arming against agreeing,
+  disagreeing, postdating-flat and unreadably-stamped answers; the zero-net agreement
+  discriminator; the second restart in both directions; the reconnect-armed memory against its
+  per-instrument reader) — and every cell landed honest: venue proof clears and reconciles,
+  everything else withholds fail-safe with the book intact, the fresh-cache restart keeps
+  starting, and the reverted tree reproduces the erasures exactly where the round claimed. The
+  two problems the audit recorded are diagnostics-only — staleness entries armed for spot
+  instruments are inert, and a failed pass re-records its trades so the debug delta inflates
+  across retries — stated on the arming method and under the review matrix's residual risks.
 - ~~Close the two open recovery defects above with a scenario that asserts the damage, and extend
   the restart scenarios to cover the pairings only the reconnect scenarios exercise today.~~ Done:
   the dual-route parity family asserts the damage per route before comparing them, the restart

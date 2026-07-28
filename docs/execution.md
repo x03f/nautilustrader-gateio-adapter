@@ -872,39 +872,55 @@ What was built, and one repair that was tried and taken back out:
   Booking first has one consequence that deserves its own statement: a position
   answer read before the booked trades landed. The rule
   (`_position_answer_is_stale`) was restated in the eighth round after its
-  first form was refuted in both directions (`REC-05`), and now reads: once
-  trades were booked in this recovery for orders this node already held, a
-  position answer stands only if it *contains* those trades — it equals the
-  book as it now stands — or is stamped strictly after them. Equal
-  second-granular stamps do not qualify, because the reading that cannot
-  misstate money is the trade listing's, and the stamp judged is the venue's
-  own: a row stating none is never promoted to local now, which would outrank
-  every booked trade by construction (R7C-02). **Every other answer is
-  withheld**, not only the one equal to the pre-booking book: the refuted form
-  believed any answer staler than its own memory — an absent row, or the kept
-  zero-size row Gate.io serves for a traded contract — and the engine squared
-  a pre-existing position to FLAT with a fabricated execution while reporting
-  success. A withheld query is answered `PositionStatusUnavailable` until the
-  venue produces a row the rule can tell apart, which at startup degrades to a
-  refused node start — the fail-safe trade. The memory arms only for bookings
-  that extended orders the cache held when recovery began: bookings that
-  reconstruct venue history onto adopted orders (a fresh-cache start, an
-  external order) arm nothing, because the pre-booking book for them is not
-  knowledge this node holds — arming there is what froze an ordinary
+  first form was refuted in both directions (`REC-05`), and its arming and
+  clearing were restated again in the ninth after the audit drove two doors
+  through it (`REC-07`). It now reads: once this recovery set out to book
+  venue trades on an instrument this node held prior knowledge for, a
+  position answer for it stands only if it *contains* those trades — it
+  equals the book as it now stands — or is stamped strictly after them.
+  Equal second-granular stamps do not qualify, because the reading that
+  cannot misstate money is the trade listing's, and the stamp judged is the
+  venue's own: a row stating none is never promoted to local now, which
+  would outrank every booked trade by construction (R7C-02). **Every other
+  answer is withheld**, not only the one equal to the pre-booking book: the
+  refuted form believed any answer staler than its own memory — an absent
+  row, or the kept zero-size row Gate.io serves for a traded contract — and
+  the engine squared a pre-existing position to FLAT with a fabricated
+  execution while reporting success. A withheld query is answered
+  `PositionStatusUnavailable` until the venue produces a row the rule can
+  tell apart, which at startup degrades to a refused node start — the
+  fail-safe trade. Those two proofs — the strictly-later venue stamp, and
+  agreement with the post-booking book — are the only ways an armed memory
+  clears, for every entry alike: the net delta of the bookings plays no
+  part, because a zero-net outage round trip (ordinary strategy behaviour)
+  still cannot be contained in an answer that disagrees with the
+  post-booking book — the eighth round's reader popped the memory at delta
+  zero before any comparison, and that was `REC-07`'s second door (R8-F2).
+  The memory arms for **every** venue trade the pass sets out to book on an
+  instrument this node held prior knowledge for — a cached order the trade
+  extended, or a pre-existing open position — regardless of the provenance
+  of the order the trade rode: cache-held, adopted or external. The eighth
+  round keyed that exception per order, and one outage trade riding an
+  external order left the whole instrument unarmed, so the stale answer
+  erased the pre-existing position together with the adopted trade
+  (`REC-07`'s first door, R8-F1). Everything is snapshotted and recorded
+  *before* the pass books anything: a position the pass opens can never
+  count as pre-existing, and a trade the in-call sweep fails to book — the
+  single-order re-read behind it can go unanswered — is still guarded,
+  because the engine books it from the returned mass status after any
+  post-sweep arming would have run. The one arming gap that remains is
+  deliberate: trades that reconstruct venue history onto adopted orders
+  over an instrument with *no* pre-existing position (the fresh-cache
+  start) arm nothing, because the pre-booking book for them is emptiness
+  rather than knowledge — arming there is what froze an ordinary
   no-database restart of a closed partial-window round trip against the
   venue's *current* flat row for the length of the lookback (R7C-01). Two
-  residuals are stated rather than hidden: a compensating unseen trade landing
-  in the same second as the row is withheld with it until a distinguishable
-  answer arrives; and the memory dies with the process, so a venue still
-  serving the stale row across a full restart cycle meets a pass that books
-  nothing new, arms nothing, and squares to the row — protection is exactly
-  one restart deep. The arming exception itself is more than a residual: one
-  fill booked onto an order this node did not hold leaves the *whole
-  instrument* unarmed, so a stale answer arriving in the same pass erases the
-  pre-existing position together with the adopted bookings, in a node that
-  then starts — the open, blocking finding `REC-07` in the
-  [review matrix](review-matrix.md#recovery-findings-raised-after-this-review),
-  demonstrated by the eighth round's audit. Withholding itself never books or
+  residuals are stated rather than hidden: a compensating unseen trade
+  landing in the same second as the row is withheld with it until a
+  distinguishable answer arrives; and the memory dies with the process, so
+  a venue still serving the stale row across a full restart cycle meets a
+  pass that books nothing new, arms nothing, and squares to the row —
+  protection is exactly one restart deep. Withholding itself never books or
   unbooks anything.
 * **A value this client cannot read was reported as a confident number.** The
   row *shapes* were covered first: a row that is not an object, a row missing
@@ -935,11 +951,18 @@ What was built, and one repair that was tried and taken back out:
   Gate.io sends since v4.106.0. On the live stream the same strict readers
   drop the one unreadable frame loudly (never the socket), leaving the state
   to the next frame or to reconciliation, which re-reads the listings under
-  the rules above. Three edges the eighth round's audit found still ride
-  forgiving readers and are recorded as residual risks in the
-  [review matrix](review-matrix.md#residual-risks): the order report's
-  average price, the spot fill's fee currency, and the spot stream's
-  inferred `finished` for a payload stating neither status nor event.
+  the rules above. Of the three edges the eighth round's audit found still
+  riding forgiving readers, the ninth round closed two: the order report's
+  average price is read strictly on filled rows (it is the price the engine
+  puts on any inferred stand-in fill, so an unreadable stated value refuses
+  the listing; absence stays the smaller claim), and a spot fill that states
+  a nonzero fee without a readable `fee_currency` refuses rather than
+  guessing the quote currency — Gate.io documents the field on every spot
+  trade row, and the fee is base for the ordinary buy, so the guess
+  misdenominated commission (a zero fee keeps the quote as its harmless
+  denomination). The remaining edge — the spot stream's inferred `finished`
+  for a payload stating neither status nor event — stays recorded as a
+  residual risk in the [review matrix](review-matrix.md#residual-risks).
 * **A quote-denominated spot market buy read while the venue was still matching
   it lost trades**, on either route. Gate.io publishes no base-denominated
   quantity for an unfinished market buy, so the listing's `filled_amount` is a
@@ -958,15 +981,21 @@ blocking findings (`REC-05`, `REC-06`). The eighth round closed the parsing
 surface in full, and closed the staleness rule for instruments whose
 recovered trades extended orders this node held; its audit verified those
 closures and then demonstrated the same erasure surviving through the arming
-exception — an instrument whose outage trade rode an external or adopted
-order has no memory at all, and a stale answer squares its pre-existing
-position in a node that starts. That remainder is `REC-07` in the
-[review matrix](review-matrix.md#recovery-findings-raised-after-this-review),
-open and blocking. The residuals stated there and on the methods (the
-one-restart-deep staleness memory, the same-second compensating trade, the
-refusal of decimal-sized contracts, and the below-bar parsing edges the
-audit recorded under residual risks) are, together with `REC-07`, the
-current honest boundary of the recovery claim.
+exception's two doors — an adopted-order booking that armed nothing, and a
+zero-net booking set that disarmed the reader — recorded as `REC-07`. The
+ninth round closed the class those doors shared: the memory arms per
+instrument for every trade the pass books over prior knowledge, whatever
+order it rode, and clears only on venue proof, whatever the bookings net
+to. Both doors are pinned by their own release-gate scenarios (the
+auditor's exact shapes, both routes, with a caught-up-row release restart)
+and regression tests, each proven failing against the pre-repair tree. The
+residuals stated in the
+[review matrix](review-matrix.md#recovery-findings-raised-after-this-review)
+and on the methods (the one-restart-deep staleness memory, the same-second
+compensating trade, the unguarded fresh-cache reconstruction that is the
+deliberate R7C-01 trade, the refusal of decimal-sized contracts, and the
+below-bar edges recorded under residual risks) are the current honest
+boundary of the recovery claim.
 
 What the sixth round closed stands: a failed trade listing used to be reported
 to the engine as "no trades". The engine's only brake against squaring a book on

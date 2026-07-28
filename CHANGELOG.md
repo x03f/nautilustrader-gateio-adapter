@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The staleness protection now covers every trade a recovery pass books
+  over prior knowledge, closing the two doors its arming rule left open**
+  (`REC-07` in docs/review-matrix.md, found by the eighth round's audit).
+  The arming skipped fills whose order the cache did not hold when recovery
+  began, so one outage trade riding an external or adopted order left its
+  whole instrument unguarded, and a stale position answer — an absent row,
+  or the kept zero-size row stamped in the same second — erased the
+  pre-existing position together with the adopted trade, with a fabricated
+  execution and reconciliation reporting success; independently, the reader
+  popped the memory when the bookings netted to zero before comparing
+  anything, so an ordinary zero-net outage round trip disarmed the
+  instrument the same way. The arming is now keyed per instrument on prior
+  knowledge — a cached order the trade extended, or a pre-existing open
+  position — recorded before the pass books anything (so a position the
+  pass opens never counts as pre-existing, and a trade the in-call sweep
+  fails to book is still guarded), and the memory clears only on venue
+  proof: an answer stamped strictly after the booked trades, or one that
+  agrees with the post-booking book, with the bookings' net delta playing
+  no part. The fresh-cache restart keeps its current-answer behaviour:
+  reconstruction over no prior position still arms nothing.
+
+- **An order report's average price is read strictly on filled rows, and a
+  spot fill's fee currency must be stated for a nonzero fee.** The average
+  price (`avg_deal_price`/`fill_price`) rode a forgiving reader whose
+  default is 0 — it is the price the execution engine puts on any inferred
+  stand-in fill it builds from the report, so an unreadable stated average
+  priced a fabricated execution; it now fails the listing
+  (`OrderReportsUnavailable`), while an absent average stays the smaller
+  claim of none. A spot fill stating a fee without a readable
+  `fee_currency` booked the commission in the quote currency — Gate.io
+  documents the field on every spot trade row and charges the ordinary
+  buy's fee in the base currency, so the guess misdenominated commission;
+  it now refuses (`FillReportsUnavailable` on listings, a loud dropped
+  frame on the stream), and a zero fee keeps the quote as the harmless
+  denomination of zero.
+
 - **A stale position answer can no longer erase a position recovered through
   orders this node held.** The read-skew rule guarding recovered trades
   recognised staleness only by equality with the book as it stood before the
@@ -26,11 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readable venue timestamp is judged as unprovably fresh instead of being
   stamped with the local clock, which silently bypassed the rule. Residuals
   are stated on the method: the memory lives in-process (protection is one
-  restart deep). One boundary survives as an open finding (`REC-07` in
-  docs/review-matrix.md): trades booked onto orders adopted during the same
-  pass arm no memory, so an instrument whose outage trade rode an external or
-  adopted order is unguarded, and a stale answer can still erase its
-  pre-existing position there.
+  restart deep). One boundary survived that round as the open finding
+  `REC-07` — trades booked onto orders adopted during the same pass armed
+  no memory — and is closed by the first entry above.
 
 - **A report field this client cannot read is no longer parsed as a confident
   number.** The strict reading introduced for the position `size` now covers

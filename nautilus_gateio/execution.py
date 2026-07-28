@@ -951,11 +951,13 @@ class GateioExecutionClient(LiveExecutionClient):
         #: behind `_position_answer_is_stale`: recovery reads the position
         #: listing and the trade listing at different instants, so a position
         #: row can predate a trade both listings' venue has already matched.
-        #: An entry is written by `_record_recovery_bookings` — and only for
-        #: fills that extended orders this node already held when recovery
-        #: began (see that method for why) — and cleared the first time a
-        #: position answer for the instrument either contains the booked
-        #: trades or is stamped after them.
+        #: An entry is written by `_record_recovery_bookings` for every fill
+        #: booked onto an instrument this node held prior knowledge for — a
+        #: cached order the fill extended, or a pre-existing open position
+        #: (see that method for why either suffices and why neither is
+        #: dropped) — and cleared only on venue proof: a position answer for
+        #: the instrument that contains the booked trades, or one stamped
+        #: strictly after them.
         self._recovery_booked: dict[InstrumentId, tuple[Decimal, int]] = {}
         #: The venue's own timestamp of the last parsed position row, per
         #: instrument, exactly as stated: 0 when the row stated none. The
@@ -1260,20 +1262,24 @@ class GateioExecutionClient(LiveExecutionClient):
         await self._adopt_reported_venue_order_ids(order_reports)
 
         # Snapshot which venue trades are not yet on their orders before any of
-        # them is booked: everything in this list that IS booked afterwards —
-        # by the grouped hand-over or by the sweep — is a recovery booking a
-        # position row read in the same window may predate. The orders held
-        # right now are snapshotted with it, because only bookings that extend
-        # them arm the stale-answer memory (`_record_recovery_bookings`).
+        # them is booked: everything in this list is a trade this pass books —
+        # by the grouped hand-over or by the sweep — that a position row read
+        # in the same window may predate. The orders and the instruments with
+        # open positions held right now are snapshotted with it, because they
+        # are the prior knowledge that decides which of these trades arm the
+        # stale-answer memory (`_record_recovery_bookings`) — everything taken
+        # before anything books, so a position this pass opens can never count
+        # as pre-existing (that would re-freeze the fresh-cache restart,
+        # R7C-01).
         unbooked_before = [r for r in fill_reports if not self._fill_is_booked(r)]
         known_before = {order.client_order_id for order in self._cache.orders()}
+        positions_before = {
+            position.instrument_id for position in self._cache.positions_open(venue=None)
+        }
+        self._record_recovery_bookings(unbooked_before, known_before, positions_before)
 
         self._send_mass_status_report(mass_status)
         await self._hand_over_unapplied_fills(fill_reports, listed_orders)
-        self._record_recovery_bookings(
-            [r for r in unbooked_before if self._fill_is_booked(r)],
-            known_before,
-        )
 
         self._log.info(
             f"Reconciled {len(order_reports)} order and {len(fill_reports)} fill reports after "
@@ -1371,46 +1377,66 @@ class GateioExecutionClient(LiveExecutionClient):
 
     def _record_recovery_bookings(
         self,
-        booked_now: list[FillReport],
+        unbooked_before: list[FillReport],
         known_before: set[ClientOrderId],
+        positions_before: set[InstrumentId],
     ) -> None:
-        """Remember, per instrument, what this recovery pass just booked.
+        """Remember, per instrument, the venue trades this recovery pass books.
 
-        ``booked_now`` are the venue trades that were not on their orders when
-        recovery began and are on them now; ``known_before`` are the orders the
-        cache held when recovery began. The signed sum and the latest venue
-        timestamp feed :meth:`_position_answer_is_stale`: a position answer
-        that fails to contain these trades, and cannot be shown to be newer
-        than them, is a stale read rather than a venue statement that the
-        trades did not happen.
+        ``unbooked_before`` are the venue trades the listings named that were
+        not on their orders when recovery began — everything this pass sets
+        out to book; ``known_before`` and ``positions_before`` are the orders
+        and the instruments with open positions the cache held at the same
+        instant. All three are snapshotted before the pass books anything, so
+        nothing this pass creates can count as prior knowledge. The signed
+        sum and the latest venue timestamp feed
+        :meth:`_position_answer_is_stale`: a position answer that fails to
+        contain these trades, and cannot be shown to be newer than them, is a
+        stale read rather than a venue statement that the trades did not
+        happen.
 
-        Only fills that extended orders in ``known_before`` are recorded. The
-        staleness rule refutes a venue answer against the book as it stood
-        before the bookings, and that comparison is knowledge only when this
-        node *held* that book. A fill booked onto an order adopted during the
-        same pass — fresh-cache recovery of ancient history, or an external
-        order — reconstructs venue state rather than extending local state:
-        the pre-booking book for it is emptiness, not flatness, so nothing the
-        memory could refuse is refutable. Arming it anyway is what froze the
-        ordinary no-database restart of a closed partial-window round trip: the
-        venue's *current* flat row equalled the unrefutable pre-booking book
-        and was withheld on every start until the trades aged out of the
-        lookback (R7C-01). The cost of not arming is not a residual, it is the
-        open finding REC-07: one fill booked onto an order this node did not
-        hold leaves the *whole instrument* unarmed, so a stale position answer
-        arriving in the same pass is believed and erases the pre-existing
-        position together with the adopted bookings, in a node that then
-        starts. The repair has to tell the two cases apart without re-freezing
-        the R7C-01 restart; until it lands, the boundary is stated here and on
-        :meth:`_position_answer_is_stale`.
+        The invariant (REC-07): the protection holds for **every** venue
+        trade this pass books onto an instrument this node held prior
+        knowledge for — knowledge being a cached order the trade extended,
+        *or* a cached open position on the instrument — regardless of the
+        provenance of the order the trade rode (cache-held, adopted,
+        external) and regardless of the net delta of the bookings. The
+        memory then clears only on venue proof (see the reader). The set
+        recorded is what the listings named, not what the in-call sweep
+        managed to book: on the restart route the sweep's single-order
+        re-read can go unanswered, and the trade is then booked moments
+        later by the engine's own reconciliation of the very mass status
+        this pass returns — after any post-sweep arming would have run. By
+        the time a position answer is judged, a recorded trade is either in
+        the cache (so agreement clears the memory) or genuinely missing from
+        the book (so withholding is the correct fail-safe: the alternative
+        is the engine squaring the gap with a fabricated execution).
+
+        The one case that arms nothing is a trade on an instrument with no
+        pre-existing position, riding an order this node never held —
+        fresh-cache recovery of history. There the pre-booking book is
+        emptiness, not flatness: nothing the memory could refuse is
+        refutable, and arming it anyway is what froze the ordinary
+        no-database restart of a closed partial-window round trip against the
+        venue's *current* flat row for the length of the lookback (R7C-01).
+        Round eight keyed that exception per ORDER, where the memory and the
+        erasure are per INSTRUMENT: one fill booked onto an adopted order
+        left the whole instrument unarmed, and a stale answer erased the
+        pre-existing position together with the adopted bookings while
+        reconciliation reported success (REC-07, R8-F1). The pre-existing
+        open position is exactly the knowledge that makes a disagreeing,
+        unprovably-fresh answer refutable, so it is what widens the arming
+        here.
         """
-        for report in booked_now:
+        for report in unbooked_before:
             order = self._order_of_report(report)
-            if order is None or order.client_order_id not in known_before:
+            extends_known = order is not None and order.client_order_id in known_before
+            if not extends_known and report.instrument_id not in positions_before:
                 self._log.debug(
-                    f"Not arming the stale-answer memory for {report.trade_id.value}: its "
-                    f"order was not in the cache when recovery began, so the pre-booking "
-                    f"book for it is not knowledge this client holds",
+                    f"Not arming the stale-answer memory for {report.trade_id.value}: "
+                    f"neither its order nor an open {report.instrument_id} position was "
+                    f"in the cache when recovery began, so there is no prior book a "
+                    f"position answer could be refuted against",
                 )
                 continue
             quantity = report.last_qty.as_decimal()
@@ -1419,6 +1445,16 @@ class GateioExecutionClient(LiveExecutionClient):
                 report.instrument_id,
                 (Decimal(0), 0),
             )
+            # The delta is a diagnostic beside latest_ts: the reader decides
+            # on freshness and agreement alone. Two bounds are accepted as
+            # such rather than closed. A pass that fails between arming and
+            # booking re-records the same still-unbooked trades on the next
+            # attempt, so the delta in the reader's log line inflates across
+            # retries while the max keeps latest_ts exact. And an entry
+            # armed for a SPOT instrument is inert: spot position queries
+            # answer before the staleness rule is consulted, so nothing
+            # reads it and nothing ever pops it. Neither bound touches money
+            # or availability.
             self._recovery_booked[report.instrument_id] = (
                 delta + signed,
                 max(latest_ts, report.ts_event),
@@ -1475,30 +1511,36 @@ class GateioExecutionClient(LiveExecutionClient):
           reconciliation returns False, and the kernel refuses to start until
           the venue produces a row this test can tell apart.
 
-        The memory is kept on a withheld answer so a later fresher or
-        agreeing answer can clear it, and it dies with the process — so the
-        protection is exactly one restart deep: a venue still serving the
-        stale row to the *next* process meets a pass that books nothing new,
-        arms nothing, and squares to the row. That residual is documented
-        rather than closed (persisting the memory means persisting it
-        somewhere a restart reads, which this alpha does not do). The mirror
-        of the arming rule is not a residual but the open finding REC-07:
-        fills booked onto orders adopted during the same pass never arm this
-        memory (see :meth:`_record_recovery_bookings`), so one such booking
-        leaves the whole instrument unguarded, and a stale row then squares
-        not only the same-pass bookings but any pre-existing position beneath
-        them — the erasure this rule exists to stop, surviving through the
-        arming door in a node that starts. Withholding itself pauses position
-        reconciliation for the instrument; it never books or unbooks
-        anything.
+        These two proofs — a strictly-later venue stamp, or agreement with
+        the post-booking book — are the only ways an armed memory clears, for
+        every entry alike: the net delta of the bookings plays no part in the
+        decision (REC-07, R8-F2 — see the body). The memory is kept on a
+        withheld answer so a later fresher or agreeing answer can clear it,
+        and it dies with the process — so the protection is exactly one
+        restart deep: a venue still serving the stale row to the *next*
+        process meets a pass that books nothing new, arms nothing, and
+        squares to the row. That residual is documented rather than closed
+        (persisting the memory means persisting it somewhere a restart reads,
+        which this alpha does not do). What arms the memory — every booking
+        on an instrument this node held prior knowledge for, whatever the
+        order's provenance — is stated on
+        :meth:`_record_recovery_bookings`, together with the one deliberate
+        gap (fresh-cache reconstruction, R7C-01). Withholding itself pauses
+        position reconciliation for the instrument; it never books or
+        unbooks anything.
         """
         entry = self._recovery_booked.get(instrument_id)
         if entry is None:
             return False
+        # The signed delta is recorded for the log line below and for
+        # operators reading the memory; it takes no part in the decision. An
+        # earlier form popped the entry at delta == 0 before any comparison,
+        # and a zero-net outage round trip — ordinary strategy behaviour —
+        # disarmed the instrument, so the very next stale row erased the
+        # pre-existing position beneath the round trip (REC-07, R8-F2). A
+        # non-empty booking set that nets to zero still cannot be contained
+        # in an answer that disagrees with the post-booking book.
         delta, latest_ts = entry
-        if delta == 0:
-            self._recovery_booked.pop(instrument_id, None)
-            return False
         if venue_ts_ns > latest_ts:
             self._recovery_booked.pop(instrument_id, None)
             return False
@@ -1508,6 +1550,11 @@ class GateioExecutionClient(LiveExecutionClient):
         if signed_qty == cache_net:
             self._recovery_booked.pop(instrument_id, None)
             return False
+        self._log.debug(
+            f"Withholding the {instrument_id} position answer of {signed_qty}: the cache "
+            f"holds {cache_net} after this recovery booked a net {delta:+}, and the "
+            f"answer's stamp does not postdate the booked trades",
+        )
         return True
 
     def _withhold_stale_position_reports(
@@ -4231,12 +4278,30 @@ class GateioExecutionClient(LiveExecutionClient):
         # defaulted commission is money silently missing from realized PnL.
         fee = optional_exact_decimal(payload, "fee", what=what)
         if product.is_spot:
-            fee_currency = self._currency(
-                payload.get("fee_currency"),
-                default=instrument.quote_currency.code,
-            )
             quantity = exact_decimal_field(payload, "amount", what=what)
-            return instrument.make_qty(quantity), Money(fee, fee_currency)
+            fee_currency_value = payload.get("fee_currency")
+            if fee_currency_value in (None, ""):
+                # Gate.io states `fee_currency` on every documented spot trade
+                # row (REST `my_trades` and the `spot.usertrades` stream
+                # alike), and it is the base currency for the ordinary buy and
+                # the quote for the ordinary sell — there is no correct guess.
+                # The old default booked a base-currency fee as quote (a BTC
+                # fee as USDT, R8A-03), misstating the commission's
+                # denomination. A zero fee needs only a denomination, so it
+                # keeps the quote; a nonzero fee without a stated currency is
+                # an unknown payload shape and refuses like any other
+                # unreadable deciding field.
+                if fee != 0:
+                    raise ValueError(
+                        f"the {what} states a fee of {fee} but no 'fee_currency'; "
+                        f"booking it in a guessed currency would misstate the "
+                        f"commission",
+                    )
+                return instrument.make_qty(quantity), Money(0, instrument.quote_currency)
+            return instrument.make_qty(quantity), Money(
+                fee,
+                self._currency(fee_currency_value),
+            )
 
         settlement = getattr(instrument, "settlement_currency", instrument.quote_currency)
         size = abs(exact_lots(payload, "size", what=what))
@@ -4905,13 +4970,23 @@ class GateioExecutionClient(LiveExecutionClient):
         }
         unbooked_before = [r for r in fills if not self._fill_is_booked(r)]
         if unbooked_before:
-            # The orders held before the sweep books anything: only bookings
-            # that extend them arm the stale-answer memory
-            # (`_record_recovery_bookings`).
+            # The orders and the instruments with open positions held before
+            # the sweep books anything: the prior knowledge that decides which
+            # of the trades being booked arm the stale-answer memory
+            # (`_record_recovery_bookings`). Snapshotted — and recorded —
+            # before the sweep, so a position it opens can never count as
+            # pre-existing (that would re-freeze the fresh-cache restart,
+            # R7C-01), and a trade the sweep fails to book is still guarded:
+            # the engine books it from this very mass status moments after
+            # this method returns, which is after any post-sweep arming would
+            # have run (REC-07).
             known_before = {order.client_order_id for order in self._cache.orders()}
+            positions_before = {
+                position.instrument_id for position in self._cache.positions_open(venue=None)
+            }
+            self._record_recovery_bookings(unbooked_before, known_before, positions_before)
             await self._hand_over_unapplied_fills(unbooked_before, listed_orders)
             booked_now = [r for r in unbooked_before if self._fill_is_booked(r)]
-            self._record_recovery_bookings(booked_now, known_before)
             orders = self._prune_reports_the_sweep_outran(orders, booked_now)
 
         mass_status.add_order_reports(reports=orders)
@@ -5640,8 +5715,25 @@ class GateioExecutionClient(LiveExecutionClient):
 
         time_in_force_value = str(payload.get("time_in_force") or payload.get("tif") or "gtc")
         post_only = time_in_force_value.lower() == GateioTimeInForce.POC.value
+        # The average price decides money on a filled row: it is what the
+        # engine puts on the inferred stand-in fill it mints for a
+        # filled-quantity difference (installed live/execution_engine.py,
+        # `_handle_fill_quantity_mismatch`), so a stated-and-unreadable value
+        # may not collapse to the forgiving default — that priced a fabricated
+        # execution from a value nobody stated (R8A-02). Absence stays the
+        # smaller claim (an unfilled order states no average), and a readable
+        # zero is reported as no average because zero is not a price.
         avg_px_value = payload.get("avg_deal_price") or payload.get("fill_price")
-        avg_px = to_decimal(avg_px_value) if filled_qty.as_decimal() > 0 else None
+        avg_px: Decimal | None = None
+        if filled_qty.as_decimal() > 0 and avg_px_value not in (None, ""):
+            try:
+                parsed_avg = to_exact_decimal(avg_px_value)
+            except ValueError as e:
+                raise ValueError(
+                    f"the 'avg_deal_price'/'fill_price' field decides the answer: {e}",
+                ) from None
+            if parsed_avg > 0:
+                avg_px = parsed_avg
 
         display_qty = None
         iceberg = payload.get("iceberg")
@@ -5680,7 +5772,7 @@ class GateioExecutionClient(LiveExecutionClient):
             price=price,
             trigger_price=trigger_price,
             trigger_type=trigger_type,
-            avg_px=avg_px if avg_px and avg_px > 0 else None,
+            avg_px=avg_px,
             display_qty=display_qty,
             post_only=post_only,
             reduce_only=bool(payload.get("is_reduce_only") or payload.get("reduce_only")),
