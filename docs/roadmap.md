@@ -43,12 +43,15 @@ finished because its changes are written; it is finished when its criteria hold.
 
 Close what is already known to be wrong before adding anything.
 
-- **Recovery and reconciliation are not closed.** Six rounds have now passed their own harnesses
-  and none has survived an attempt to refute it; passing is not evidence. The sixth round set out
-  to close the three defects listed below and was put in front of three independent verifiers — one
-  on restart-versus-reconnect parity, one on the unreadable-position claim, one on claim accuracy.
-  All three refuted it. One of the three fixes it attempted is in the tree, one is in the tree and
-  does not go far enough, and one has been withdrawn.
+- **Recovery and reconciliation.** Six rounds passed their own harnesses and none survived an
+  attempt to refute it; passing is not evidence. The sixth round set out to close the three
+  defects listed below and was put in front of three independent verifiers — one on
+  restart-versus-reconnect parity, one on the unreadable-position claim, one on claim accuracy.
+  All three refuted it. One of the three fixes it attempted survived, one survived but did not go
+  far enough, and one was withdrawn. The seventh round closed what remained against a gate that
+  now owns the parity comparison that refuted the sixth; it has passed that gate and the
+  repository suite, and — like every round before it — that is evidence only until the next
+  refutation attempt, which has not yet run.
 
   **Closed.** The fill-report query now raises when a product's trade listing fails, carrying the
   reports the other products did answer. That raise is the only thing that arms the engine's brake
@@ -56,22 +59,37 @@ Close what is already known to be wrong before adding anything.
   closes a position with a synthetic trade id and no commission. Reverting it makes four tests and
   a two-cycle harness scenario fail.
 
-  **Still open, and now stated more precisely than before:**
-  - A position row the client cannot read is still answered as a definite flat report. The two
-    shapes named by the previous refutation are fixed — a row that is not an object, and a row
-    whose venue symbol or instrument cannot be resolved, both of which used to be dropped so that
-    the query answered with fewer rows than the venue sent. The field that decides the answer is
-    not: the size is read with a helper that returns `0` for a missing key, for null, for an empty
-    string, for a non-numeric string and for any decimal magnitude below one lot, and `0` is flat.
-    The client cannot tell "the venue says zero" from "I could not read what the venue said", and
-    in the second case it logs nothing. Gate.io moved every futures size field from integer to
-    string in v4.106.0, which is what makes this reachable rather than hypothetical.
-  - A restart still loses a venue-confirmed trade wherever the engine's deduplication drops an
-    order report and the trades grouped under it. The sweep that re-offers them runs only after a
-    WebSocket reconnect. The net position is not wrong — the engine closes the gap with a
-    reconciliation order and an inferred fill — but the venue's trade id, price and fee are gone,
-    and on spot the fee is withheld in the currency being bought, so the inferred fill overstates
-    the position by exactly that fee.
+  **Closed in the seventh round, against a gate that now measures both routes.** The release
+  gate's dual-route parity family drives one set of venue answers through a reconnect and through
+  a restart on independent caches, anchors each outcome to the account state the venue's answers
+  describe, and only then compares the routes field by field — so a repair of one route that
+  leaves the other behind fails the gate instead of surviving to the next refutation.
+  - The unreadable-size half of the position finding: `size` is now read strictly
+    (`to_lot_count`), so a missing key, null, an empty string, a non-numeric string, a boolean and
+    any value that is not an exact whole number of lots raise `PositionStatusUnavailable` naming
+    the row and the field, while a row that genuinely reads zero — including the stringified zeros
+    of v4.106.0 — still parses to FLAT and still squares the book. Held by
+    `TestUnreadablePositionSizes` and `TestLotCount`; every unreadable-size case fails on the
+    previous tree.
+  - The restart half: the unapplied-fill sweep now also runs *inside* `generate_mass_status`,
+    before the engine has reconciled anything — the one moment on the startup route at which
+    cached orders carry their venue ids, nothing has been deduplicated, and no position report has
+    been reconciled. A fill booked there updates the cache, so the engine's duplicate filter
+    deletes a now-matching snapshot harmlessly and a position report that already contains the
+    trade reconciles against a book that already carries it. Two consequences are handled
+    explicitly: a snapshot the sweep outran is withheld from the mass status where the engine
+    would misread it as corrupted cache and fail node start, and a position answer equal to the
+    pre-booking book that cannot be shown to postdate the booked trades is answered
+    `PositionStatusUnavailable` (the read-skew rule in `_position_answer_is_stale`, residual risk
+    stated on the method). Held by `TestStartupRecoverySweep`,
+    `TestStalePositionAnswersAfterRecovery`, and the gate's seven dual-route parity scenarios,
+    all of which fail on the previous tree.
+  - REC-04, older than these rounds: an unfinished quote-denominated spot market buy no longer
+    yields an order status report built from its running partial `filled_amount`; its executions
+    come from the trade listing and the order's statement from a re-read once the venue has
+    finished it. Held by the restated
+    `TestSpotMarketBuyQuoteSemantics::test_order_status_report_never_states_the_quote_amount` and
+    the gate's mid-match market-buy scenario beside its caught-up control.
 
   **Withdrawn, and recorded so it is not tried again.** The sixth round's repair for the restart
   path hung the sweep on the execution engine's publication of a mass status it has just
@@ -90,11 +108,12 @@ Close what is already known to be wrong before adding anything.
   reported a four-lot match — a state no perpetual account can be in, and the one answer under
   which a client that books the trade twice still reads as correct. That fixture now answers with
   the position the recovered trade creates, and fails on both trees.
-- Close the two open recovery defects above with a scenario that asserts the damage, and extend
-  the restart scenarios to cover the pairings only the reconnect scenarios exercise today. A fix
-  for the restart path has to book the recovered fills before anything can square the book against
-  a position report that already contains them, and has to leave the engine's partial-window fill
-  adjustment intact.
+- ~~Close the two open recovery defects above with a scenario that asserts the damage, and extend
+  the restart scenarios to cover the pairings only the reconnect scenarios exercise today.~~ Done:
+  the dual-route parity family asserts the damage per route before comparing them, the restart
+  fix books the recovered fills inside `generate_mass_status` — before anything can square the
+  book against a position report that already contains them — and the engine's partial-window
+  fill adjustment is untouched.
 - Fix the defects an audit against the platform documentation found, starting with the ten that
   produce silently wrong behaviour rather than an error.
 - Replace the facilities reimplemented here that the platform already ships, where the replacement

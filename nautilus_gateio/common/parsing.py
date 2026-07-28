@@ -33,6 +33,35 @@ def to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def to_lot_count(value: Any) -> int:
+    """Read a signed contract count that must be exact, or refuse to read it.
+
+    ``to_int`` above answers ``0`` for a missing value, ``None``, an empty
+    string, a non-numeric string, and for any magnitude below one after
+    truncation. That is the right default where ``0`` means "nothing here" —
+    but where the caller is deciding a position's side and size, ``0`` is an
+    affirmative claim (the position is FLAT) that the reconciliation engine
+    acts on by squaring the book. Gate.io moved its futures size fields from
+    integer to string in v4.106.0, so ``4``, ``"4"`` and ``"-4"`` are all
+    shapes the venue sends and a shape drift is a live possibility, not a
+    hypothesis. Anything that does not read as an exact whole number raises
+    ``ValueError`` naming the value, so the caller can report a failed read
+    instead of a position that is not there.
+    """
+    if isinstance(value, bool):
+        # bool is an int subclass, so it would otherwise read as 0 or 1.
+        raise ValueError(f"unreadable contract count: {value!r}")
+    try:
+        number = Decimal(str(value))
+    except Exception:
+        raise ValueError(f"unreadable contract count: {value!r}") from None
+    if not number.is_finite() or number != number.to_integral_value():
+        # A fractional count ("-0.5") truncated toward zero would misstate the
+        # size — and below one lot it would misstate it as FLAT.
+        raise ValueError(f"unreadable contract count: {value!r}")
+    return int(number)
+
+
 def to_decimal(value: Any, default: str = "0") -> Decimal:
     """Parse into ``Decimal`` without going through binary floating point."""
     if value is None or value == "":

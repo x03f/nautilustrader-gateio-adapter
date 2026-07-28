@@ -578,14 +578,33 @@ class TestSpotMarketBuyQuoteSemantics:
         )
 
     def test_order_status_report_never_states_the_quote_amount(self, harness):
+        # While the venue is still working the order there is no final
+        # base-denominated quantity at all (REC-04): `filled_amount` is a
+        # running partial, and a report built from it restates the order to a
+        # figure the venue never set, after which the remaining matches are
+        # refused as overfills. The only honest report for an open cash buy is
+        # no report — its executions travel through the trade listing, and the
+        # order's own statement is re-read once the venue has finished it.
+        assert (
+            harness.client._parse_order_status_report(
+                GateioProductType.SPOT,
+                self.PAYLOAD,
+                harness.instruments[0],
+            )
+            is None
+        )
+
+        # Once finished, `filled_amount` is the venue's final base figure, and
+        # the report states it — never the 500 USDT cash amount.
+        finished = dict(self.PAYLOAD, status="closed", left="0", filled_amount="0.008333")
         report = harness.client._parse_order_status_report(
             GateioProductType.SPOT,
-            self.PAYLOAD,
+            finished,
             harness.instruments[0],
         )
         assert report is not None
-        assert report.quantity == Quantity.from_str("0.005000")
-        assert report.filled_qty == Quantity.from_str("0.005000")
+        assert report.quantity == Quantity.from_str("0.008333")
+        assert report.filled_qty == Quantity.from_str("0.008333")
         assert report.quantity.as_decimal() < Decimal("1")
 
     def test_no_order_updated_for_a_market_order(self, harness):

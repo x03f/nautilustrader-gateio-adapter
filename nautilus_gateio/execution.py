@@ -180,7 +180,13 @@ from nautilus_gateio.common.errors import (
     WalletNotProvisionedError,
     WalletQueryRefusedError,
 )
-from nautilus_gateio.common.parsing import timestamp_to_nanos, to_decimal, to_float, to_int
+from nautilus_gateio.common.parsing import (
+    timestamp_to_nanos,
+    to_decimal,
+    to_float,
+    to_int,
+    to_lot_count,
+)
 from nautilus_gateio.common.signing import generate_client_order_id
 from nautilus_gateio.common.symbols import (
     gateio_to_instrument_id,
@@ -812,6 +818,18 @@ class GateioExecutionClient(LiveExecutionClient):
         #: lookback anchor after a reconnect.
         self._last_stream_event_ns: dict[GateioProductType, int] = {}
 
+        #: What REST recovery booked, per instrument: (signed base delta of the
+        #: fills it applied, latest fill timestamp in ns). This is the memory
+        #: behind `_position_answer_is_stale`: recovery reads the position
+        #: listing and the trade listing at different instants, so a position
+        #: row can predate a trade both listings' venue has already matched.
+        #: An entry is written by `_record_recovery_bookings` and cleared the
+        #: first time a position answer for that instrument is either
+        #: consistent with the booked trades or disagrees in a way they do not
+        #: explain — both of which are current venue statements that supersede
+        #: the memory.
+        self._recovery_booked: dict[InstrumentId, tuple[Decimal, int]] = {}
+
         self._log.info(f"Products: {', '.join(p.value for p in products)}", LogColor.BLUE)
         self._log.info(f"Spot account mode: {spot_mode.value}", LogColor.BLUE)
         self._log.info(f"Account type: {account_type.name}", LogColor.BLUE)
@@ -1099,8 +1117,17 @@ class GateioExecutionClient(LiveExecutionClient):
         # the order until it is rebased.
         await self._adopt_reported_venue_order_ids(order_reports)
 
+        # Snapshot which venue trades are not yet on their orders before any of
+        # them is booked: everything in this list that IS booked afterwards —
+        # by the grouped hand-over or by the sweep — is a recovery booking a
+        # position row read in the same window may predate.
+        unbooked_before = [r for r in fill_reports if not self._fill_is_booked(r)]
+
         self._send_mass_status_report(mass_status)
         await self._hand_over_unapplied_fills(fill_reports, listed_orders)
+        self._record_recovery_bookings(
+            [r for r in unbooked_before if self._fill_is_booked(r)],
+        )
 
         self._log.info(
             f"Reconciled {len(order_reports)} order and {len(fill_reports)} fill reports after "
@@ -1113,7 +1140,14 @@ class GateioExecutionClient(LiveExecutionClient):
         fill_reports: list[FillReport],
         listed_orders: dict[VenueOrderId, OrderStatusReport],
     ) -> None:
-        """Re-offer, one by one, every recovered trade the grouped pass did not book.
+        """Book, one order at a time, every recovered trade not yet on its order.
+
+        Both recovery routes end here. On a reconnect it runs *after* the
+        grouped hand-over, sweeping what that pass did not book; on a restart
+        it runs *inside* :meth:`generate_mass_status`, before the engine has
+        reconciled anything, because after that method returns the client has
+        no correct moment left (see the docstring there for why the engine's
+        own reconciliation cannot be relied on to book these).
 
         Grouping a trade under its order report is what lets the engine restate
         the order's quantity before applying the trade, but it also makes
@@ -1182,12 +1216,180 @@ class GateioExecutionClient(LiveExecutionClient):
         for venue_order_id, reports in unapplied.items():
             self._log.warning(
                 f"{len(reports)} recovered trade(s) "
-                f"({', '.join(r.trade_id.value for r in reports)}) were not booked by the "
-                f"grouped hand-over for {venue_order_id!r}; re-offering them with the "
-                f"venue's own statement of the order",
+                f"({', '.join(r.trade_id.value for r in reports)}) are not yet booked "
+                f"for {venue_order_id!r}; offering them with the venue's own statement "
+                f"of the order",
             )
             self._restate_from_listing(listed_orders.get(venue_order_id))
             await self._reoffer_recovered_fills(reports)
+
+    def _record_recovery_bookings(self, booked_now: list[FillReport]) -> None:
+        """Remember, per instrument, what this recovery pass just booked.
+
+        ``booked_now`` are the venue trades that were not on their orders when
+        recovery began and are on them now. The signed sum and the latest
+        venue timestamp feed :meth:`_position_answer_is_stale`: a position
+        answer that fails to contain these trades, and cannot be shown to be
+        newer than them, is a stale read rather than a venue statement that
+        the trades did not happen.
+        """
+        for report in booked_now:
+            quantity = report.last_qty.as_decimal()
+            signed = quantity if report.order_side == OrderSide.BUY else -quantity
+            delta, latest_ts = self._recovery_booked.get(
+                report.instrument_id,
+                (Decimal(0), 0),
+            )
+            self._recovery_booked[report.instrument_id] = (
+                delta + signed,
+                max(latest_ts, report.ts_event),
+            )
+
+    def _position_answer_is_stale(
+        self,
+        instrument_id: InstrumentId,
+        signed_qty: Decimal,
+        venue_ts_ns: int,
+    ) -> bool:
+        """Return whether a position answer predates trades recovery just booked.
+
+        Recovery reads the order listing, the trade listing and the position
+        listing as separate requests at separate instants, so a match landing
+        between two of those reads produces a position row that does not yet
+        contain a trade the trade listing already names. The engine cannot see
+        that: it takes every position report as the venue's current truth and
+        squares the local book against it with a reconciliation order and an
+        inferred fill (`_reconcile_position_report_netting`, installed
+        live/execution_engine.py) — deleting the venue trade id, price and fee
+        this client just booked and replacing them with an execution nobody
+        made. The trade listing is the finer-grained and later read, so where
+        the two disagree *by exactly the trades just booked*, the row loses.
+
+        The test is deliberately narrow, in this order:
+
+        * no trades were booked for the instrument in this recovery — every
+          answer stands (the ordinary case, and the reason the periodic
+          position check keeps working);
+        * the row is stamped strictly after the last booked trade — it is the
+          fresher statement and stands, whatever it says. Equal stamps do not
+          qualify: both listings report whole seconds, so a row written just
+          before a trade in the same second is indistinguishable from one
+          written just after, and the reading that cannot misstate money is
+          the trade listing's;
+        * the answer equals the local book **as it stood before** the booked
+          trades — that is a read from before them, and it is withheld;
+        * anything else — the answer either already contains the booked
+          trades or disagrees in a way they do not explain. Both are current
+          venue statements the engine must see, so the memory is also cleared:
+          keeping it could later suppress an honest answer that happens to
+          coincide with the old book.
+
+        The residual risk is a venue whose position row and a compensating
+        unseen trade land in the same second and net back to the old book —
+        that answer is withheld until the venue produces a row this test can
+        tell apart. Withholding pauses position reconciliation for the
+        instrument; it never books or unbooks anything.
+        """
+        entry = self._recovery_booked.get(instrument_id)
+        if entry is None:
+            return False
+        delta, latest_ts = entry
+        if delta == 0:
+            self._recovery_booked.pop(instrument_id, None)
+            return False
+        if venue_ts_ns and venue_ts_ns > latest_ts:
+            self._recovery_booked.pop(instrument_id, None)
+            return False
+        cache_net = Decimal(0)
+        for position in self._cache.positions_open(venue=None, instrument_id=instrument_id):
+            cache_net += position.signed_decimal_qty()
+        if signed_qty == cache_net - delta:
+            return True
+        self._recovery_booked.pop(instrument_id, None)
+        return False
+
+    def _withhold_stale_position_reports(
+        self,
+        reports: list[PositionStatusReport],
+    ) -> list[PositionStatusReport]:
+        """Keep only the position reports the booked trades do not refute.
+
+        Runs after the recovery sweep, on the account-wide answer gathered for
+        the startup mass status. A withheld row is not handed to the engine at
+        all: the engine reconciles a mass status' position reports against the
+        cache *after* the orders and fills, so by then the cache already
+        carries the booked trades and a pre-trade row would square them away.
+        The engine re-queries any open position the mass status does not
+        cover, and that query answers honestly — with the fresher row once the
+        venue has caught up, or with `PositionStatusUnavailable` while the
+        answer is still the stale one.
+        """
+        kept: list[PositionStatusReport] = []
+        for report in reports:
+            if self._position_answer_is_stale(
+                report.instrument_id,
+                report.signed_decimal_qty,
+                report.ts_last,
+            ):
+                self._log.warning(
+                    f"Withholding the {report.instrument_id} position row from the mass "
+                    f"status: it does not contain venue trades this recovery just booked "
+                    f"and is not stamped after them, so it is a stale read, not a "
+                    f"statement that those trades did not happen",
+                )
+                continue
+            kept.append(report)
+        return kept
+
+    def _prune_reports_the_sweep_outran(
+        self,
+        order_reports: list[OrderStatusReport],
+        booked_now: list[FillReport],
+    ) -> list[OrderStatusReport]:
+        """Drop order snapshots that predate executions this pass just booked.
+
+        Considered are only reports about orders the sweep just advanced, and
+        of those only the statuses that fall through the engine's status
+        short-circuits into ``_handle_fill_quantity_mismatch`` (installed
+        live/execution_engine.py:3164) while claiming *fewer* fills than the
+        order now carries. That branch books nothing either way, but it reads
+        the disagreement as duplicate fills or corrupted cache, logs it at
+        ERROR and fails the reconciliation — and a failed startup
+        reconciliation stops the whole node (system/kernel.py: a False from
+        ``reconcile_execution_state`` aborts start). The snapshot is not
+        wrong, it is old: the trade listing, read moments later, named the
+        executions and this client booked them.
+
+        An ACCEPTED snapshot is deliberately kept even when it is equally
+        stale: the engine short-circuits on it without reaching the mismatch
+        handler (a re-ACCEPT of a filled order is swallowed as an idempotent
+        transition), so it is harmless — and keeping it preserves the mass
+        status as the venue's answer rather than this client's edit of it.
+        """
+        outran = {
+            order.client_order_id
+            for report in booked_now
+            if (order := self._order_of_report(report)) is not None
+        }
+        if not outran:
+            return order_reports
+        kept: list[OrderStatusReport] = []
+        for report in order_reports:
+            order = self._order_of_report(report)
+            if (
+                order is not None
+                and order.client_order_id in outran
+                and report.order_status not in SHORT_CIRCUIT_REPORT_STATUSES
+                and report.filled_qty < order.filled_qty
+            ):
+                self._log.info(
+                    f"Withholding the stale {report.venue_order_id!r} order snapshot "
+                    f"(filled {report.filled_qty}) from the mass status: the order already "
+                    f"carries {order.filled_qty} from trades this recovery just booked",
+                )
+                continue
+            kept.append(report)
+        return kept
 
     async def _adopt_reported_venue_order_ids(
         self,
@@ -4246,11 +4448,33 @@ class GateioExecutionClient(LiveExecutionClient):
         works from what the venue *did* answer, so the reports gathered before
         the failure are taken off the exception rather than thrown away.
 
-        What this method cannot do is check afterwards which of those reports
-        the engine booked, because the engine reconciles the mass status after
-        this call returns. The sweep in :meth:`_hand_over_unapplied_fills` is
-        therefore reached from the reconnect route only, and REC-01 in
-        docs/review-matrix.md records what a restart still loses because of it.
+        The recovered executions are booked **inside this method, before it
+        returns** — see the sweep below. This is the one moment on the restart
+        route with the three properties a correct booking needs, all verified
+        against the installed engine:
+
+        * the engine has reconciled nothing yet: ``reconcile_execution_state``
+          awaits this method and only then calls
+          ``_reconcile_execution_mass_status``, so nothing can have squared a
+          position report that already contains these trades against a cache
+          that does not carry them yet;
+        * the cached orders carry their venue ids (they survive a restart in
+          the cache index, and the rebase above restores the trigger-fired
+          ones), so ``_reconcile_fill_report_single`` can attribute every fill;
+        * a fill booked here updates the cache before the engine's duplicate
+          filter runs, so ``_deduplicate_mass_status_orders`` deletes a
+          now-matching order report harmlessly and a position report
+          reconciles against a cache that already carries the trade.
+
+        Checking *afterwards* which reports the engine booked — the reconnect
+        route's shape — has no correct trigger here, and the attempt is
+        recorded so it is not repeated (docs/roadmap.md, Stage 0): a sweep
+        staged off the engine's publication of the reconciled mass status ran
+        after the engine had already reconciled the startup position reports,
+        so it booked the venue's real trade on top of the inferred fill the
+        engine had just minted for the same trade — a doubled position that
+        nothing corrects, because the periodic position check is off by
+        default.
         """
         self._log.info("Generating ExecutionMassStatus...")
         self.reconciliation_active = True
@@ -4325,6 +4549,27 @@ class GateioExecutionClient(LiveExecutionClient):
         # mass status inline, so the rebase has to land before it is handed over.
         await self._adopt_reported_venue_order_ids(orders)
 
+        # Book every recovered execution not yet on its order, now, before the
+        # engine sees anything. Waiting for the engine's grouped pass loses
+        # them: its duplicate filter deletes an order report matching the
+        # cached order on status and filled quantity together with the trades
+        # grouped under it, and its ACCEPTED short-circuit returns before the
+        # trade loop — both of which are exactly the shape of a match landing
+        # between the order-listing read and the trade-listing read. The
+        # engine then squares the resulting position gap with a reconciliation
+        # order and an inferred fill carrying no venue trade id and no
+        # commission, which on spot overstates the position by the withheld
+        # base-currency fee.
+        listed_orders = {
+            report.venue_order_id: report for report in orders if report.venue_order_id is not None
+        }
+        unbooked_before = [r for r in fills if not self._fill_is_booked(r)]
+        if unbooked_before:
+            await self._hand_over_unapplied_fills(unbooked_before, listed_orders)
+            booked_now = [r for r in unbooked_before if self._fill_is_booked(r)]
+            self._record_recovery_bookings(booked_now)
+            orders = self._prune_reports_the_sweep_outran(orders, booked_now)
+
         mass_status.add_order_reports(reports=orders)
         mass_status.add_fill_reports(reports=fills)
 
@@ -4339,7 +4584,13 @@ class GateioExecutionClient(LiveExecutionClient):
                 positions,
             )
         else:
-            mass_status.add_position_reports(reports=positions)
+            # The account-wide position answer was read concurrently with the
+            # listings above, so it can predate the trades just booked; a row
+            # the booked trades refute is withheld rather than handed to an
+            # engine that would take it as current truth.
+            mass_status.add_position_reports(
+                reports=self._withhold_stale_position_reports(positions),
+            )
 
         self.reconciliation_active = False
         return mass_status
@@ -5104,7 +5355,23 @@ class GateioExecutionClient(LiveExecutionClient):
 
         if order_type == OrderType.MARKET and side == OrderSide.BUY:
             # `amount` is a quote-currency cash amount here, so the only
-            # base-denominated quantity the venue publishes is what was filled.
+            # base-denominated quantity the venue ever publishes for this order
+            # is the final filled amount — and that figure exists only once the
+            # venue has finished working the order. While the row still reads
+            # "open", `filled_amount` is a running partial: a report built from
+            # it would state a quantity the venue never set, the engine would
+            # restate the order to that partial figure, and every further match
+            # would then be refused as an overfill (REC-04). So an unfinished
+            # cash buy yields no order status report at all. Nothing is lost by
+            # that: its executions are recovered from the trade listing, and
+            # the order's own statement is taken from a re-read once the venue
+            # has finished it (`_hand_over_fills_with_their_order`).
+            if str(payload.get("status") or "").lower() == "open":
+                self._log.debug(
+                    "Skipping the report of a spot market buy Gate.io is still working: "
+                    "no base-denominated quantity exists for it until it finishes",
+                )
+                return None
             if filled <= 0:
                 self._log.debug(
                     "Skipping an unfilled spot market buy report: Gate.io publishes only a "
@@ -5589,7 +5856,18 @@ class GateioExecutionClient(LiveExecutionClient):
                 # The venue really was asked and really did say "no position", so
                 # an explicit FLAT report is a statement it made. Without it a
                 # derivative position closed at the venue could never be closed
-                # locally.
+                # locally. The one exception: an absent row cannot contain venue
+                # trades this recovery just booked, and it carries no timestamp
+                # that could show it postdates them — so while the answer is
+                # exactly the pre-trade book, it is a stale read, and asserting
+                # FLAT from it would have the engine square away the very trades
+                # the trade listing named.
+                if self._position_answer_is_stale(requested, Decimal(0), 0):
+                    raise PositionStatusUnavailable(
+                        f"Gate.io lists no {requested} position, but this recovery pass "
+                        f"booked venue trades there that an absent row cannot contain; "
+                        f"the answer was read before those trades and is stale, not flat",
+                    )
                 instrument = self._instrument(requested)
                 if instrument is not None:
                     reports.append(
@@ -5602,6 +5880,23 @@ class GateioExecutionClient(LiveExecutionClient):
                     )
         else:
             self._refuse_incomplete_account_sweep()
+
+        for report in reports:
+            # The same stale-read test, for a row the venue did send: a row that
+            # neither contains the trades this recovery just booked nor is
+            # stamped after them is a read from before those trades, and the
+            # only honest answer built on it is "the query is not answered yet".
+            if self._position_answer_is_stale(
+                report.instrument_id,
+                report.signed_decimal_qty,
+                report.ts_last,
+            ):
+                raise PositionStatusUnavailable(
+                    f"The {report.instrument_id} position row does not contain venue "
+                    f"trades this recovery just booked and is not stamped after them; "
+                    f"it is a stale read, not a statement that those trades did not "
+                    f"happen",
+                )
 
         self._log_report_receipt(len(reports), "PositionStatusReport", command.log_receipt_level)
         return reports
@@ -5709,7 +6004,18 @@ class GateioExecutionClient(LiveExecutionClient):
                     f"{type(payload).__name__} where a position object was expected. "
                     f"Nothing follows about what the ledger holds",
                 )
-            report = await self._parse_position_report(product, payload)
+            try:
+                report = await self._parse_position_report(product, payload)
+            except ValueError as e:
+                # A field that decides the answer could not be read. This is
+                # kept apart from the `None` branch below so the raise can name
+                # the field and the value: "size was the string '-0.5'" sends
+                # an operator to the right place, "cannot read" does not.
+                raise PositionStatusUnavailable(
+                    f"Gate.io answered the {product.value} position query with a row "
+                    f"({index + 1} of {len(entries)}) this client cannot read: {e}. "
+                    f"Nothing follows about what the ledger holds",
+                ) from e
             if report is None:
                 raise PositionStatusUnavailable(
                     f"Gate.io answered the {product.value} position query with a row "
@@ -5728,8 +6034,11 @@ class GateioExecutionClient(LiveExecutionClient):
 
         ``None`` means the row could not be read, never "there is no position
         here": a position of zero is a report like any other, with
-        ``PositionSide.FLAT``. The caller turns the difference into a failed
-        query, because a row that was not read supports no claim at all.
+        ``PositionSide.FLAT``. An unreadable *deciding field* raises
+        ``ValueError`` naming the field and the value instead, so the caller
+        can say which row failed and why. Either way the caller turns the
+        outcome into a failed query, because a row that was not read supports
+        no claim at all.
         """
         raw_symbol = venue_symbol_of(payload)
         if not raw_symbol:
@@ -5743,7 +6052,22 @@ class GateioExecutionClient(LiveExecutionClient):
         if instrument is None:
             return None  # `_instrument_or_load` has already logged the loss
 
-        size = to_int(payload.get("size"))
+        # `size` is the one field that decides both the side and the quantity,
+        # so it is read strictly. The forgiving `to_int` used elsewhere answers
+        # 0 for a missing key, null, an empty string, a non-numeric string and
+        # any magnitude truncating below one lot — and 0 here is not a default,
+        # it is the affirmative claim FLAT, which the engine acts on by closing
+        # the local position with an invented execution. Gate.io moved every
+        # futures size field from integer to string in v4.106.0, so a shape
+        # this client cannot read is a live possibility, not a hypothesis.
+        if "size" not in payload:
+            raise ValueError(f"the {raw_symbol} row has no 'size' field")
+        try:
+            size = to_lot_count(payload["size"])
+        except ValueError as e:
+            raise ValueError(
+                f"the {raw_symbol} row's 'size' field decides the answer: {e}"
+            ) from None
         if size > 0:
             side = PositionSide.LONG
         elif size < 0:

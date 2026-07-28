@@ -2348,3 +2348,113 @@ class TestPostOnlyTermination:
 
         assert self._terminate_as_post_only(env, order) == []
         assert order.status == OrderStatus.CANCELED
+
+
+class TestStartupRecoverySweep:
+    """Regression (REC-01): the restart route books recovered trades itself.
+
+    ``LiveExecutionEngine.reconcile_execution_state`` awaits
+    ``generate_mass_status`` and reconciles the result after it returns, so the
+    inside of that call is the last moment at which nothing has been reconciled
+    yet. A trade booked there reaches the cache before the engine's duplicate
+    filter compares snapshots against it and before any position report is
+    reconciled — the ordering that round six's withdrawn repair (a sweep staged
+    off the engine's publication of the reconciled mass status) got wrong, and
+    that docs/roadmap.md Stage 0 records so it is not tried again.
+    """
+
+    @staticmethod
+    def _wire_startup_gap(env: ExecHarness, text: str) -> None:
+        """The venue after a 3-lot match the order listing has not caught up with."""
+        env.perp.responses["positions"] = []
+        env.perp.responses["position"] = []
+        env.perp.responses["list_orders"] = lambda **kwargs: (
+            [_futures_order_payload(text=text)] if kwargs.get("status") == "open" else []
+        )
+        env.perp.responses["my_trades"] = lambda **kwargs: (
+            [_futures_fill_payload("T-GAP", -3, text=text)] if kwargs.get("offset", 0) == 0 else []
+        )
+
+    def test_the_gap_trade_is_offered_before_the_mass_status_is_returned(self, perp_harness):
+        env = perp_harness
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "900001")
+        self._wire_startup_gap(env, f"t-{order.client_order_id.value}")
+
+        mass_status = env.run(env.client.generate_mass_status(None))
+
+        # The venue trade went to the engine DURING the call, over the
+        # single-report channel that has no status gate. On the old tree
+        # nothing was sent here: the engine's grouped pass then deleted the
+        # ACCEPTED snapshot as an exact duplicate of the cached order and the
+        # trade grouped under it in the same breath, and the position gap was
+        # closed with an inferred fill instead of the venue's execution.
+        assert [report.trade_id for report in env.reports] == [TradeId("T-GAP")]
+        assert [report.venue_order_id for report in env.reports] == [VenueOrderId("900001")]
+
+        # The mass status still carries the venue's own answers: the ACCEPTED
+        # snapshot is kept (the engine short-circuits on it without reaching
+        # the trade loop, and a re-ACCEPT of an advanced order is swallowed as
+        # an idempotent transition), and the trade stays grouped under it.
+        assert mass_status is not None
+        assert VenueOrderId("900001") in mass_status.order_reports
+        assert [fill.trade_id for fill in mass_status.fill_reports[VenueOrderId("900001")]] == [
+            TradeId("T-GAP")
+        ]
+
+    def test_a_snapshot_the_sweep_outran_is_withheld_from_the_mass_status(self, perp_harness):
+        """A fall-through snapshot claiming fewer fills than the order now holds
+        would fail the whole startup reconciliation.
+
+        ``_handle_fill_quantity_mismatch`` (installed live/execution_engine.py)
+        reads ``report.filled_qty < order.filled_qty`` as duplicate fills or
+        corrupted cache, logs at ERROR and returns False — and a False from
+        ``reconcile_execution_state`` aborts node start (system/kernel.py). The
+        snapshot is merely older than the trades the sweep just booked, so it
+        is withheld. An equally stale ACCEPTED snapshot stays: the engine
+        short-circuits on it harmlessly, and the mass status remains the
+        venue's answer rather than this client's edit of it.
+        """
+        env = perp_harness
+        instrument = env.cache.instrument(PERP_BTC_USDT)
+        order = env.order_factory.limit(
+            PERP_BTC_USDT,
+            OrderSide.SELL,
+            Quantity.from_int(10),
+            Price.from_str("59000.0"),
+        )
+        env.accepted(order, "900001")
+        text = f"t-{order.client_order_id.value}"
+
+        # The order already carries the six lots the sweep just booked.
+        env.client._handle_fill_payload(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-NEW", -6, text=text),
+        )
+        env.drain(order)
+        assert order.filled_qty == Quantity.from_int(6)
+
+        booked_fill = env.client._parse_fill_report(
+            GateioProductType.PERP,
+            _futures_fill_payload("T-NEW", -6, text=text),
+            instrument,
+        )
+        stale = env.client._parse_order_status_report(
+            GateioProductType.PERP,
+            _futures_order_payload(left=-8, text=text),  # PARTIALLY_FILLED, filled 2 of 10
+            instrument,
+        )
+        untouched = env.client._parse_order_status_report(
+            GateioProductType.PERP,
+            _futures_order_payload(left=-10, text=text),  # ACCEPTED, filled 0
+            instrument,
+        )
+
+        kept = env.client._prune_reports_the_sweep_outran([stale, untouched], [booked_fill])
+
+        assert kept == [untouched]

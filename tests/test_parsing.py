@@ -26,6 +26,7 @@ from nautilus_gateio.common.parsing import (
     to_decimal,
     to_float,
     to_int,
+    to_lot_count,
 )
 
 
@@ -185,12 +186,14 @@ class TestSingleCanonicalTimestampConversion:
         """A second definition is the defect itself, so assert against the tree."""
         package = Path(nautilus_gateio.__file__).resolve().parent
         definitions = [
-            f"{path.relative_to(package)}:{index}"
+            str(path.relative_to(package))
             for path in sorted(package.rglob("*.py"))
-            for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            for line in path.read_text(encoding="utf-8").splitlines()
             if line.startswith("def timestamp_to_nanos")
         ]
-        assert definitions == ["common/parsing.py:56"], definitions
+        # The property is the count and the home, not the line number: pinning
+        # a line made this fail whenever an unrelated helper was added above it.
+        assert definitions == ["common/parsing.py"], definitions
 
     def test_every_module_uses_the_canonical_one(self):
         """Importing it is fine; redefining it is not."""
@@ -216,3 +219,36 @@ class TestSingleCanonicalTimestampConversion:
 
         for value in (1790000000123, "1790000000123", 1790000000.123456, 1790000000):
             assert data.timestamp_to_nanos(value) == execution.timestamp_to_nanos(value)
+
+
+class TestLotCount:
+    """Regression (REC-02): a contract count is exact or it is refused.
+
+    ``to_int`` answers 0 for everything it cannot read, which is right where 0
+    means "nothing here" and wrong where 0 is the affirmative claim FLAT. The
+    strict reader exists for the fields that decide a position's side and size.
+    """
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (4, 4),
+            (-4, -4),
+            ("4", 4),  # v4.106.0 moved futures sizes from integer to string
+            ("-4", -4),
+            ("4.0", 4),
+            (0, 0),
+            ("0", 0),
+            ("0.0", 0),
+        ],
+    )
+    def test_exact_counts_read(self, value, expected):
+        assert to_lot_count(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "abc", "-0.5", "0.5", {"long": -4}, [-4], True, False, "NaN", "Infinity"],
+    )
+    def test_anything_else_raises_naming_the_value(self, value):
+        with pytest.raises(ValueError, match="unreadable contract count"):
+            to_lot_count(value)

@@ -778,6 +778,192 @@ class TestUnreadablePositionRows:
             env.run(env.client.generate_position_status_reports(_position_command(None)))
 
 
+class TestUnreadablePositionSizes:
+    """Regression (REC-02 remainder): the field that decides the answer is read strictly.
+
+    The row-shape cases above catch a row that is not an object or cannot be
+    attributed to an instrument. This class holds the field that decides the
+    answer itself: ``size`` was read with a forgiving helper that returns 0 for
+    a missing key, null, an empty string, a non-numeric string and any
+    magnitude truncating below one lot — and 0 is not a default here, it is the
+    affirmative claim FLAT, which the engine squares a live book against with a
+    reconciliation order and an invented fill. Gate.io moved every futures size
+    field from integer to string in v4.106.0, which is what makes an unreadable
+    shape reachable rather than hypothetical.
+    """
+
+    UNREADABLE = [
+        ({"contract": "BTC_USDT", "entry_price": "59000"}, "the size key is absent"),
+        ({"contract": "BTC_USDT", "size": None}, "size is null"),
+        ({"contract": "BTC_USDT", "size": ""}, "size is an empty string"),
+        ({"contract": "BTC_USDT", "size": "abc"}, "size is a non-numeric string"),
+        ({"contract": "BTC_USDT", "size": {"long": -4}}, "size is an object"),
+        ({"contract": "BTC_USDT", "size": [-4]}, "size is a list"),
+        ({"contract": "BTC_USDT", "size": "-0.5"}, "size truncates below one lot"),
+        ({"contract": "BTC_USDT", "size": True}, "size is a boolean"),
+        ({"contract": "BTC_USDT", "size": "NaN"}, "size is not a number at all"),
+    ]
+
+    @pytest.mark.parametrize(("row", "why"), UNREADABLE)
+    def test_an_unreadable_size_fails_the_per_instrument_query(self, perp_env, row, why):
+        env = perp_env
+        env.perp.responses["position"] = [row]
+
+        with pytest.raises(PositionStatusUnavailable) as excinfo:
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+        # The raise names the row and the field, so an operator is sent to the
+        # venue payload rather than left with a phantom flat position and no log.
+        assert "size" in str(excinfo.value)
+        assert "1 of 1" in str(excinfo.value)
+
+    @pytest.mark.parametrize(("row", "why"), UNREADABLE)
+    def test_an_unreadable_size_fails_the_account_wide_sweep(self, perp_env, row, why):
+        env = perp_env
+        env.perp.responses["positions"] = [row]
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(env.client.generate_position_status_reports(_position_command(None)))
+
+    @pytest.mark.parametrize("zero", [0, "0", "0.0"])
+    def test_a_size_that_reads_zero_is_still_an_answer(self, perp_env, zero):
+        """The venue stated the position is gone; the book must still square."""
+        env = perp_env
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": zero, "entry_price": "0", "update_time": INSIDE_SECS},
+        ]
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.FLAT]
+
+    def test_a_stringified_size_reads_exactly(self, perp_env):
+        """v4.106.0 sends sizes as strings: "-4" is four lots short, not flat."""
+        env = perp_env
+        env.perp.responses["position"] = [
+            {
+                "contract": "BTC_USDT",
+                "size": "-4",
+                "entry_price": "59000",
+                "update_time": INSIDE_SECS,
+            },
+        ]
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.SHORT]
+        assert reports[0].quantity == Quantity.from_int(4)
+
+
+class TestStalePositionAnswersAfterRecovery:
+    """Regression (REC-01, position half): a row recovery outran is not an answer.
+
+    Recovery reads the trade listing and the position listing at separate
+    instants, so a position answer can predate a venue trade recovery just
+    booked. The engine takes any position report as current truth and squares
+    the book against it — which would delete the venue trade id, price and fee
+    just booked and replace them with an invented execution. While the answer
+    is exactly the pre-trade book and cannot be shown to postdate the trades,
+    the only honest answer is that the query is not answered yet.
+    """
+
+    @staticmethod
+    def _after_recovery_booked(env: ExecHarness, lots: int, booked_ts_ns: int) -> None:
+        """Leave the state the recovery sweep leaves behind.
+
+        A position opened by the booked trades, and the client's memory of
+        having booked them in this recovery pass.
+        """
+        _cache_open_position(env, PERP_BTC_USDT, Quantity.from_int(lots))
+        env.client._recovery_booked[PERP_BTC_USDT] = (Decimal(lots), booked_ts_ns)
+
+    def test_a_row_equal_to_the_pre_booking_book_is_withheld(self, perp_env):
+        env = perp_env
+        self._after_recovery_booked(env, 4, booked_ts_ns=2**62)
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 0, "entry_price": "0", "update_time": INSIDE_SECS},
+        ]
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_an_absent_row_equal_to_the_pre_booking_book_is_withheld(self, perp_env):
+        """An absent row carries no timestamp at all, so it can never postdate
+        the booked trades; while it matches the pre-trade book it is a stale
+        read, not the venue saying flat."""
+        env = perp_env
+        self._after_recovery_booked(env, 4, booked_ts_ns=2**62)
+        env.perp.responses["position"] = []
+
+        with pytest.raises(PositionStatusUnavailable):
+            env.run(
+                env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+            )
+
+    def test_a_row_stamped_after_the_booked_trades_stands_whatever_it_says(self, perp_env):
+        """A fresher row wins even when it reads flat: the venue has spoken since."""
+        env = perp_env
+        self._after_recovery_booked(env, 4, booked_ts_ns=1)
+        env.perp.responses["position"] = [
+            {"contract": "BTC_USDT", "size": 0, "entry_price": "0", "update_time": INSIDE_SECS},
+        ]
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.FLAT]
+        assert PERP_BTC_USDT not in env.client._recovery_booked
+
+    def test_a_row_containing_the_booked_trades_answers_and_clears_the_memory(self, perp_env):
+        env = perp_env
+        self._after_recovery_booked(env, 4, booked_ts_ns=2**62)
+        env.perp.responses["position"] = [
+            {
+                "contract": "BTC_USDT",
+                "size": 4,
+                "entry_price": "60000",
+                "update_time": INSIDE_SECS,
+            },
+        ]
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.LONG]
+        assert PERP_BTC_USDT not in env.client._recovery_booked
+
+    def test_a_disagreement_the_bookings_do_not_explain_is_reported(self, perp_env):
+        """A difference beyond the booked trades is a genuine discrepancy: the
+        engine must see it, or position reconciliation would be blinded."""
+        env = perp_env
+        self._after_recovery_booked(env, 4, booked_ts_ns=2**62)
+        env.perp.responses["position"] = [
+            {
+                "contract": "BTC_USDT",
+                "size": 9,
+                "entry_price": "60000",
+                "update_time": INSIDE_SECS,
+            },
+        ]
+
+        reports = env.run(
+            env.client.generate_position_status_reports(_position_command(PERP_BTC_USDT)),
+        )
+
+        assert [report.position_side for report in reports] == [PositionSide.LONG]
+        assert reports[0].quantity == Quantity.from_int(9)
+
+
 class TestFailedFillQueriesAreSurfaced:
     """Regression (REC-03): a failed trade listing may not be reported as no trades.
 

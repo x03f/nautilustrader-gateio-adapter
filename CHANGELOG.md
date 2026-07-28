@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A restart no longer loses a venue-confirmed trade the engine's
+  deduplication would drop.** The sweep that re-offers recovered executions the
+  grouped hand-over did not book used to run only after a WebSocket reconnect;
+  a process restart built the same mass status, handed it over, and never
+  looked at the outcome — so an order snapshot the venue had not caught up with
+  was deleted as a duplicate together with the trades grouped under it, and the
+  position gap was closed with an inferred fill carrying no venue trade id and
+  no commission (on spot overstating the position by exactly the withheld
+  base-currency fee), or not closed at all. The sweep now also runs inside
+  `generate_mass_status`, before the execution engine reconciles anything, so
+  the venue's own trades — id, price, fee — reach the cache first and a
+  position report that already contains them reconciles cleanly. An order
+  snapshot the sweep outran is withheld from the mass status (the engine would
+  misread it as corrupted cache and abort node start), and a position answer
+  equal to the pre-booking book that cannot be shown to postdate the booked
+  trades is answered `PositionStatusUnavailable` rather than handed to the
+  engine as current truth. An earlier repair staged off the engine's
+  publication of the reconciled mass status was withdrawn for doubling the
+  position; docs/roadmap.md (Stage 0) and docs/review-matrix.md record why.
+
+- **A position row whose `size` this client cannot read is no longer answered
+  as flat.** The row shapes were covered in the previous round; the field that
+  decides the answer now is too. `size` is read strictly, so a missing key,
+  null, an empty string, a non-numeric string, a boolean and any value that is
+  not an exact whole number of lots fail the query naming the row and the
+  field, instead of reading as `0` — which is FLAT, a claim the engine squares
+  a live book against. A row that genuinely reads zero, including the
+  stringified zeros Gate.io sends since v4.106.0, still squares the book.
+
+- **An unfinished quote-denominated spot market buy no longer yields an order
+  status report built from its running partial fill.** Gate.io publishes no
+  base-denominated quantity for a cash buy until it finishes, so a listing read
+  mid-match produced a report that restated the order to the partial figure and
+  the remaining matches were refused as overfills. While the venue is still
+  working the order there is now no report at all: its executions are recovered
+  from the trade listing, and the order's own statement is re-read once the
+  venue has finished it.
+
 - **A failed trade listing is no longer reported to the execution engine as "no
   trades".** `generate_fill_reports` caught every per-product failure, logged it
   and returned whatever it had collected. The engine keeps exactly one brake
@@ -31,9 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   statement the venue never made, and one the engine squares a live book against.
   Such a row now fails the query instead, naming which row of how many and why. A
   row that reports zero size is unaffected: that is the venue saying the position
-  is closed, and it must still square the book. This does not yet cover a row
-  whose *size* cannot be read; see `REC-02` in
-  [docs/review-matrix.md](docs/review-matrix.md).
+  is closed, and it must still square the book. The remaining half — a row whose
+  *size* cannot be read — is closed by the entry above; `REC-02` in
+  [docs/review-matrix.md](docs/review-matrix.md) records both halves.
 
 ### Changed
 

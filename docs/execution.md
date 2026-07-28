@@ -763,24 +763,28 @@ Keeping Nautilus client order ids within Gate.io's `text` limit is what makes a
 restart able to re-identify resting orders with no local state at all; see
 [client order ids](#client-order-ids).
 
-**The startup path has no unapplied-fill sweep, and a restart can therefore lose
-a trade the venue reported.** Startup builds the same `ExecutionMassStatus` the
-reconnect path builds, with each recovered trade grouped under its order report,
-and hands it to the engine — but it does not afterwards check which of those
-trades were actually booked. The engine drops an order report that tells it
+**The startup path books recovered trades itself, before the engine reconciles
+anything.** Startup builds the same `ExecutionMassStatus` the reconnect path
+builds, with each recovered trade grouped under its order report — but it does
+not merely hand it over and hope. The engine drops an order report that tells it
 nothing new (same status, filled quantity, instrument and side as the cached
-order) and drops the trades grouped under that report along with it; the
-reconnect sweep re-offers them, startup does not. The order and trade listings
-are also issued concurrently, so a match landing between them produces exactly
-that pairing. Until the sweep runs on both paths, treat a restart that coincides
-with a fill as a case where the order is left working a quantity the venue has
-already matched, and the venue's own trade — its id, its price and its fee — is
-not on the order. What that costs the *position* depends on the mass status: when
-it carries a position report for the instrument, the engine closes the gap with a
-reconciliation order and an inferred fill, so the net position is right and the
-audit trail is not; when it does not, nothing closes the gap and the book
-understates the position outright. See [Reconnect](#reconnect) for the mechanism,
-the measurements, and one repair that was tried and withdrawn.
+order) and drops the trades grouped under that report along with it, and the
+order and trade listings are issued concurrently, so a match landing between
+them produces exactly that pairing. `generate_mass_status` therefore runs the
+same unapplied-fill sweep the reconnect runs, *inside the call*, which is the
+last moment on this route at which the engine has reconciled nothing: the fills
+land in the cache before the engine's duplicate filter compares snapshots
+against it, and before any position report — which may already contain those
+trades — is reconciled against the book. Two consequences of booking first are
+handled explicitly. An order snapshot the sweep outran (one claiming fewer
+fills than the order now carries, in a status the engine would not
+short-circuit on) is withheld from the mass status, because the engine reads
+that disagreement as corrupted cache and fails the startup reconciliation,
+which aborts node start; a stale ACCEPTED snapshot is kept, because the engine
+short-circuits on it harmlessly. And a position answer that is exactly the
+pre-booking book, and cannot be shown to postdate the booked trades, is treated
+as the read-skew it is — see [Reconnect](#reconnect) for the rule and for the
+repair that was tried first and withdrawn.
 
 ### Reconnect
 
@@ -814,10 +818,14 @@ be applied against whatever quantity the local order still carries, and since
 `OrderUpdated` triggers no state transition, an order whose quantity the venue
 has moved on from could never reach a terminal status again.
 
-That is what the code does after a reconnect, and only after a reconnect;
-relying on it is another matter (*experimental*). The sweep has exactly one
-caller, the reconnect handler, so a node that starts, reconciles and never loses
-its socket never runs it — see [Startup](#startup) for what that costs.
+The sweep now runs on both routes: after the grouped hand-over on a reconnect,
+and inside `generate_mass_status` on a restart — before the engine has
+reconciled anything, which is the ordering the withdrawn repair below got
+wrong. The release gate holds the two routes to parity: each dual-route
+scenario fixes one set of venue answers, drives them through a reconnect and
+through a restart on independent caches, anchors both outcomes to the account
+state the venue's answers describe, and only then compares the routes field by
+field.
 
 The two defects that were open here in the fourth round are closed. An order
 with more than one unbooked trade now has every one of them handed over under
@@ -828,28 +836,27 @@ Both were closed against a demonstration of the damage — a fabricated trade id
 in place of a real one, and a position overstated by exactly the replaced
 trade's fee — and both re-appear when the fix is reverted.
 
-Six attempts at this path have now each closed the case their own scenario named
-and been refuted on another; the fifth and the sixth were each refuted from three
-independent directions at once. The sixth closed the third item below. What
-remains open, and one repair that was tried and taken back out:
+Six attempts at this path each closed the case their own scenario named and
+were refuted on another; the fifth and the sixth were each refuted from three
+independent directions at once. The seventh closed the remainder against a gate
+that now drives every case through both recovery routes and anchors each to
+venue truth before comparing them. What was closed, and one repair that was
+tried and taken back out:
 
-* **A restart loses what a reconnect recovers.** The engine deduplicates an
-  `ExecutionMassStatus` before applying it: an order report that matches the
+* **A restart used to lose what a reconnect recovers.** The engine deduplicates
+  an `ExecutionMassStatus` before applying it: an order report that matches the
   cached order on status, filled quantity, instrument and side is deleted, and
   every trade grouped under that report is deleted with it. The reconnect sweep
-  exists precisely to notice and repair that; on the startup path nothing does,
-  so a venue-confirmed execution is dropped in full and the order is left
-  working a remainder the venue has already cut. Measured on the fixtures of
-  scenarios that pass over the reconnect route — a zero-filled order, a
-  partly-filled one, one carrying two unbooked trades — on spot and on
-  perpetuals. Only a later reconnect, while the trade is still inside the
-  lookback window, repairs it. The net position is not wrong — the engine's
-  position reconciliation closes the gap with a reconciliation order and an
-  inferred fill — but the venue's trade id, price and fee are gone with the
-  trade, and on spot the fee is withheld in the currency being bought, so the
-  inferred fill overstates the position by exactly that fee.
+  exists precisely to notice and repair that; on the startup path nothing did,
+  so a venue-confirmed execution was dropped in full — the venue's trade id,
+  price and fee replaced by an inferred fill (on spot overstating the position
+  by exactly the withheld base-currency fee), or, with no position report in
+  the mass status, the position understated outright. The sweep now runs inside
+  `generate_mass_status`, before the engine reconciles anything, which is what
+  makes the position reports safe: they reconcile against a cache that already
+  carries the trades they contain.
 
-  A repair for this was written and withdrawn, and the shape of it is worth
+  The first repair was written and withdrawn, and the shape of it is worth
   knowing because it looks right. It started the sweep from the execution
   engine's publication of a mass status it had just reconciled, which is the one
   moment both routes reach. The topic is shared; the engine's state when it
@@ -858,46 +865,58 @@ remains open, and one repair that was tried and taken back out:
   — so on the startup path the sweep booked the venue's real trade on top of the
   fill the engine had just inferred for the same trade. Against a venue holding
   four lots short the account held eight, and the periodic position check is off
-  by default, so nothing corrected it. Whatever closes this has to book the
-  recovered fills before the book can be squared against a position report that
-  already contains them, and has to leave the engine's partial-window fill
-  adjustment intact.
-* **A position row whose size this client cannot read is reported as flat.** The
-  row *shapes* are covered: a row that is not an object, a row missing its symbol
-  field, an unresolvable instrument and an empty `200` body now make the query
-  fail rather than answer, because a row that was not read supports no claim at
-  all. The field that carries the answer does not: the size is read with a
-  helper that returns `0` for a missing key, for null, for an empty string, for a
-  non-numeric string and for any magnitude below one lot, and `0` is flat. So the
-  client still states that the venue is flat when it simply could not read the
-  field, without even a log line, and the engine squares the live position with a
-  reconciliation order and an inferred fill. Gate.io moved every futures size
-  field from integer to string in v4.106.0, so this is reachable rather than
-  hypothetical.
+  by default, so nothing corrected it.
 
-A third loss is older than any of these rounds and sits on the reconnect path as
-well: a quote-denominated spot market buy read while the venue is still matching
-it. Gate.io publishes no base-denominated quantity for an unfilled market buy, so
-the listing's quantity is the amount filled so far; restating the order to that
-figure caps it, and the matches that follow are then refused as overfills. It
-appeared in twelve of 338 randomised reconnect cases and behaves identically
-before and after this round.
+  Booking first has one consequence that deserves its own statement: a position
+  answer read before the booked trades landed. The rule
+  (`_position_answer_is_stale`) withholds a position answer only when trades
+  were booked for the instrument in this recovery, the answer is *exactly* the
+  book as it stood before them, and the answer cannot be shown to be stamped
+  after them — equal second-granular stamps do not qualify, because the reading
+  that cannot misstate money is the trade listing's. Such an answer is a stale
+  read, and the query is answered `PositionStatusUnavailable` until the venue
+  produces a row the rule can tell apart; a genuinely fresher row wins whatever
+  it says, and a disagreement the booked trades do not explain is handed to the
+  engine untouched. The residual risk is stated on the method: a compensating
+  unseen trade landing in the same second as the row nets back to the old book
+  and is withheld with it, pausing position reconciliation for that instrument
+  — never booking or unbooking anything — until a distinguishable answer
+  arrives.
+* **A position row whose size this client cannot read was reported as flat.**
+  The row *shapes* were covered first: a row that is not an object, a row
+  missing its symbol field, an unresolvable instrument and an empty `200` body
+  make the query fail rather than answer, because a row that was not read
+  supports no claim at all. The field that carries the answer is now covered
+  too: `size` is read strictly (`to_lot_count`), so a missing key, null, an
+  empty string, a non-numeric string, a boolean and any value that is not an
+  exact whole number of lots raise `PositionStatusUnavailable` naming the row
+  and the field, while a row that genuinely reads zero — including the
+  stringified zeros Gate.io sends since v4.106.0 moved futures sizes from
+  integer to string — still parses to FLAT and still squares the book.
+* **A quote-denominated spot market buy read while the venue was still matching
+  it lost trades**, on either route. Gate.io publishes no base-denominated
+  quantity for an unfinished market buy, so the listing's `filled_amount` is a
+  running partial; a report built from it restated the order to that figure and
+  the matches that followed were refused as overfills (twelve of 338 randomised
+  reconnect cases). An unfinished cash buy now yields no order status report at
+  all: its executions are recovered from the trade listing, and the order's own
+  statement is taken from a re-read once the venue has finished it. An order
+  that is still being worked when the re-read happens is booked by its trades
+  alone and left open until the live stream delivers the finish — the stream is
+  up again by the time recovery runs, so the window is the venue's own matching
+  latency, not the outage.
 
-What the sixth round did close is the fourth: a failed trade listing used to be
-reported to the engine as "no trades". The engine's only brake against squaring a
-book on a failed query is armed when the report query raises, and this client
-caught every per-product failure, logged it and returned what it had — so a 5xx
-on the trade listing while the position query answered closed the position with a
+What the sixth round closed stands: a failed trade listing used to be reported
+to the engine as "no trades". The engine's only brake against squaring a book on
+a failed query is armed when the report query raises, and this client caught
+every per-product failure, logged it and returned what it had — so a 5xx on the
+trade listing while the position query answered closed the position with a
 synthetic trade id and no commission, permanently, because by the next cycle the
 position was no longer open. `generate_fill_reports` now raises
 `FillReportsUnavailable`, carrying the reports the products that did answer
 produced, so the brake engages and one product's failure costs that product's
 fills rather than the whole recovery. A wallet Gate.io has not created is still
 an answer of none, because a ledger that does not exist holds no trades.
-
-The three that remain open are not covered by a test here yet; each was
-demonstrated against a real `LiveExecutionEngine`, and each is work to be done
-rather than a bound the venue forces.
 
 ### Duplicate suppression
 
