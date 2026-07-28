@@ -49,9 +49,13 @@ Close what is already known to be wrong before adding anything.
   restart-versus-reconnect parity, one on the unreadable-position claim, one on claim accuracy.
   All three refuted it. One of the three fixes it attempted survived, one survived but did not go
   far enough, and one was withdrawn. The seventh round closed what remained against a gate that
-  now owns the parity comparison that refuted the sixth; it has passed that gate and the
-  repository suite, and — like every round before it — that is evidence only until the next
-  refutation attempt, which has not yet run.
+  now owns the parity comparison that refuted the sixth, and passed that gate and the repository
+  suite. The refutation attempt then ran, in the same three-way shape, and two of the three
+  verifiers refuted the round. Claim accuracy held in full: the commit describes exactly what the
+  tree does, every cited test fails on revert, and the gate fails the exact scenarios claimed on
+  the reverted tree. What the other two broke, and what they left standing, is recorded per fix
+  below; the open remainders are `REC-05` and `REC-06` in the
+  [review matrix](review-matrix.md#recovery-findings-raised-after-this-review), and both block.
 
   **Closed.** The fill-report query now raises when a product's trade listing fails, carrying the
   reports the other products did answer. That raise is the only thing that arms the engine's brake
@@ -59,18 +63,27 @@ Close what is already known to be wrong before adding anything.
   closes a position with a synthetic trade id and no commission. Reverting it makes four tests and
   a two-cycle harness scenario fail.
 
-  **Closed in the seventh round, against a gate that now measures both routes.** The release
-  gate's dual-route parity family drives one set of venue answers through a reconnect and through
-  a restart on independent caches, anchors each outcome to the account state the venue's answers
-  describe, and only then compares the routes field by field — so a repair of one route that
-  leaves the other behind fails the gate instead of surviving to the next refutation.
+  **Built in the seventh round, against a gate that now measures both routes; the refutation
+  kept the mechanisms and re-opened two boundaries.** The release gate's dual-route parity family
+  drives one set of venue answers through a reconnect and through a restart on independent
+  caches, anchors each outcome to the account state the venue's answers describe, and only then
+  compares the routes field by field — so a repair of one route that leaves the other behind
+  fails the gate instead of surviving to the next refutation.
   - The unreadable-size half of the position finding: `size` is now read strictly
     (`to_lot_count`), so a missing key, null, an empty string, a non-numeric string, a boolean and
     any value that is not an exact whole number of lots raise `PositionStatusUnavailable` naming
     the row and the field, while a row that genuinely reads zero — including the stringified zeros
     of v4.106.0 — still parses to FLAT and still squares the book. Held by
     `TestUnreadablePositionSizes` and `TestLotCount`; every unreadable-size case fails on the
-    previous tree.
+    previous tree. The refutation left this standing and broke its boundary: strictness stops at
+    this one field. The deciding fields of the fill and order parses — futures order `left` and
+    `size`, futures and options fill `size`, spot fill `amount`, every fill `price` — still ride
+    forgiving readers with silent defaults, and through the real engine an unreadable `left`
+    becomes a confident full fill the engine fabricates the rest of, an unreadable fill `size`
+    silently replaces a venue-confirmed execution with an inferred fill carrying no commission,
+    and reconciliation reports success over both. That is `REC-06`, and the repair direction is
+    the round's own tool: the same strict read and the same raise on every field that decides
+    money, keeping the venue's affirmative zero as the one believed zero.
   - The restart half: the unapplied-fill sweep now also runs *inside* `generate_mass_status`,
     before the engine has reconciled anything — the one moment on the startup route at which
     cached orders carry their venue ids, nothing has been deduplicated, and no position report has
@@ -80,10 +93,22 @@ Close what is already known to be wrong before adding anything.
     explicitly: a snapshot the sweep outran is withheld from the mass status where the engine
     would misread it as corrupted cache and fail node start, and a position answer equal to the
     pre-booking book that cannot be shown to postdate the booked trades is answered
-    `PositionStatusUnavailable` (the read-skew rule in `_position_answer_is_stale`, residual risk
-    stated on the method). Held by `TestStartupRecoverySweep`,
-    `TestStalePositionAnswersAfterRecovery`, and the gate's seven dual-route parity scenarios,
-    all of which fail on the previous tree.
+    `PositionStatusUnavailable` (the read-skew rule in `_position_answer_is_stale`). Held by
+    `TestStartupRecoverySweep`, `TestStalePositionAnswersAfterRecovery`, and the gate's seven
+    dual-route parity scenarios, all of which fail on the previous tree. The refutation left the
+    sweep standing — order state is right on both routes across a 33-cell restart/reconnect
+    matrix in which the previous tree fails 23 cells — and broke the read-skew rule, in both
+    directions. Equality with the pre-booking book is the only staleness it recognises, so an
+    answer staler than that memory — an absent row, or a kept zero-size row, both of which
+    Gate.io produces for a traded contract — erases a pre-existing position with a fabricated
+    execution and a reconciliation that reports success, while the same shapes over a flat
+    pre-outage book are withheld fail-safe; and a *current* answer that happens to equal that
+    memory is refused, so an ordinary fresh-cache startup whose closed round trip straddles the
+    lookback window cannot start until the trades age out. That is `REC-05`, and the repair
+    direction is written on the method itself: an answer that cannot contain the trades just
+    booked and cannot be shown to postdate them supports no claim, whichever book it equals —
+    withholding it degrades to the refusal already accepted for the flat slice, never to a
+    fabrication.
   - REC-04, older than these rounds: an unfinished quote-denominated spot market buy no longer
     yields an order status report built from its running partial `filled_amount`; its executions
     come from the trade listing and the order's statement from a re-read once the venue has

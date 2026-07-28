@@ -9,9 +9,10 @@ works. Every status here was re-derived from the source, not carried over from a
 where a tracking file and the code disagreed, the code decided.
 
 Findings raised later, by the rounds of work on recovery and the attempts to refute them, are in
-[a section of their own](#recovery-findings-raised-after-this-review) at the end. Four of those are
-open. This page is not a claim that nothing is wrong; it is a claim that what is known is written
-down.
+[a section of their own](#recovery-findings-raised-after-this-review) at the end. Two of those are
+open and block a release; two more are closed only in part, with the open remainder carried by the
+two that block. This page is not a claim that nothing is wrong; it is a claim that what is known is
+written down.
 
 Run any row's validation command from the repository root.
 
@@ -22,8 +23,8 @@ Run any row's validation command from the repository root.
 | Fixed | 51 | the defective behaviour is gone and a regression test fails against it |
 | Accepted | 1 | a deliberate bound rather than a defect; stated in the documentation |
 
-Severity of the 52 as first classified: 10 critical, 19 major, 21 minor, 2 nit. The four open
-recovery findings below are outside this count.
+Severity of the 52 as first classified: 10 critical, 19 major, 21 minor, 2 nit. The six recovery
+findings below are outside this count.
 
 ## Findings
 
@@ -108,12 +109,21 @@ those attempts raise findings of their own. They are recorded here because this 
 reader looks for what is known to be wrong, and kept separate because they are not part of that
 review and are not closed.
 
+The seventh round of that work was refuted in its turn, which is where `REC-05` and `REC-06` come
+from. What held under the refutation: the sweep and its placement inside `generate_mass_status`
+(order state is correct on both recovery routes across a 33-cell restart/reconnect matrix in which
+the previous tree fails 23 cells), the strict reading of the position `size` field, and the raised
+fill-query failures — every cited regression test fails on revert. What did not hold is recorded in
+the two open rows below, and until they close, `REC-01` and `REC-02` are closed only in part.
+
 | ID | Finding | Status | Code | Evidence |
 |---|---|---|---|---|
-| `REC-01` | The unapplied-fill sweep ran only after a WebSocket reconnect, so on the startup path the engine's deduplication dropped a venue-confirmed trade and nothing re-offered it: the position was understated (or squared by an invented execution that erased the venue's trade id, price and fee), and the order was left working a quantity the venue already matched | FIXED | `nautilus_gateio/execution.py` `generate_mass_status` (the sweep now runs inside it, before the engine reconciles anything), `_hand_over_unapplied_fills`, `_prune_reports_the_sweep_outran`, `_record_recovery_bookings`, `_position_answer_is_stale`, `_withhold_stale_position_reports` | `TestStartupRecoverySweep`, `TestStalePositionAnswersAfterRecovery`; the dual-route parity family of the release gate (one venue answer set driven through both recovery routes, anchored to venue truth, then compared field by field) fails 7 scenarios on the previous tree and none on this one |
-| `REC-02` | A position row the client cannot read is answered with an explicit flat report, and the engine squares the live book against it with a reconciliation order and an inferred fill. The row shapes were closed first (a non-object row, an unresolvable symbol or instrument); the field that decides the answer is now closed too: `size` is read strictly, so a missing key, null, an empty string, a non-numeric string, a boolean, and any value that is not an exact whole number of lots raise `PositionStatusUnavailable` naming the row and the field, while a row that genuinely reads zero still squares the book | FIXED | `nautilus_gateio/execution.py` `_parse_position_report`, `_position_reports_for_product`; `nautilus_gateio/common/parsing.py` `to_lot_count` | `TestUnreadablePositionRows` (shapes), `TestUnreadablePositionSizes` (the deciding field, both routes, with zero-size and stringified-size controls), `TestLotCount` |
+| `REC-01` | The unapplied-fill sweep ran only after a WebSocket reconnect, so on the startup path the engine's deduplication dropped a venue-confirmed trade and nothing re-offered it: the position was understated (or squared by an invented execution that erased the venue's trade id, price and fee), and the order was left working a quantity the venue already matched | PARTIAL — the sweep, the prune and the in-call placement stand, and the lost-execution half is closed; the stale-position rule that shipped beside them is re-opened as `REC-05` | `nautilus_gateio/execution.py` `generate_mass_status` (the sweep now runs inside it, before the engine reconciles anything), `_hand_over_unapplied_fills`, `_prune_reports_the_sweep_outran`, `_record_recovery_bookings`, `_position_answer_is_stale`, `_withhold_stale_position_reports` | `TestStartupRecoverySweep`, `TestStalePositionAnswersAfterRecovery`; the dual-route parity family of the release gate (one venue answer set driven through both recovery routes, anchored to venue truth, then compared field by field) fails 7 scenarios on the previous tree and none on this one |
+| `REC-02` | A position row the client cannot read is answered with an explicit flat report, and the engine squares the live book against it with a reconciliation order and an inferred fill. The row shapes were closed first (a non-object row, an unresolvable symbol or instrument); the field that decides the answer is now closed too: `size` is read strictly, so a missing key, null, an empty string, a non-numeric string, a boolean, and any value that is not an exact whole number of lots raise `PositionStatusUnavailable` naming the row and the field, while a row that genuinely reads zero still squares the book | PARTIAL — the strict read of `size` stands with its tests; the refutation of the seventh round showed it stops at that one field, and the remainder is `REC-06` | `nautilus_gateio/execution.py` `_parse_position_report`, `_position_reports_for_product`; `nautilus_gateio/common/parsing.py` `to_lot_count` | `TestUnreadablePositionRows` (shapes), `TestUnreadablePositionSizes` (the deciding field, both routes, with zero-size and stringified-size controls), `TestLotCount` |
 | `REC-03` | `generate_fill_reports` caught every per-product failure, so the engine's brake against squaring a position on a failed fill query never engaged; a 5xx on the trade listing closed the position with a synthetic trade id and no commission | FIXED | `nautilus_gateio/execution.py` `generate_fill_reports`, `FillReportsUnavailable` | `TestFailedFillQueriesAreSurfaced`; removing the raise makes those tests and a two-cycle harness scenario fail, while the control — a listing that answers with nothing to find — still squares the book |
 | `REC-04` | A quote-denominated spot market buy whose order listing is read mid-match loses trades: Gate.io publishes no base-denominated quantity for an unfinished market buy, so the report restated the order to the running partial figure and the remaining matches were rejected as overfills. An unfinished cash buy now yields no order status report at all: its executions are recovered from the trade listing, and the order's own statement is re-read once the venue has finished it | FIXED | `nautilus_gateio/execution.py` `_parse_spot_order_fields` | `TestSpotMarketBuyQuoteSemantics::test_order_status_report_never_states_the_quote_amount` (asserts no report while open, the final base figure once finished, never the cash amount); release-gate scenario `dual_route_parity_spot_market_buy_read_mid_match` with its caught-up control |
+| `REC-05` | A stale position answer erases a pre-existing position, and the staleness rule is wrong in both directions. `_position_answer_is_stale` recognises a stale answer only when it equals exactly the book as it stood before this pass booked the recovered trades. An answer staler than that — an absent row, or a zero-size row stamped in the same second, both of which Gate.io produces for a traded contract — matches neither the pre-booking nor the post-booking book, so it is taken as a current statement: the engine squares a pre-existing short six lots to flat with a reconciliation order and an inferred fill, and reconciliation reports success, so nothing downstream corrects it. The same shapes over a flat pre-outage book are withheld fail-safe — the staler the answer, the more confidently it is applied. In the other direction, an ordinary fresh-cache startup whose closed round trip straddles the lookback window makes a *current* answer read as stale, and the node refuses to start on every attempt until the trades age out of the 24-hour window. A row carrying no readable timestamp falls back to the local clock and bypasses the rule entirely | OPEN — blocks | `nautilus_gateio/execution.py` `_position_answer_is_stale`, `_withhold_stale_position_reports`, `generate_position_status_reports`, `_parse_position_report`, `_record_recovery_bookings` | The refutation of the seventh round: a 33-cell restart/reconnect parity matrix driven through both recovery routes against the real execution engine. Twenty-nine cells end in identical, venue-anchored state; the four that pair a pre-existing position with a stale answer end at net zero against a venue holding short six, with a fabricated execution and reconciliation reporting success. Every earlier test and gate fixture armed the rule over a flat pre-outage book, which is why the gate stayed green |
+| `REC-06` | The strict reading that closed `REC-02` covers exactly one field. The other fields that decide money in the fill and order parses still ride forgiving readers with silent defaults: futures order `left` and `size`, futures and options fill `size`, spot fill `amount`, and every fill `price`. An unreadable `left` turns a partly-matched order into a confident full fill — the engine fabricates the difference, closes the order locally while the venue holds it open, then mints a phantom round trip to square the book the fabrication broke; a venue-canceled order with an unreadable `left` reports fully filled. An unreadable fill `size` silently drops a venue-confirmed execution, and an inferred fill with zero commission stands in its place. An unreadable `price` books an execution at price zero. A decimal size is truncated and booked short — and the startup sweep books that truncation into the cache itself. The changelog sentence cited for the position fix stringifies every futures size and quantity field, and decimal strings are current documented payloads for decimal-enabled contracts. In the same scope: a still-open spot cash market buy answers its status query with nothing, which after five consecutive in-flight-check misses fabricates a rejection for a live order | OPEN — blocks | `nautilus_gateio/execution.py` `_parse_contract_order_fields`, `_order_status`, `_parse_fill_report`, `_fill_quantity_and_commission`, `generate_order_status_report`; `nautilus_gateio/common/parsing.py` `to_int`, `to_decimal` | The refutation of the seventh round: every deciding field fed the same unreadable-shape family the position fix accepted, with a recording logger so silence is a recorded fact, then driven through the real execution engine on restart — reconciliation returned success across the damage, and byte-identical controls with readable values parse exactly. Both recovery routes parse with the same defaults, so route parity holds while the money is wrong, which is why no parity scenario could see it |
 
 `REC-01` is stated in [execution.md](execution.md) under both Startup and Reconnect, because a reader
 of either section needs it.
@@ -133,7 +143,14 @@ explicitly: an order snapshot the sweep outran is withheld from the mass status 
 would misread it as corrupted cache and fail node start, and a position answer equal to the
 pre-booking book that cannot be shown to postdate the booked trades is answered as
 `PositionStatusUnavailable` rather than handed to the engine as current truth (the read-skew rule
-in `_position_answer_is_stale`, which also documents its residual risk).
+in `_position_answer_is_stale`).
+
+That read-skew rule is where the refutation of the seventh round landed. Equality with the
+pre-booking book is the only staleness it recognises, so its protection reaches exactly as far as
+the fixtures that shaped it — a flat book before the recovered trades. `REC-05` records what lies
+beyond that boundary, `REC-06` records the same lesson on the parsing surface, and both stand open
+above. The sweep's placement, which the withdrawn repair got wrong and this one got right, is not
+in question: order state is correct on both routes across the whole refutation matrix.
 
 ## Residual risks
 

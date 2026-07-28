@@ -840,8 +840,10 @@ Six attempts at this path each closed the case their own scenario named and
 were refuted on another; the fifth and the sixth were each refuted from three
 independent directions at once. The seventh closed the remainder against a gate
 that now drives every case through both recovery routes and anchors each to
-venue truth before comparing them. What was closed, and one repair that was
-tried and taken back out:
+venue truth before comparing them — and was then refuted in its turn on two
+boundaries, recorded at the end of this section and held open in the
+[review matrix](review-matrix.md#recovery-findings-raised-after-this-review).
+What was built, and one repair that was tried and taken back out:
 
 * **A restart used to lose what a reconnect recovers.** The engine deduplicates
   an `ExecutionMassStatus` before applying it: an order report that matches the
@@ -905,6 +907,21 @@ tried and taken back out:
   alone and left open until the live stream delivers the finish — the stream is
   up again by the time recovery runs, so the window is the venue's own matching
   latency, not the outage.
+
+The refutation of the seventh round kept those mechanisms and re-opened two
+boundaries, both tracked as open, blocking findings (`REC-05`, `REC-06`) in the
+[review matrix](review-matrix.md#recovery-findings-raised-after-this-review).
+The read-skew rule recognises staleness only by equality with the book as it
+stood before the recovered trades were booked: an answer staler than that
+memory — an absent row, or a kept zero-size row — erases a *pre-existing*
+position with a fabricated execution while the same shapes over a flat book are
+withheld, and a current answer that happens to equal that memory is refused,
+holding a fresh-cache startup down until its trades age out of the lookback.
+And the strict reading stops at the position `size` field: the fields that
+decide fills and orders — futures `left` and `size`, fill `size`, spot
+`amount`, every fill `price` — keep their silent defaults. Until both close,
+the recovery described above is exact over a flat pre-outage book and readable
+payloads, and is not claimed beyond that.
 
 What the sixth round closed stands: a failed trade listing used to be reported
 to the engine as "no trades". The engine's only brake against squaring a book on
