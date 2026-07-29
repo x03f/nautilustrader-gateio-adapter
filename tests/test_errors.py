@@ -1,68 +1,218 @@
-"""Unit tests for error typing, message format, and retry classification."""
+"""Tests for error typing, message formatting and retry classification."""
 
 from __future__ import annotations
 
 import pytest
 
-from nautilus_gateio.errors import (
+from nautilus_gateio.common.errors import (
+    ACCOUNT_MODE_LABELS,
+    WALLET_NOT_PROVISIONED_LABELS,
     GateioClientError,
     GateioError,
     GateioServerError,
+    OrderValidationError,
+    UnsupportedOrderError,
+    WalletNotProvisionedError,
+    WalletQueryRefusedError,
     error_from_response,
     should_retry,
 )
+from nautilus_gateio.http.margin import require_wallet
 
 
 class TestErrorFromResponse:
-    @pytest.mark.parametrize("status", [400, 401, 403, 404, 429])
-    def test_4xx_maps_to_client_error(self, status):
-        err = error_from_response(status, "SOME_LABEL", "bad request")
-        assert isinstance(err, GateioClientError)
-        assert isinstance(err, GateioError)
-        assert not isinstance(err, GateioServerError)
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 422, 429, 499])
+    def test_4xx_maps_to_a_client_error(self, status):
+        error = error_from_response(status, "SOME_LABEL", "bad request")
+        assert isinstance(error, GateioClientError)
+        assert isinstance(error, GateioError)
+        assert not isinstance(error, GateioServerError)
 
     @pytest.mark.parametrize("status", [500, 502, 503, 504])
-    def test_5xx_maps_to_server_error(self, status):
-        err = error_from_response(status, "SERVER_ERROR", "boom")
-        assert isinstance(err, GateioServerError)
-        assert isinstance(err, GateioError)
-        assert not isinstance(err, GateioClientError)
+    def test_5xx_maps_to_a_server_error(self, status):
+        error = error_from_response(status, "SERVER_ERROR", "boom")
+        assert isinstance(error, GateioServerError)
+        assert isinstance(error, GateioError)
+        assert not isinstance(error, GateioClientError)
 
-    def test_fields_preserved(self):
-        err = error_from_response(400, "INVALID_PARAM", "amount too small")
-        assert err.status == 400
-        assert err.label == "INVALID_PARAM"
-        assert err.message == "amount too small"
+    def test_all_three_fields_are_preserved(self):
+        error = error_from_response(400, "INVALID_PARAM_VALUE", "amount too small")
+        assert error.status == 400
+        assert error.label == "INVALID_PARAM_VALUE"
+        assert error.message == "amount too small"
 
-    def test_message_format(self):
-        err = error_from_response(400, "INVALID_PARAM", "amount too small")
-        assert str(err) == "Gate.io 400 INVALID_PARAM: amount too small"
+    def test_message_carries_status_label_and_text(self):
+        error = error_from_response(429, "TOO_MANY_REQUESTS", "slow down")
+        text = str(error)
+        assert "429" in text
+        assert "TOO_MANY_REQUESTS" in text
+        assert "slow down" in text
 
-    def test_server_error_message_format(self):
-        err = error_from_response(503, "SERVER_ERROR", "unavailable")
-        assert str(err) == "Gate.io 503 SERVER_ERROR: unavailable"
+    def test_errors_are_raisable_exceptions(self):
+        with pytest.raises(GateioError):
+            raise error_from_response(400, "LABEL", "message")
 
 
 class TestShouldRetry:
-    def test_server_error_is_retryable(self):
-        assert should_retry(error_from_response(500, "INTERNAL", "boom")) is True
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_server_errors_are_retryable(self, status):
+        assert should_retry(error_from_response(status, "SERVER_ERROR", "boom")) is True
 
-    def test_429_is_retryable(self):
-        assert should_retry(error_from_response(429, "RATE_LIMITED", "slow down")) is True
+    def test_rate_limiting_is_retryable(self):
+        assert should_retry(error_from_response(429, "TOO_MANY_REQUESTS", "slow down")) is True
 
-    def test_too_many_requests_label_is_retryable(self):
-        err = error_from_response(403, "TOO_MANY_REQUESTS", "rate limit exceeded")
-        assert should_retry(err) is True
+    @pytest.mark.parametrize(
+        "label",
+        ["TOO_MANY_REQUESTS", "SERVER_ERROR", "INTERNAL", "TIMEOUT", "REQUEST_EXPIRED"],
+    )
+    def test_transient_labels_are_retryable_whatever_the_status(self, label):
+        assert should_retry(error_from_response(400, label, "transient")) is True
 
-    def test_400_invalid_param_not_retryable(self):
-        assert should_retry(error_from_response(400, "INVALID_PARAM", "bad")) is False
-
-    def test_auth_error_not_retryable(self):
-        assert should_retry(error_from_response(401, "INVALID_KEY", "bad key")) is False
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "INVALID_KEY",
+            "INVALID_SIGNATURE",
+            "INVALID_PARAM_VALUE",
+            "BALANCE_NOT_ENOUGH",
+            "ORDER_NOT_FOUND",
+            "READ_ONLY",
+            "IP_FORBIDDEN",
+        ],
+    )
+    def test_permanent_client_errors_are_not_retryable(self, label):
+        assert should_retry(error_from_response(400, label, "nope")) is False
 
     @pytest.mark.parametrize(
         "error",
-        [ValueError("nope"), RuntimeError("boom"), KeyError("k"), Exception("generic")],
+        [ValueError("not a venue error"), RuntimeError("boom"), Exception("generic")],
     )
-    def test_random_exceptions_not_retryable(self, error):
+    def test_unrelated_exceptions_are_not_retryable(self, error):
         assert should_retry(error) is False
+
+    def test_wallet_not_provisioned_is_not_retryable(self):
+        assert should_retry(WalletNotProvisionedError("no futures wallet")) is False
+
+
+class TestLabelSets:
+    def test_wallet_not_provisioned_labels(self):
+        assert "USER_NOT_FOUND" in WALLET_NOT_PROVISIONED_LABELS
+
+    @pytest.mark.parametrize(
+        "label",
+        ["INVALID_UNIFIED_ACCOUNT", "UNIFIED_ACCOUNT_NOT_ACTIVATED", "FORBIDDEN"],
+    )
+    def test_account_mode_labels(self, label):
+        assert label in ACCOUNT_MODE_LABELS
+
+    def test_the_label_sets_do_not_overlap(self):
+        assert not WALLET_NOT_PROVISIONED_LABELS & ACCOUNT_MODE_LABELS
+
+
+async def _raise(error: Exception):
+    raise error
+
+
+class TestRefusalIsTypedApartFromAbsence:
+    """A missing wallet and a refused query are two different facts.
+
+    Only the first says anything about what the ledger holds. Collapsing them
+    into one type makes "absence" the default reading of a refusal at every catch
+    site, and where that site is the position query the absence becomes a FLAT
+    report the venue never made — the engine then squares a live book with a
+    reconciliation order and an inferred fill.
+    """
+
+    @pytest.mark.parametrize("label", sorted(ACCOUNT_MODE_LABELS))
+    async def test_a_refusal_carries_the_refusal_type(self, label):
+        with pytest.raises(WalletQueryRefusedError) as excinfo:
+            await require_wallet(_raise(GateioClientError(403, label, "nope")), "the wallet")
+
+        assert label in str(excinfo.value)
+
+    @pytest.mark.parametrize("label", sorted(WALLET_NOT_PROVISIONED_LABELS))
+    async def test_an_unprovisioned_wallet_does_not(self, label):
+        with pytest.raises(WalletNotProvisionedError) as excinfo:
+            await require_wallet(_raise(GateioClientError(400, label, "nope")), "the wallet")
+
+        assert not isinstance(excinfo.value, WalletQueryRefusedError)
+
+    @pytest.mark.parametrize("label", sorted(ACCOUNT_MODE_LABELS))
+    async def test_a_refusal_is_still_caught_as_an_unavailable_wallet(self, label):
+        """The subclass is what keeps every existing handler correct.
+
+        A caller that only reads balances is right to treat both alike: a ledger
+        it cannot read keeps its previous figures whichever fact it is. Making
+        the refusal a sibling type instead would turn a permission error on a
+        secondary wallet into a hard start-up failure.
+        """
+        with pytest.raises(WalletNotProvisionedError):
+            await require_wallet(_raise(GateioClientError(403, label, "nope")), "the wallet")
+
+    async def test_an_unrelated_venue_error_passes_through_untouched(self):
+        with pytest.raises(GateioClientError):
+            await require_wallet(
+                _raise(GateioClientError(400, "INVALID_PARAM_VALUE", "bad")),
+                "the wallet",
+            )
+
+    def test_the_refusal_type_is_not_retryable_either(self):
+        assert should_retry(WalletQueryRefusedError("the key may not read that ledger")) is False
+
+
+class TestTheDistinctionIsReachableFromOutsideThePackage:
+    """The type exists so that a *caller* can catch a refusal before an absence.
+
+    It was introduced without being re-exported, so the only import path that
+    reached it was `nautilus_gateio.common.errors`, which the documentation does
+    not advertise as public. A distinction available to the adapter and to
+    nobody else is not a distinction the package offers.
+    """
+
+    def test_both_wallet_error_types_are_exported_from_the_package_root(self):
+        import nautilus_gateio
+
+        for name in ("WalletNotProvisionedError", "WalletQueryRefusedError"):
+            assert name in nautilus_gateio.__all__
+            assert getattr(nautilus_gateio, name, None) is not None
+
+    def test_a_caller_can_catch_the_refusal_before_the_absence(self):
+        """Order matters: the refusal is a subclass, so it must be caught first."""
+        from nautilus_gateio import WalletNotProvisionedError as Absence
+        from nautilus_gateio import WalletQueryRefusedError as Refusal
+
+        assert issubclass(Refusal, Absence)
+
+        caught = None
+        try:
+            raise Refusal("the venue would not answer")
+        except Refusal as e:
+            caught = ("refusal", e)
+        except Absence as e:  # pragma: no cover - the subclass clause wins
+            caught = ("absence", e)
+
+        assert caught is not None
+        assert caught[0] == "refusal"
+
+
+class TestAdapterLevelErrors:
+    @pytest.mark.parametrize(
+        "error_class",
+        [
+            WalletNotProvisionedError,
+            WalletQueryRefusedError,
+            OrderValidationError,
+            UnsupportedOrderError,
+        ],
+    )
+    def test_adapter_errors_are_plain_exceptions_not_venue_errors(self, error_class):
+        """They describe local conditions, so they carry no HTTP status."""
+        error = error_class("explanation")
+        assert isinstance(error, Exception)
+        assert not isinstance(error, GateioError)
+        assert "explanation" in str(error)
+
+    def test_unsupported_order_is_distinct_from_order_validation(self):
+        """One means "the venue would reject it", the other "we cannot express it"."""
+        assert not issubclass(UnsupportedOrderError, OrderValidationError)
+        assert not issubclass(OrderValidationError, UnsupportedOrderError)

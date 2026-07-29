@@ -1,181 +1,509 @@
 # Architecture
 
-This document describes how the adapter is put together: the module map, the
-runtime dataflows, and the design decisions behind the less obvious choices.
+How the adapter is put together: the package layout, the runtime dataflows, and
+the reasoning behind the choices that are not self-evident from the code.
 
-## Module map
+Two facts frame everything below.
 
-All modules live in the flat `nautilus_gateio` package.
+**This is an external, community-maintained package.** It is not part of the
+NautilusTrader distribution and is not endorsed by Nautech Systems or by
+Gate.io. It is written in pure Python and developed against `nautilus_trader`
+1.230.0. NautilusTrader's stated preference for adapters inside its own tree is
+a Rust core with a thin PyO3 binding, and this package deliberately does not
+follow that.
+[The deliberate Python-only architecture](#the-deliberate-python-only-architecture)
+explains why, and — more importantly — what that decision does *not* excuse.
 
-| Module | Responsibility |
-|---|---|
-| `config.py` | Config classes (`GateioDataClientConfig`, `GateioExecClientConfig`, `GateioPaperConfig`) and `resolve_credentials()` |
-| `constants.py` | Venue identifiers, REST/WS endpoints, bar-interval maps, client-order-id constraints |
-| `data.py` | `GateioDataClient` — live market-data client (bars over WS with REST fallback, historical bars, synthetic quotes) |
-| `errors.py` | Typed error hierarchy (`GateioError`, `GateioClientError`, `GateioServerError`, `LiveOrdersDisabledError`, `OrderValidationError`) and retry classification (`should_retry`) |
-| `execution.py` | `GateioExecutionClient` — live spot execution client (order routing, fill polling, account state) |
-| `factories.py` | `GateioLiveDataClientFactory` / `GateioLiveExecClientFactory` for `TradingNode` registration |
-| `futures.py` | Experimental raw REST clients for USDT-perpetual futures (`GateioFuturesPublicClient`, `GateioFuturesPrivateClient`) — not integrated with Nautilus |
-| `http.py` | `GateioHttpClient` — synchronous Gate.io API v4 REST client with signing, rate limiting (`RateLimiter`), and the `live_orders` safety switch |
-| `paper.py` | `PaperExecution` — local paper-fill simulator driven by live public data (orders never leave the process) |
-| `providers.py` | `GateioInstrumentProvider` / `StaticInstrumentProvider`, `build_currency_pair()`, `get_currency()` |
-| `reconcile.py` | `reconcile()` — standalone diagnostic comparison of local state vs. exchange state (read-only) |
-| `schemas.py` | Pure parsing helpers for API v4 payloads (`parse_order`, `parse_candle`, `parse_balances`, ..., `validate_order`) |
-| `signing.py` | HMAC-SHA512 request signing (`sign_request`) and client-order-id helpers (`generate_client_order_id`, `sanitize_client_order_id`) |
-| `symbols.py` | Symbol conversion between Nautilus instrument ids and Gate.io currency pairs |
-| `websocket.py` | `GateioWebSocketClient` — public spot WebSocket transport (candlesticks/trades) with reconnect, dedup, and gap detection |
+**The release is alpha.** The behaviour described here is implemented and
+covered by the unit suite against recorded and synthetic venue payloads. No
+live-venue validation has been performed; see [validation.md](validation.md).
+Where this page classifies a capability it uses exactly one of: *implemented and
+mock-tested*, *implemented, mainnet validation pending*, *experimental*,
+*unsupported*, *not applicable*. Nothing here is described as stable or
+production ready, because nothing has earned either word yet.
 
-## Dataflow
+## Package layout
 
-### Market data (inbound)
+The package is sub-packaged by concern. The top-level `__init__` re-exports the
+public API, so `from nautilus_gateio import GateioDataClient` works regardless of
+where a symbol physically lives.
 
 ```text
-Gate.io WS (spot.candlesticks)
-        |
-        v
-GateioWebSocketClient          -- closed-bar filter, dedup, out-of-order drop,
-        |                         gap detection, reconnect with backoff
-        v  on_bar callback (plain dict OHLCV)
-GateioDataClient._emit_bar
-        |
-        +--> Bar  ------------------> msgbus --> strategies / actors
-        |
-        +--> QuoteTick (synthetic, --> msgbus     [optional, see below]
-              close +/- 0.5 bp)
-
-Fallback path (WS failure or use_websocket=False):
-
-Gate.io REST /spot/candlesticks
-        |
-        v
-GateioDataClient._stream_poll  -- polls every poll_interval_secs, emits the
-        |                         last CLOSED candle once per new timestamp
-        v
-GateioDataClient._emit_bar --> msgbus
+nautilus_gateio/
+  __init__.py            public API re-exports, __version__
+  common/
+    constants.py         venue id, REST/WS endpoints, interval maps, limits
+    enums.py             GateioProductType, account modes, TIF, status mapping
+    errors.py            typed error hierarchy and retry classification
+    credentials.py       environment resolution and masking
+    signing.py           HMAC-SHA512 request and WebSocket signing, client ids
+    symbols.py           instrument id <-> Gate.io symbol (the only such place)
+    parsing.py           tolerant payload field conversion
+  http/
+    client.py            shared transport: signing, pacing, retries, errors
+    spot.py margin.py futures.py options.py wallet.py   typed namespaces
+  websocket/
+    client.py            one resilient connection to one endpoint
+    public.py            public channels for one product
+    private.py           authenticated channels for one product
+  books.py               local L2 book assembly and sequence validation
+  instruments.py         Gate.io payload -> NautilusTrader instrument
+  providers.py           GateioInstrumentProvider (multi-product, filtered)
+  config.py              GateioDataClientConfig, GateioExecClientConfig
+  data.py                GateioDataClient
+  execution.py           GateioExecutionClient
+  factories.py           TradingNode factories, shared-transport caching
 ```
 
-Historical requests follow a separate, simpler path:
+The dependency direction is one-way, from the bottom of this table upwards:
 
-```text
-Strategy.request_bars --> GateioDataClient._request_bars
-        --> REST /spot/candlesticks (limit capped at 1000)
-        --> list[Bar] --> msgbus response
+| Layer | Imports | NautilusTrader types in its own API |
+|---|---|---|
+| `books.py` | standard library only | none |
+| `common/*` | standard library only | identifiers and enums only (`constants.py`, `enums.py`, `symbols.py`) |
+| `http/*` | `common/*`, `httpx` | none — namespaces return decoded JSON unchanged |
+| `websocket/*` | `common/*`, `websockets`, the platform's logger and task cancellation | none — the transport hands raw envelopes to a callback |
+| `instruments.py`, `providers.py` | `http/*`, `common/*` | instrument and provider types |
+| `data.py`, `execution.py`, `factories.py` | everything below | the full live-client surface |
+
+The consequence worth knowing is that the REST and WebSocket layers can be used
+directly, without a trading node: nothing in their signatures is a NautilusTrader
+object. (The distribution still depends on `nautilus_trader`, because
+`common/constants.py` builds a `Venue` and `common/enums.py` maps onto the
+framework's order enums.)
+
+`books.py` has no framework dependency at all: it deals in `Decimal` prices and
+sizes, so the snapshot-plus-increment synchronisation algorithm can be unit
+tested without a trading environment. Turning its output into venue data types is
+the data client's job.
+
+## The two clients and their factories
+
+| Component | Base class | Role |
+|---|---|---|
+| `GateioDataClient` | `LiveMarketDataClient` | subscriptions and historical requests for every configured product |
+| `GateioExecutionClient` | `LiveExecutionClient` | order submission, modification, cancellation, account state and all four report generators |
+| `GateioLiveDataClientFactory` | `LiveDataClientFactory` | builds the data client from `GateioDataClientConfig` |
+| `GateioLiveExecClientFactory` | `LiveExecClientFactory` | builds the execution client from `GateioExecClientConfig` |
+
+Both factories are registered with a `TradingNode` under the venue's client id:
+
+```python
+from nautilus_gateio import (
+    GATEIO,
+    GateioLiveDataClientFactory,
+    GateioLiveExecClientFactory,
+)
+
+node.add_data_client_factory(GATEIO, GateioLiveDataClientFactory)
+node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)
 ```
 
-### Execution (outbound + inbound events)
+There is one client of each kind, not one per product. A single data client
+multiplexes every product named in `products`, and a single execution client
+trades all of them through one Nautilus account. Gate.io keeps a **separate
+wallet per product** and funds do not move between them implicitly, so the
+execution client aggregates those wallets into one account and says so in a
+start-up warning rather than letting the segregation surprise anyone at the
+first order.
+
+The factories perform no I/O. Construction opens no socket and issues no
+request; the venue is first contacted in `_connect()`. This is asserted by the
+factory tests, which run with the network blocked.
+
+## Shared, reference-counted REST transport
+
+`factories.py` caches the HTTP transport on `(api_key, api_secret, base_url,
+timeout_secs, max_retries)` and the instrument provider on `(http_client,
+products, options_underlyings, instrument_provider_config)`. A data client and
+an execution client configured alike therefore share one connection pool and one
+instrument load, which is the pattern the adapters bundled with NautilusTrader
+1.230.0 use.
+
+The cache is `functools.lru_cache(1)` — again matching the bundled adapters — so
+it holds exactly one entry. Two differently configured transports do not
+coexist: asking for a second configuration evicts the first, and asking for the
+first again builds a new instance. Within a single node this is invisible;
+a process that builds nodes for two environments will simply not get sharing
+between them.
+
+Shutdown is reference counted. Each owner calls `acquire()` when it takes the
+transport and `close()` when it releases it in `_disconnect`, and the underlying
+`httpx` pool is closed exactly once, by the last release. `close()` is
+idempotent and safe to call from a component that never acquired, so shutdown
+paths need no coordination. A cached entry that has been closed is discarded and
+rebuilt on the next request, because handing a closed client to a second node in
+the same process would fail on its first call.
+
+## Typed REST namespaces over one transport
+
+The REST side is deliberately the opposite shape to the WebSocket side: one
+transport, many typed namespaces.
+
+`GateioHttpClient` owns everything that is true of every request — HMAC-SHA512
+signing, client-side pacing with exponential backoff on HTTP 429, translation of
+`{"label", "message"}` error bodies into the typed error hierarchy, the venue
+clock offset, and the retry policy. The namespace classes
+(`GateioSpotHttpAPI`, `GateioMarginHttpAPI`, `GateioFuturesHttpAPI`,
+`GateioOptionsHttpAPI`, `GateioWalletHttpAPI`) each take that client and return
+decoded payloads unchanged.
+
+The clock offset is opt-in and worth knowing about, because two features hang off
+it. Signatures embed a timestamp, so a drifting local clock produces
+`INVALID_SIGNATURE`; and Gate.io's optional `x-gate-exptime` submission deadline
+bounds how late a request delayed in flight may still be accepted. Calling
+`sync_time()` measures the offset against the venue and enables both. Neither
+client calls it during connect, so an unsynchronised transport signs with the
+local clock and sends no deadline header — the deadline is deliberately withheld
+rather than computed from a clock that has not been checked, since an
+unsynchronised clock would expire valid requests.
+
+Perpetual and delivery futures share one namespace class, because Gate.io serves
+them from paths that differ only in two segments. The `/futures/{settle}` versus
+`/delivery/{settle}` split is expressed once, in the constructor:
+
+```python
+perp = GateioFuturesHttpAPI(client, settle="usdt")
+inverse = GateioFuturesHttpAPI(client, settle="btc")
+dated = GateioFuturesHttpAPI(client, settle="usdt", delivery=True)
+```
+
+The handful of endpoints that genuinely exist only for perpetuals — funding
+rates, order amendment, dual position mode — raise rather than quietly routing
+somewhere else.
+
+The retry policy is the part of this layer with money attached, so it is stated
+plainly. Gate.io offers no request-level idempotency token, and a transparent
+replay of a mutating request can execute it twice. The client therefore replays
+only where a replay is provably harmless: `GET`, `HEAD`, `OPTIONS` and `DELETE`
+always; `POST`, `PUT` and `PATCH` only when the venue has stated the request was
+rejected before it was processed (HTTP 429, or a `TOO_MANY_REQUESTS` /
+`REQUEST_EXPIRED` label), or when the transport failed before a byte left the
+process. Any other failure of a mutating request raises
+`GateioRequestAmbiguousError`, whose contract is "this may or may not have been
+applied — reconcile before resubmitting" rather than a silent retry.
+
+Replaying does not make an outcome known, so the same error is raised for a
+request that reached the venue and was never answered however often it was
+replayed; `NETWORK_ERROR` is reserved for the case where no byte of any attempt
+left the process. A cancel is why that distinction is load-bearing: `DELETE` *is*
+replayed, and reporting a definitive failure for an order the venue had already
+cancelled is what the execution client would then tell the strategy.
+
+## One WebSocket transport per product
+
+Gate.io serves each product family from its own WebSocket host, and perpetual
+and delivery futures share the `futures.*` channel namespace while living on
+different hosts. A message is therefore only interpretable in combination with
+the endpoint it arrived on, which is why `GateioProductType` is part of the
+identity of a `GateioWebSocketClient` rather than a parameter of each call. The
+product also selects the application-level ping channel and whether the
+fractional-size handshake header applies.
+
+| Product | Channel namespace | Default endpoint |
+|---|---|---|
+| Spot | `spot.*` | `wss://api.gateio.ws/ws/v4/` |
+| Perpetual (linear, USDT) | `futures.*` | `wss://fx-ws.gateio.ws/v4/ws/usdt` |
+| Perpetual (inverse, BTC) | `futures.*` | `wss://fx-ws.gateio.ws/v4/ws/btc` |
+| Delivery futures | `futures.*` | `wss://fx-ws.gateio.ws/v4/ws/delivery/usdt` |
+| Options | `options.*` | `wss://op-ws.gateio.live/v4/ws` |
+
+Gate.io publishes testnet WebSocket endpoints for spot and USDT perpetuals only,
+which is why configuring any other product together with
+`environment="testnet"` is rejected before a connection is attempted rather than
+failing later at the socket.
+
+`GateioWebSocketClient` is transport only: it connects, signs private
+subscription requests, keeps the connection alive, reconnects with capped
+exponential backoff, replays the subscription set and hands decoded envelopes to
+a callback. It contains no trading logic. `GateioPublicWebSocket` and
+`GateioPrivateWebSocket` wrap one such connection each and give the channels
+typed methods.
+
+The data client opens one public connection per configured product; the
+execution client opens one private connection per configured product. Both pass
+an `on_reconnect` callback, because Gate.io has no server-side session resume:
+
+* the data client rebuilds every local order book from a fresh REST snapshot,
+  since a book is stale by definition after a gap;
+* the execution client refreshes account state and re-queries orders and fills
+  over the outage window.
+
+Subscription replay itself belongs to the transport, and is safe because
+Gate.io treats repeated subscriptions as additive. A subscription that failed
+for a transport reason (`WS_NOT_CONNECTED` during a reconnect window,
+`WS_ACK_TIMEOUT`) is kept and replayed; only an outright venue rejection removes
+it.
+
+### Logging and background tasks in the transport
+
+The transport logs through NautilusTrader's logging subsystem
+(`nautilus_trader.common.component.Logger`), under the component name
+`GateioWebSocketClient`. Reconnects, subscription replay failures, malformed
+frames and the venue's service notifications therefore land in the Nautilus log
+file and obey `log_level`, `log_level_file` and `log_component_levels` like
+every other component. Using a standard-library logger here meant none of that
+applied, and the package contradicted itself, since `instruments.py` already
+logged through the platform.
+
+Every background task the transport starts — the receive loop, the heartbeat,
+the subscription replay, the proactive close triggered by the venue's `upgrade`
+notification and the task wrapping a coroutine returned by the message handler —
+is registered in one collection, and `disconnect()` hands that collection to the
+platform's `cancel_tasks_with_timeout`. That is what takes a strong reference
+snapshot before cancelling, so a task held only by the event loop cannot be
+collected mid-cancellation, and what reports the task names if they do not
+settle in time. A task the transport does not register is a task shutdown cannot
+account for.
+
+This does not require a running trading node: a `Logger` built before the
+logging subsystem is initialized simply discards its messages, so the REST and
+WebSocket layers remain usable standalone as described above.
+
+## Instrument provider
+
+`GateioInstrumentProvider` subclasses NautilusTrader's `InstrumentProvider` and
+implements `load_all_async`, `load_ids_async` and `load_async`. It loads each
+configured product independently through the typed namespaces, so the venue's
+path layout is expressed in exactly one place.
+
+Two behaviours in it are deliberate and worth knowing before an account starts:
+
+**Per-product degradation.** Gate.io creates the futures, delivery and options
+wallets on first use and answers `USER_NOT_FOUND` until then; a key may also lack
+permission for a product, or the account may not be in the mode an endpoint
+needs. These are configuration states, not failures. Each is logged and that one
+product is skipped, so an account trading only spot still starts cleanly with
+several products configured.
+
+**Rejection rather than clamping.** `instruments.py` is a set of pure payload
+transformations, and a payload that cannot be represented faithfully yields
+`None` plus a warning rather than raising — one bad entry never aborts a batch
+load. The important case is price scale: a few Gate.io spot pairs quote more
+decimals than a standard NautilusTrader build can represent, and quantising such
+a price yields `0.000000000`, which `Price` accepts in silence. Publishing the
+instrument anyway would mean publishing zeroes as if they were venue prices, so
+the instrument is not published at all.
+
+The provider additionally withholds instruments that cannot be traded normally:
+untradable or one-sided spot pairs, delisting or inactive contracts, expired
+delivery contracts, and options outside an active expiration. When credentials
+are present it reads the account's fee tier once, from `GET /wallet/fee` with the
+deprecated `GET /spot/fee` as a fallback, so spot instruments carry real fees
+rather than the deprecated per-pair percentage.
+
+## Symbology
+
+All conversion between NautilusTrader instrument ids and Gate.io symbols lives in
+`nautilus_gateio/common/symbols.py`. No other module builds or takes apart an
+instrument id. Three decisions define it; [symbology.md](symbology.md) is the
+full reference.
+
+**The venue string is `GATE_IO`, with an underscore.** NautilusTrader already
+identifies this exchange as `GATE_IO` in its own tooling — the Tardis
+integration's venue mapping matches on exactly that string — so instruments
+produced here interoperate with data loaded through other NautilusTrader
+components. Version 0.1.0 used `GATEIO`; the change is breaking and is covered
+by the [migration guide](migration-0.1-to-0.2.md).
+
+**Minimum normalization.** A Gate.io symbol is used verbatim unless the venue
+genuinely reuses it, and the adapter invents no vocabulary of its own. There is
+no `-SPOT`, `-FUT`, `-OPT` or `-INVERSE` suffix, because none is needed to tell
+those apart.
+
+**`-PERP`, on perpetuals only, and only because they collide.** A survey of the
+venue's listings recorded 527 USDT perpetual contracts whose exact symbol is
+also a spot pair: `BTC_USDT` is both a spot market and a perpetual. Two distinct
+instruments cannot share one instrument id, so the perpetual has to carry
+something the spot pair does not, and `-PERP` is the established NautilusTrader
+convention for precisely this case. Delivery contracts (`BTC_USDT_20260807`) and
+options (`BTC_USDT-20260729-70000-C`) carry their expiry inside the symbol and
+collide with nothing — no spot pair contains a dash or a second underscore — so
+they take no suffix.
+
+**`raw_symbol` is always the venue's own string.** Whatever the instrument id
+looks like, `raw_symbol` on the instrument is the exact symbol Gate.io uses, so
+a round trip back to the API never has to reverse a transformation. The suffix
+exists in the instrument id and nowhere else.
+
+| Product | Instrument id | `raw_symbol` |
+|---|---|---|
+| Spot | `BTC_USDT.GATE_IO` | `BTC_USDT` |
+| Perpetual (linear) | `BTC_USDT-PERP.GATE_IO` | `BTC_USDT` |
+| Perpetual (inverse) | `BTC_USD-PERP.GATE_IO` | `BTC_USD` |
+| Delivery future | `BTC_USDT_20260807.GATE_IO` | `BTC_USDT_20260807` |
+| Option | `BTC_USDT-20260729-70000-C.GATE_IO` | `BTC_USDT-20260729-70000-C` |
+
+## Dataflow: market data
 
 ```text
-Strategy.submit_order
-        |
-        v
-GateioExecutionClient._submit_order
-        |                         (MARKET is emulated as an aggressive
-        v                          LIMIT IOC — see design decisions)
-GateioHttpClient.place_order  --> REST POST /spot/orders
-        |
-        v
-OrderSubmitted / OrderAccepted / OrderRejected events --> msgbus
+Gate.io WS (per product endpoint)          Gate.io REST
+        |                                         |
+        v                                         v
+GateioPublicWebSocket                    GateioHttpClient + namespaces
+        |  raw envelope                           |  snapshots, history
+        v                                         v
+              GateioDataClient._handle_ws_message
+                        |
+                        v
+   TradeTick            <- *.trades
+   QuoteTick            <- *.book_ticker (the venue's own best bid/offer)
+   OrderBookDeltas      <- REST snapshot + *.order_book_update, assembled by
+                           GateioOrderBook: sequence-validated, resync on gap
+   Bar                  <- *.candlesticks, closed intervals only
+   MarkPriceUpdate      <- futures.tickers / options.contract_tickers
+   IndexPriceUpdate     <- futures.tickers / options.contract_tickers
+   FundingRateUpdate    <- futures.tickers, and REST funding_rate on request
+                        |
+                        v
+                 Nautilus DataEngine
+```
 
-Fill detection (no private WebSocket yet):
+Nothing is published that the venue did not send: quotes come from the real
+`book_ticker` best bid/offer stream, not from a synthesised spread. Sizes that
+truncate to zero at the instrument's precision are dropped rather than published
+as zeros, and an empty book side is absent rather than zero.
 
-  post-submit check (~0.6 s)  \
-                               >--> GateioHttpClient.order (REST GET)
-  _poll_loop (every            /         |
-   account_poll_interval_secs)           v
-                              delta vs. reported_fill
+Gate.io publishes no instrument-definition channel, so instrument updates come
+from a polling task on `update_instruments_interval_mins` instead of a stream —
+the same approach other NautilusTrader adapters take for venues without one.
+
+## Dataflow: execution
+
+```text
+Strategy -> SubmitOrder / ModifyOrder / CancelOrder
+                        |
+                        v
+              GateioExecutionClient
+                translate (reject if not expressible)
+                        |
+                        v
+              product REST namespace  ---------------> Gate.io
+                        ^                                 |
+                        |                                 v
+              REST reconciliation                private WebSocket
+              (reports, account poll)         orders / usertrades /
+                        |                     balances / positions
+                        +----------------+----------------+
+                                         v
+                          OrderAccepted / OrderFilled / OrderCanceled
+                                 AccountState, reports
                                          |
                                          v
-              OrderFilled / OrderCanceled events --> msgbus
-              AccountState push after each fill and each poll cycle
+                              Nautilus ExecutionEngine
 ```
+
+The private WebSocket is the primary event source and REST is the reconciliation
+source. Position updates arrive on both, and only the REST view is published as
+reports: one fill must not produce two competing views of the same position. All
+four report generators (`generate_order_status_report`,
+`generate_order_status_reports`, `generate_fill_reports`,
+`generate_position_status_reports`) are implemented against REST, so a restart
+with resting orders and open positions is a supported path — implemented and
+mock-tested, mainnet validation pending.
 
 ## Design decisions
 
-### WebSocket primary, REST fallback
+**Contracts, not coins.** For every derivative a `Quantity` is a number of
+contracts, matching the venue's `size` field, with the face value carried in
+`multiplier`. `size_precision` is therefore `0` on every contract instrument:
+fractional contracts do not exist on this venue. This is how Gate.io computes
+notional and how `Instrument.notional_value()` computes it.
 
-The WebSocket candlestick stream is the primary bar transport: it is pushed,
-cheap, and carries an explicit window-close flag. If the WS transport fails
-(exception escaping the reconnect loop), the same subscription transparently
-degrades to REST polling of `/spot/candlesticks`, which emits the last closed
-candle whenever its timestamp advances. Both transports feed the same
-`_emit_bar` path, so downstream consumers cannot tell them apart.
+**Reject rather than substitute.** An order Gate.io cannot express without
+changing its meaning raises `UnsupportedOrderError` and becomes an explicit
+denial or rejection carrying the reason, rather than a different order sent
+quietly. Reduce-only on spot is the clearest case: it is a derivatives concept,
+Gate.io's spot endpoint has no such flag, and dropping the flag would change what
+the strategy asked for. Which time-in-force values, flags and order types each
+product accepts is set out per case in [execution.md](execution.md).
 
-### Closed bars only
+The one deliberate substitution is documented and logged on every use: a
+base-denominated spot market buy, which Gate.io's spot API cannot express
+directly, is sent as an aggressive limit bounded by the pair's own published
+slippage cap. It substitutes the price and only the price — the order's own time
+in force rides along, so a fill-or-kill buy stays fill-or-kill.
 
-Both transports emit only *closed* bars (WS: the `window_close` flag; REST:
-the second-to-last row of the candle response). In-progress candles mutate on
-every trade; emitting them would produce a stream of partial bars that most
-strategies mishandle. The trade-off is latency: a bar arrives only after its
-interval ends, so the 1-minute bar spec is the lowest-latency option.
+**Degrade rather than fail.** "Wallet not created yet", "account not in the
+required mode" and "key lacks permission" are configuration states, not
+failures. They skip one product with an actionable message instead of aborting
+the load.
 
-### Synthetic quotes
+**Refuse rather than reconfigure the account.** A perpetual futures account in
+hedge (dual) position mode holds a separate long and short leg for one contract,
+which cannot be reconciled against Nautilus netting. The execution client checks
+the position mode at connect and refuses to start, naming the venue-side setting
+to change. It never changes that setting on the operator's behalf.
 
-When `emit_synthetic_quotes` is enabled (the default), each closed bar also
-emits a `QuoteTick` centered on the bar close with a fixed +/- 0.5 basis-point
-half-spread and unit sizes. The single purpose is to feed quote-driven
-execution simulations (sandbox/backtest-style fill models that need
-top-of-book updates). These ticks are **not** real market quotes — they carry
-no real spread, depth, or intra-bar movement. Disable them if any component
-treats quote ticks as market truth. See `docs/market-data.md`.
+**No local kill switch.** A boolean inside the process is not a security
+boundary. Control over what a key may do belongs on the key itself
+(permissions, IP allow-list) and in the explicit choice of `environment` — which
+defaults to mainnet, so that an execution client can never be pointed at a
+different exchange environment than the operator believes.
 
-### MARKET emulated as an IOC limit
+## The deliberate Python-only architecture
 
-Gate.io spot market **buy** orders interpret the `amount` field as *quote*
-currency (e.g. USDT to spend), while Nautilus quantities are in *base*
-currency. Rather than converting at a guessed price, the execution client
-emulates MARKET orders as aggressive LIMIT IOC orders that cross the spread
-by 1% (last price * 1.01 for buys, * 0.99 for sells). This keeps quantity
-semantics exact, bounds worst-case slippage at 1%, and lets the exchange
-cancel any unfillable remainder (surfaced as `OrderCanceled`). See
-`docs/execution.md`.
+NautilusTrader's developer guide describes the preferred shape of an adapter
+that lives inside its repository: a Rust core doing the venue work, with a thin
+PyO3 layer exposing it to Python. This adapter is pure Python, top to bottom.
+That is a deviation, it is deliberate, and it is stated here rather than left
+for a reader to discover.
 
-### REST polling for fills
+**Why.** This is an externally distributed package, installed from PyPI
+alongside `nautilus_trader` rather than merged into it. A Rust core would mean
+publishing compiled wheels per platform and Python version, a build toolchain
+for contributors, and an FFI boundary to keep correct — cost that buys an
+external package very little, since the adapter's work is JSON parsing and
+socket handling bounded by network latency, not by the interpreter. Pure Python
+also keeps the whole implementation readable and modifiable by the people most
+likely to need to: users debugging their own venue behaviour.
 
-The adapter has no private WebSocket integration yet. Fills are detected by
-polling `GET /spot/orders/{id}`: an immediate check ~0.6 s after submission
-(aggressive orders usually fill instantly) plus a periodic loop every
-`account_poll_interval_secs`. Each poll computes the fill delta versus the
-last reported amount, so partial fills generate incremental `OrderFilled`
-events. The cost is fill-report latency up to one poll interval.
+**What this does not excuse.** The distinction that matters is between
+*functional correctness* requirements and *repository convention*.
 
-### Fresh-start reconciliation semantics
+Requirements governing how an adapter must behave toward the platform apply in
+full, wherever the code lives: event ordering and lifecycle, order-book record
+flags, timestamp units, identity handling, precision, and the content of
+reconciliation reports. A strategy cannot tell which language its adapter is
+written in, and none of those requirements becomes optional because this package
+is external. Where the adapter falls short of one, that is a defect, not a
+consequence of this decision.
 
-`generate_order_status_reports`, `generate_fill_reports`, and
-`generate_position_status_reports` return empty results: the client does not
-adopt pre-existing exchange state on start-up, and Nautilus starts from a
-clean slate. Pre-existing open orders are *not* managed by the node. For a
-read-only diagnostic comparison of local vs. exchange state, use the
-standalone `nautilus_gateio.reconcile.reconcile()` helper — it reports
-discrepancies and recommended actions but never mutates anything.
+In-tree conventions are a different matter: repository layout, crate structure,
+the upstream build and release process, the in-tree test directory split. Those
+govern contributions to the NautilusTrader repository and do not bind a
+separately distributed package. They are not treated as release blockers here.
 
-### Layered order-flow safety
+Every Rust and PyO3 requirement in the upstream guide — FFI memory contracts,
+`PyCapsule` destructors, `unsafe` policy, crate lint configuration — is
+inapplicable rather than unmet, because there is no Rust in this package to hold
+to them.
 
-Credentials alone never enable order placement. `GateioHttpClient` requires
-an explicit `live_orders=True` before any mutating endpoint works
-(`LiveOrdersDisabledError` otherwise), and `GateioExecClientConfig` defaults
-to the Gate.io testnet host — mainnet requires `environment="mainnet"`
-explicitly. The experimental futures private client goes further and refuses
-to operate on any non-testnet host at all.
+**What this is not.** This page does not claim architectural conformance with an
+official in-tree adapter, and this package is not one. A future Rust/PyO3
+migration is a possible separate project. It is **not promised**, has no
+timeline, and nothing here should be read as a commitment to it or as a
+recommendation of it; stylistic parity with in-tree Rust adapters would not on
+its own be a reason to introduce Rust.
 
-## Conventions
+## Testing seams
 
-The package follows the structure conventions of the official NautilusTrader
-adapters: a flat `config` / `constants` / `data` / `execution` / `factories`
-/ `providers` module layout modeled on the Bybit and OKX adapters, with the
-transport layer (HTTP and WebSocket clients separate from the Nautilus-facing
-clients) modeled on the Binance adapter.
+The layering exists so that the parts with hard-to-reproduce failure modes can
+be tested without a venue.
 
-Deliberate deviations from the official adapters:
+* `books.py` — pure `Decimal` in, changes out. No framework, no I/O, so
+  out-of-order and gapped update sequences are ordinary unit tests.
+* `instruments.py` — pure payload transformations; an unrepresentable payload
+  yields `None` plus a warning, so both the accept and the reject path are
+  assertable from a fixture.
+* `http/*` — namespaces take a client, and the client's `request()` is the
+  single network seam to stub.
+* `websocket/*` — the transport takes a handler callable; tests drive it with
+  recorded envelopes rather than a live socket.
+* `common/*` — pure functions throughout.
+* `factories.py` — construction is I/O-free, so the factory tests run with the
+  network blocked and fail loudly if that ever stops being true.
 
-* **Plain-Python transports.** REST uses `httpx` and WebSocket uses
-  `websockets` instead of the `nautilus_pyo3` Rust network clients. This
-  keeps the package pure Python — installable anywhere, debuggable with
-  standard tooling — and is acceptable at this adapter's throughput
-  (closed-bar market data and low-frequency spot order flow).
-* **Dict-based schemas.** Payload parsing returns plain dicts
-  (`schemas.py`) rather than `msgspec` structs. Fewer dependencies, and
-  honest about the package's maturity: field-level typing can be added once
-  the payload surface stabilizes.
-* **Single flat package.** No `spot/` and `futures/` subpackages: spot is
-  the supported product, and futures support is an experimental REST-only
-  module (`futures.py`) that would not justify a parallel tree yet.
+See [testing.md](testing.md) for what the suite covers, and
+[validation.md](validation.md) for what it does not: no amount of unit testing
+establishes that the venue agrees with the adapter's model of it.

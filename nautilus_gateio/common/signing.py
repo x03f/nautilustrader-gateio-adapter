@@ -20,8 +20,8 @@ import itertools
 import re
 import time
 
-from nautilus_gateio.constants import (
-    CLIENT_ORDER_ID_MAX_LEN,
+from nautilus_gateio.common.constants import (
+    CLIENT_ORDER_ID_MAX_BODY,
     CLIENT_ORDER_ID_PREFIX,
     DEFAULT_CLIENT_ORDER_ID_TAG,
 )
@@ -83,4 +83,28 @@ def sanitize_client_order_id(value: str) -> str:
     cleaned = _TEXT_CHARSET.sub("", value)
     if not cleaned.startswith(CLIENT_ORDER_ID_PREFIX):
         cleaned = CLIENT_ORDER_ID_PREFIX + cleaned
-    return cleaned[:CLIENT_ORDER_ID_MAX_LEN]
+    return (
+        CLIENT_ORDER_ID_PREFIX + cleaned[len(CLIENT_ORDER_ID_PREFIX) :][:CLIENT_ORDER_ID_MAX_BODY]
+    )
+
+
+def sign_ws_request(channel: str, event: str, timestamp: int, api_secret: str) -> str:
+    """Sign a private WebSocket subscription.
+
+    Gate.io signs the literal string ``channel=<channel>&event=<event>&time=<ts>``
+    with HMAC-SHA512. The resulting hex digest goes into the ``auth.SIGN`` field
+    alongside ``auth.KEY`` and ``auth.method = "api_key"``.
+    """
+    message = f"channel={channel}&event={event}&time={timestamp}"
+    return hmac.new(api_secret.encode(), message.encode(), hashlib.sha512).hexdigest()
+
+
+def ws_auth_payload(
+    channel: str, event: str, timestamp: int, api_key: str, api_secret: str
+) -> dict:
+    """Build the ``auth`` object for a private WebSocket subscription."""
+    return {
+        "method": "api_key",
+        "KEY": api_key,
+        "SIGN": sign_ws_request(channel, event, timestamp, api_secret),
+    }

@@ -1,140 +1,150 @@
-"""Spot TESTNET order round-trip with layered safety gates.
+"""Spot TESTNET order round-trip: place, list, cancel.
 
-Places one deliberately unfillable limit buy (30% below the last price) on
-the Gate.io spot testnet, shows it among the open orders, cancels it, and
-shows the final state. Every step uses the validated order path
-(``place_order_validated``), which rounds to instrument precision and checks
-exchange minimums before submitting.
+Submits one limit buy far below the market, confirms it is resting, and cancels
+it. The order is priced so that it cannot fill.
 
-Why the gates exist
--------------------
-Order-placing code must never run by accident — not from a copy-pasted
-snippet, not from an environment that happens to contain credentials, and
-never against mainnet. The presence of API keys alone must NEVER be enough to
-place orders. This script therefore refuses to run unless ALL of the
-following hold, and prints each check as it passes:
+Safety gates in this script (they live here, not in the adapter):
 
-1. ``GATEIO_ALLOW_ORDERS=YES`` is set — an explicit, per-run human opt-in.
-2. The REST host is the hard-coded testnet host (``api-testnet.gateapi.io``).
-   The constant is defined in this file and is not overridable by any
-   environment variable, so the script physically cannot target mainnet.
-3. Testnet credentials are present (``GATE_TESTNET_API_KEY`` /
-   ``GATE_TESTNET_API_SECRET``).
-4. The order notional is hard-capped at 5 USDT; the computed order is
-   validated against the exchange specification before submission.
+1. **Explicit opt-in.** Refuses to run unless ``GATEIO_ALLOW_ORDERS=YES`` is set
+   for this run, so credentials sitting in the environment cannot place an order
+   on their own.
+2. **Testnet host, hard-coded.** The base URL is the ``GATEIO_HTTP_TESTNET``
+   constant. No environment variable or flag redirects this script to mainnet.
+3. **Bounded notional.** The order value is capped at ``MAX_NOTIONAL_USDT`` and
+   the limit price sits far below the market.
+4. **Cancel in ``finally``.** The order is cancelled even if an assertion or an
+   exception intervenes.
 
-These mirror the adapter's own layered safety model (``live_orders`` switch,
-testnet-by-default execution config).
+The adapter itself has no order kill switch: ``environment`` defaults to
+mainnet, and the controls that bind are the API key's permissions and IP
+allow-list. See docs/configuration.md.
 
-Credentials: REQUIRED (testnet only). Never use mainnet keys here.
+Credentials: REQUIRED, testnet only.
+
+    export GATE_TESTNET_API_KEY=...
+    export GATE_TESTNET_API_SECRET=...
+    export GATEIO_ALLOW_ORDERS=YES
 
 Run:
-    GATEIO_ALLOW_ORDERS=YES python examples/06_testnet_orders.py
+    python examples/06_testnet_orders.py
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
-from urllib.parse import urlparse
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from typing import Any
 
-from nautilus_gateio import GateioHttpClient
-
-# Hard-coded testnet endpoint. Deliberately NOT read from the environment or
-# CLI: this script must be physically unable to reach the mainnet API.
-TESTNET_BASE_URL = "https://api-testnet.gateapi.io"
-EXPECTED_HOST = "api-testnet.gateapi.io"
+from nautilus_gateio import (
+    GATEIO_HTTP_TESTNET,
+    GateioHttpClient,
+    GateioSpotHttpAPI,
+    generate_client_order_id,
+    resolve_credentials,
+)
 
 PAIR = "BTC_USDT"
-MAX_NOTIONAL_USDT = 5.0  # hard cap on order value
-DISCOUNT = 0.70  # buy limit at 30% below last price -> deep out of the book
+#: Hard cap on the value of the order this script may submit.
+MAX_NOTIONAL_USDT = Decimal("5")
+#: The limit price is placed this far below the last trade, so it cannot fill.
+PRICE_DISCOUNT = Decimal("0.5")
 
 
-def refuse(reason: str) -> None:
-    print(f"REFUSED: {reason}")
-    print("No order was placed; exiting.")
-    sys.exit(0)
+def _quantize(value: Decimal, decimals: int, rounding: str) -> Decimal:
+    return value.quantize(Decimal(1).scaleb(-decimals), rounding=rounding)
 
 
-def main() -> None:
-    # -- gate 1: explicit opt-in -------------------------------------------
-    if os.getenv("GATEIO_ALLOW_ORDERS", "") != "YES":
-        refuse(
-            "GATEIO_ALLOW_ORDERS is not set to YES. This example places real "
-            "orders on the Gate.io testnet and requires an explicit opt-in: "
-            "run it with GATEIO_ALLOW_ORDERS=YES. API keys alone never enable "
-            "order placement."
+def _build_order(spec: dict[str, Any], last: Decimal) -> dict[str, Any]:
+    """Size and price a resting limit buy inside the venue's constraints."""
+    price_decimals = int(spec["precision"])
+    amount_decimals = int(spec["amount_precision"])
+    min_notional = Decimal(str(spec.get("min_quote_amount") or "1"))
+    min_amount = Decimal(str(spec.get("min_base_amount") or "0"))
+
+    if min_notional > MAX_NOTIONAL_USDT:
+        raise SystemExit(
+            f"{PAIR} requires a minimum notional of {min_notional} USDT, "
+            f"above this script's cap of {MAX_NOTIONAL_USDT}"
         )
-    print("[gate 1/4] explicit opt-in: GATEIO_ALLOW_ORDERS=YES")
 
-    # -- gate 2: testnet host only -----------------------------------------
-    host = urlparse(TESTNET_BASE_URL).hostname
-    if host != EXPECTED_HOST:
-        refuse(f"base URL host {host!r} is not the testnet host {EXPECTED_HOST!r}")
-    print(f"[gate 2/4] endpoint is the hard-coded testnet host: {host}")
+    price = _quantize(last * (Decimal(1) - PRICE_DISCOUNT), price_decimals, ROUND_DOWN)
+    # Round the amount UP so the notional clears the venue minimum, then verify
+    # the result is still inside the cap.
+    amount = _quantize(min_notional / price, amount_decimals, ROUND_UP)
+    amount = max(amount, _quantize(min_amount, amount_decimals, ROUND_UP))
+    notional = amount * price
 
-    # -- gate 3: testnet credentials ---------------------------------------
-    api_key = os.getenv("GATE_TESTNET_API_KEY", "").strip()
-    api_secret = os.getenv("GATE_TESTNET_API_SECRET", "").strip()
+    if notional > MAX_NOTIONAL_USDT:
+        raise SystemExit(
+            f"computed notional {notional} USDT exceeds the cap of {MAX_NOTIONAL_USDT}"
+        )
+
+    print(f"order: BUY {amount} {PAIR} @ {price} (notional {notional} USDT, last {last})")
+    return {
+        "currency_pair": PAIR,
+        "side": "buy",
+        "type": "limit",
+        "account": "spot",
+        "amount": str(amount),
+        "price": str(price),
+        "time_in_force": "gtc",
+        "text": generate_client_order_id("ex"),
+    }
+
+
+async def main() -> int:
+    if os.environ.get("GATEIO_ALLOW_ORDERS") != "YES":
+        print(
+            "Refusing to run: set GATEIO_ALLOW_ORDERS=YES for this run to allow "
+            "this script to place a testnet order.",
+            file=sys.stderr,
+        )
+        return 1
+
+    api_key, api_secret = resolve_credentials(None, None, testnet=True)
     if not api_key or not api_secret:
-        refuse(
-            "missing GATE_TESTNET_API_KEY / GATE_TESTNET_API_SECRET. Create a "
-            "Gate.io testnet API key pair and export both variables."
+        print(
+            "No testnet credentials found. Set GATE_TESTNET_API_KEY and "
+            "GATE_TESTNET_API_SECRET and try again.",
+            file=sys.stderr,
         )
-    print("[gate 3/4] testnet credentials present")
+        return 1
 
-    client = GateioHttpClient(
-        api_key=api_key,
-        api_secret=api_secret,
-        live_orders=True,  # explicit switch; without it orders raise locally
-        base_url=TESTNET_BASE_URL,
-    )
-    with client:
-        client.sync_time()
+    # Gate 2: the host is a constant, not configuration.
+    print(f"host: {GATEIO_HTTP_TESTNET} (testnet, hard-coded)")
 
-        # -- gate 4: notional hard cap -------------------------------------
-        spec = client.currency_pair(PAIR)
-        last = client.ticker_last(PAIR)
-        price = round(last * DISCOUNT, spec["price_precision"])
-        # Smallest amount satisfying the exchange minimums at our price...
-        min_quote = float(spec["min_quote_amount"] or 0)
-        min_base = float(spec["min_base_amount"] or 0)
-        target_notional = max(min_quote * 1.05, min_base * price, 1.0)
-        amount = round(target_notional / price, spec["amount_precision"])
-        notional = amount * price
-        if notional > MAX_NOTIONAL_USDT:
-            refuse(
-                f"computed notional {notional:.4f} USDT exceeds the hard cap of "
-                f"{MAX_NOTIONAL_USDT} USDT (pair minimums too high for this demo)"
-            )
-        print(f"[gate 4/4] notional {notional:.4f} USDT is within the {MAX_NOTIONAL_USDT} USDT cap")
+    async with GateioHttpClient(api_key, api_secret, base_url=GATEIO_HTTP_TESTNET) as client:
+        await client.sync_time()
+        spot = GateioSpotHttpAPI(client)
 
-        print(f"\nlast price {last:.2f}; placing limit buy {amount} {PAIR} @ {price:.2f}")
-        order = client.place_order_validated(
-            PAIR,
-            "buy",
-            amount=amount,
-            price=price,
-            spec=spec,
-        )
-        print(f"placed: id={order['id']} status={order['status']} client_id={order['client_id']}")
+        spec = await spot.currency_pair(PAIR)
+        tickers = await spot.tickers(PAIR)
+        last = Decimal(str(tickers[0]["last"]))
+        body = _build_order(spec, last)
 
-        open_orders = client.open_orders(PAIR)
-        print(f"\nopen orders for {PAIR}: {len(open_orders)}")
-        for entry in open_orders:
-            marker = "  <-- ours" if entry["id"] == order["id"] else ""
-            print(
-                f"  id={entry['id']} {entry['side']} {entry['amount']} @ {entry['price']}{marker}"
-            )
+        placed = await spot.create_order(body)
+        order_id = str(placed["id"])
+        print(f"placed: id={order_id} status={placed.get('status')} text={placed.get('text')}")
 
-        print("\ncancelling ...")
-        cancelled = client.cancel_order(order["id"], PAIR)
-        print(f"cancelled: id={cancelled['id']} status={cancelled['status']}")
+        try:
+            grouped = await spot.open_orders()
+            resting = [
+                order
+                for group in grouped
+                if group.get("currency_pair") == PAIR
+                for order in group.get("orders", [])
+                if str(order.get("id")) == order_id
+            ]
+            print(f"resting: {'yes' if resting else 'no'}")
+        finally:
+            # Gate 4: cancel no matter what happened above.
+            cancelled = await spot.cancel_order(order_id, PAIR)
+            print(f"cancelled: id={cancelled['id']} status={cancelled.get('status')}")
 
-        remaining = client.open_orders(PAIR)
-        print(f"\nfinal state: {len(remaining)} open orders for {PAIR}")
-        print("done - the order never rested near the market and was cancelled cleanly")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(asyncio.run(main()))
