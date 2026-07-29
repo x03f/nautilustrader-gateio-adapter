@@ -48,9 +48,10 @@ venue.** The USDT perpetual is the only product whose conditional orders the
 venue has seen on both sides: a spot conditional sell needs base currency the
 cash account under test did not hold, so the platform's own risk engine denied
 every one before it could be sent. On the option contract nothing beyond the
-three orders above has been exercised — no market order, no conditional order,
-which the adapter refuses for options in any case, and no close of the long that
-those runs opened.
+three orders above has been exercised — no market order, and no conditional
+order, which the adapter refuses for options in any case. The close of the long
+those runs opened is not among the recorded steps either: by the time one was
+attempted the venue was already reporting that position flat.
 
 ## Status by account mode
 
@@ -131,6 +132,12 @@ successes is not a record.
 **This is a snapshot.** These rows are what had been recorded when the page was
 written, on an account with a fixed budget and a campaign still adding to it. A
 row that is absent is a run that had not happened, not a run that was hidden.
+Three late steps that would have read state back from the venue — the spot
+orders, the short side of the perpetual position, and the option position — are
+recorded failed and are deliberately not rows: each ran an hour or more after
+the state it was meant to read had been closed or cleaned away, and the venue
+answered them with an empty account or a flat position. A step that runs after
+its own premise has gone establishes nothing, in either direction.
 
 ### What the runs did not confirm
 
