@@ -297,8 +297,14 @@ cached last trade, then the cached quote's mid, then the venue ticker; if none o
 those is available the order is rejected rather than priced by guesswork.
 
 Fill quantities for such an order are read from `filled_amount` (base), never
-from the submitted `amount`, which is why a partially filled quote-denominated
-buy never restates the order quantity (*implemented and mock-tested*).
+from the submitted `amount`, which is quote-currency cash. The two denominations
+are never compared: an order's completion is decided in quote units
+(`filled_total` against `amount`), and its quantity in base units. A
+quote-denominated buy carries a bound in base units while it works and is closed
+with `OrderCanceled` on the venue's own `filled_amount` when Gate.io finishes
+it, so it ends `CANCELED` rather than `FILLED` — see
+[execution](execution.md#fills) for why the platform allows no other close
+(*implemented and mock-tested*).
 
 ## Time in force by product
 

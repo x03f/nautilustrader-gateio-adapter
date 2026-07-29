@@ -1220,9 +1220,13 @@ class TestSpotQuantityAmends:
 
         assert [event.is_quote_quantity for event in env.events_of(OrderUpdated)] == [False]
         assert order.is_quote_quantity is False
-        assert order.quantity == Quantity.from_str("0.010000")
+        # The quantity is a bound while the order is in flight: one size
+        # increment above the base Gate.io has credited, so no further fill can
+        # be discarded as an overfill and none can close the order before the
+        # venue says it is finished.
+        assert order.quantity == Quantity.from_str("0.010001")
         assert order.filled_qty == Quantity.from_str("0.010000")
-        assert order.status == OrderStatus.FILLED
+        assert order.status == OrderStatus.PARTIALLY_FILLED
 
 
 # -- reconnect must reconcile, not just refresh balances ---------------------

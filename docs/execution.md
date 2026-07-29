@@ -310,6 +310,25 @@ Those are matched back to this client's armed orders and closed explicitly,
 rather than being pushed through the order-payload path where they would not be
 understood.
 
+**Cancelling an order the venue no longer holds is not a refusal.** Gate.io
+answers such a cancel with `ORDER_NOT_FOUND`, `ORDER_CLOSED`, `ORDER_CANCELLED`
+or `ORDER_FINISHED`, and its own error tables class these as benign idempotent
+races on cancel. This client's transport replays `DELETE` on a transient
+failure, so one of these labels is also the ordinary answer to a cancellation it
+already performed. Reporting it as an `OrderCancelRejected` would be a
+misstatement with consequences: the platform reverts the order to its previous
+status, leaving it open here while the venue holds nothing, and a strategy that
+re-quotes on the rejection replaces an order that no longer exists.
+
+The client asks instead of inferring: the order is re-read and its own statement
+decides, through the same translation as any other order frame. Only when the
+re-read cannot answer at all is the outcome taken from the label, and then it is
+`OrderCanceled` — the venue said it holds no live order, and that transition
+preserves the filled quantity of a partly filled order. `CANCEL_FAIL` and
+`NO_CHANGE` are deliberately excluded: neither says the order is gone, and
+reading "the cancel did not happen" as "the order is closed" is the same
+mistake pointing the other way.
+
 ### Rejection, denial and expiry
 
 **Who refused the order decides which event says so.** `OrderDenied` is the
@@ -479,9 +498,30 @@ filled before its answer was lost is found as well.
   GT-fee deduction is enabled on the account. A derivative fill is commissioned in
   the instrument's settlement currency; a payload that carries no `fee` field at
   all is reported with a zero commission rather than an invented one.
-* A quote-denominated spot market buy is restated in base units at the venue's
-  own fill price before its first fill is applied, so that position and PnL
-  arithmetic downstream works in one unit.
+* A quote-denominated spot market buy is restated in base units before its first
+  fill is applied, because NautilusTrader compares an order's filled quantity
+  against its quantity without regard to units. Gate.io states the base total
+  for such an order exactly once — when the order finishes — so until then the
+  order's quantity is a **bound**: one size increment above the base the venue
+  has credited so far, recomputed from the venue's own fill amounts. That is why
+  the order reads `PARTIALLY_FILLED` with one increment outstanding while it is
+  still working. The bound is not an estimate of the total, and deliberately so:
+
+  * a quantity below what the venue credits makes the execution engine discard
+    the venue's fill as an overfill, so a trade that happened is not booked;
+  * a quantity above it can never be reached by fills, and the platform offers
+    no way to close such an order afterwards — `OrderUpdated` triggers no state
+    transition, and reconciliation reports it as already reconciled.
+
+  When Gate.io finishes the order, its `filled_amount` replaces the bound and
+  the order is closed with `OrderCanceled`, preserving the filled quantity. A
+  Gate.io spot market buy is IOC or FOK, so whatever the cash did not buy was
+  canceled rather than left working; **a cash buy therefore ends `CANCELED`
+  rather than `FILLED`, including when it spent all of its cash.** Read the
+  outcome from `filled_qty` and the resulting position, not from the terminal
+  status. A fill still travelling on the trade stream when the order closes is
+  routed through reconciliation, which is the platform's own route for a fill
+  that lands on a canceled order.
 
 ## Conditional order identity
 

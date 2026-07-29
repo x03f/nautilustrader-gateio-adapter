@@ -330,6 +330,23 @@ POST_ONLY_LABELS: Final[frozenset[str]] = frozenset(
 #: Terminal ``finish_as`` reason for a post-only order that would have taken.
 POST_ONLY_FINISH_AS: Final[str] = "poc"
 
+#: Gate.io error labels answering a cancel with "there is no such live order".
+#:
+#: Gate.io's own error tables class these as benign idempotent races on cancel
+#: — the futures table words it "treat cancel as done" — and this client's
+#: transport replays ``DELETE`` on a transient failure (see `http/client.py`),
+#: so they are also the ordinary answer to a cancellation it already performed.
+#: Reporting one as a refusal reopens the order here while the venue holds
+#: nothing (see `_resolve_cancel_of_a_vanished_order`).
+#:
+#: ``CANCEL_FAIL`` and ``NO_CHANGE`` are deliberately absent. Gate.io lists
+#: them beside these as benign, but neither says the order is gone, and reading
+#: "the cancel did not happen" as "the order is closed" is the same defect
+#: pointing the other way.
+CANCEL_ALREADY_DONE_LABELS: Final[frozenset[str]] = frozenset(
+    {"ORDER_NOT_FOUND", "ORDER_CLOSED", "ORDER_CANCELLED", "ORDER_FINISHED"},
+)
+
 #: Gate.io trigger rules: 1 = fire when price >= trigger, 2 = when price <= trigger.
 TRIGGER_RULE_ABOVE: Final[int] = 1
 TRIGGER_RULE_BELOW: Final[int] = 2
@@ -494,6 +511,27 @@ def venue_symbol_of(payload: dict[str, Any]) -> str:
         if value:
             return str(value)
     return ""
+
+
+def is_cash_buy_payload(payload: dict[str, Any]) -> bool:
+    """Return whether a spot payload describes a quote-denominated cash buy.
+
+    Gate.io denominates a spot MARKET BUY in the quote currency: ``amount`` is
+    cash to spend, ``left`` is cash unspent, and ``filled_total`` is cash
+    spent, while ``filled_amount`` is the base quantity bought. Mixing the two
+    denominations is the venue's own documented trap, so every reader that
+    compares an order's quantities asks this first.
+
+    ``type == "market"`` with ``side == "buy"`` identifies the cash buy exactly,
+    because a *base*-denominated spot market buy never reaches the venue as a
+    market order: this client submits it as an aggressive limit order instead
+    (`_build_aggressive_spot_buy`). The caller establishes that the payload is
+    a spot one.
+    """
+    return (
+        str(payload.get("type") or "").lower() == "market"
+        and str(payload.get("side") or "").lower() == "buy"
+    )
 
 
 def is_ambiguous_outcome(error: BaseException) -> bool:
@@ -918,9 +956,14 @@ class GateioExecutionClient(LiveExecutionClient):
 
         # Fills already applied, so a replayed usertrade cannot fill twice
         self._applied_trade_ids: dict[ClientOrderId, set[str]] = {}
-        #: Spot market buys whose quote-denominated quantity has been restated
-        #: in base units (see `_maybe_convert_quote_quantity`).
-        self._quote_quantity_converted: set[ClientOrderId] = set()
+        #: Spot cash buys in flight: {client order id: (base credited so far,
+        #: base quantity stated on the order)}. Gate.io denominates a spot
+        #: market buy in the quote currency and states its base total only when
+        #: the order finishes, so until then the order carries a bound built
+        #: from the venue's own fills (see `_raise_cash_buy_bound`). The order
+        #: object cannot be read for either figure: it still carries its
+        #: pre-update state while the execution engine's queue is undrained.
+        self._cash_buy_bounds: dict[ClientOrderId, tuple[Decimal, Decimal | None]] = {}
 
         # Last known wallet state per currency: {currency: (total, free)}
         self._balances: dict[str, tuple[Decimal, Decimal]] = {}
@@ -2341,7 +2384,7 @@ class GateioExecutionClient(LiveExecutionClient):
         if text is not None:
             self._client_order_id_by_text.pop(text, None)
         self._applied_trade_ids.pop(client_order_id, None)
-        self._quote_quantity_converted.discard(client_order_id)
+        self._cash_buy_bounds.pop(client_order_id, None)
         link = self._trigger_links.pop(client_order_id, None)
         if link is not None:
             self._trigger_by_armed_id.pop(link.armed_id, None)
@@ -3234,6 +3277,14 @@ class GateioExecutionClient(LiveExecutionClient):
                 # replace an order that no longer exists - double exposure.
                 self._outcome_unresolved("Cancellation", command.client_order_id, reason)
                 return
+            if str(e.label or "").upper() in CANCEL_ALREADY_DONE_LABELS:
+                await self._resolve_cancel_of_a_vanished_order(
+                    product,
+                    raw_symbol,
+                    command,
+                    reason,
+                )
+                return
             self._cancel_rejected(command, reason)
         except Exception as e:  # noqa: BLE001 - report, never propagate
             if is_ambiguous_outcome(e):
@@ -3244,6 +3295,80 @@ class GateioExecutionClient(LiveExecutionClient):
                 )
                 return
             self._cancel_rejected(command, f"cancel failed: {e}")
+
+    async def _resolve_cancel_of_a_vanished_order(
+        self,
+        product: GateioProductType,
+        raw_symbol: str,
+        command: CancelOrder,
+        reason: str,
+    ) -> None:
+        """Resolve a cancel Gate.io answered with "there is no such live order".
+
+        That answer is not a refusal, and reporting it as one misstates money:
+        ``Order.apply(OrderCancelRejected)`` reverts the order to its previous
+        status (model/orders/base.pyx:1065-1067), so the order stands open here
+        while the venue holds nothing — and a strategy that re-quotes on the
+        rejection replaces an order that no longer exists.
+
+        The classification in :func:`is_ambiguous_outcome` is by exception type,
+        because only the transport knows whether a request reached the venue.
+        This is a label-level exception to it, and it is one for a reason the
+        type cannot express: the cancel endpoints are idempotent and this
+        client's transport replays them, so a 4xx naming a missing order is the
+        expected answer to a cancellation that *worked*, not evidence of one
+        that was refused.
+
+        What the venue holds is a question with an answer, so it is asked
+        rather than inferred: the order is re-read and its own statement goes
+        through the same translation as every other order frame. Only when the
+        re-read cannot answer at all is the outcome taken from the label, and
+        then it is ``OrderCanceled`` — the venue said it holds no live order,
+        ``PARTIALLY_FILLED -> CANCELED`` preserves the filled quantity, and a
+        fill still in flight still reaches the order through
+        ``_handle_late_fill``. This is the resolution the platform itself
+        reaches for the same situation (``_resolve_order_not_found_at_venue``,
+        live/execution_engine.py), arrived at here without waiting for a check
+        that is not scheduled by default.
+        """
+        order = self._cache.order(command.client_order_id)
+        venue_order_id = (order.venue_order_id if order is not None else None) or (
+            self._cache.venue_order_id(command.client_order_id)
+        )
+
+        if venue_order_id is not None:
+            try:
+                payload = await self._get_order(product, venue_order_id.value, raw_symbol)
+            except Exception as e:  # noqa: BLE001 - the label is the fallback, not a raise
+                self._log.warning(
+                    f"Gate.io answered the cancellation of {command.client_order_id!r} with "
+                    f"{reason}, and the order could not be re-read ({e}); reporting the "
+                    f"termination the label states",
+                )
+            else:
+                if isinstance(payload, dict) and payload:
+                    self._log.info(
+                        f"Gate.io answered the cancellation of {command.client_order_id!r} with "
+                        f"{reason}, which is not a refusal; the order's own statement decides",
+                    )
+                    self._handle_order_payload(product, payload)
+                    return
+                self._log.warning(
+                    f"Gate.io answered the cancellation of {command.client_order_id!r} with "
+                    f"{reason}, and the re-read returned no order object; reporting the "
+                    f"termination the label states",
+                )
+
+        if order is not None and order.is_closed:
+            return
+        self.generate_order_canceled(
+            strategy_id=command.strategy_id,
+            instrument_id=command.instrument_id,
+            client_order_id=command.client_order_id,
+            venue_order_id=venue_order_id,
+            ts_event=self._clock.timestamp_ns(),
+        )
+        self._forget_order(command.client_order_id)
 
     async def _cancel_one(
         self,
@@ -3853,6 +3978,15 @@ class GateioExecutionClient(LiveExecutionClient):
             self._forget_order(order.client_order_id)
             return
 
+        if product.is_spot and is_cash_buy_payload(payload):
+            # The venue has finished a spot cash buy. Every branch below decides
+            # an order's terminal state from a quantity this client holds, and
+            # for this order that quantity is only a bound built from the fills
+            # so far (`_raise_cash_buy_bound`) — the venue states the base total
+            # here and nowhere else, so the close is taken from it.
+            self._close_finished_cash_buy(order, payload, instrument, venue_order_id, ts_event)
+            return
+
         if status == OrderStatus.EXPIRED:
             if not order.is_closed:
                 self.generate_order_expired(
@@ -4140,11 +4274,7 @@ class GateioExecutionClient(LiveExecutionClient):
             size = abs(to_lot_count(value))
             return Quantity(size, instrument.size_precision) if size > 0 else None
 
-        is_spot_market_buy = (
-            str(payload.get("type") or "").lower() == "market"
-            and str(payload.get("side") or "").lower() == "buy"
-        )
-        if is_spot_market_buy:
+        if is_cash_buy_payload(payload):
             value = payload.get("filled_amount")
             if value in (None, ""):
                 return None
@@ -4184,7 +4314,19 @@ class GateioExecutionClient(LiveExecutionClient):
                 status = "open" if event in ("put", "update") else "finished"
             what = f"spot order {payload.get('id')!r}"
             amount = float(optional_exact_decimal(payload, "amount", what=what))
-            filled = float(optional_exact_decimal(payload, "filled_amount", what=what))
+            if is_cash_buy_payload(payload):
+                # `amount` on a spot cash buy is quote cash, so the comparable
+                # filled figure is `filled_total` (quote) — NOT `filled_amount`,
+                # which is the base bought. Comparing those two mixes
+                # denominations, and the answer then depends on the price of the
+                # pair rather than on the order: on a cheap pair the base number
+                # is the larger one and a half-spent order reads FILLED, on an
+                # expensive pair the same order reads CANCELED. Gate.io's own
+                # documentation warns about this pairing. `left` below is quote
+                # cash for this order too, so the fallback stays in one unit.
+                filled = float(optional_exact_decimal(payload, "filled_total", what=what))
+            else:
+                filled = float(optional_exact_decimal(payload, "filled_amount", what=what))
             if not filled and payload.get("left") not in (None, "") and "amount" in payload:
                 left = float(optional_exact_decimal(payload, "left", what=what))
                 filled = max(0.0, amount - left)
@@ -4338,7 +4480,7 @@ class GateioExecutionClient(LiveExecutionClient):
         # the one carrier the platform lets change a venue order id.
         self._maybe_swap_trigger_venue_order_id(order, venue_order_id, ts_event)
 
-        self._maybe_convert_quote_quantity(order, instrument, venue_order_id, last_px, ts_event)
+        self._raise_cash_buy_bound(order, instrument, venue_order_id, last_qty, ts_event)
 
         applied.add(trade_id.value)
         self.generate_order_filled(
@@ -4421,46 +4563,150 @@ class GateioExecutionClient(LiveExecutionClient):
         # Options fills carry no fee on the REST endpoint; the stream does.
         return Quantity(size, instrument.size_precision), Money(fee, settlement)
 
-    def _maybe_convert_quote_quantity(
+    def _raise_cash_buy_bound(
         self,
         order: Order,
         instrument: Instrument,
         venue_order_id: VenueOrderId,
-        last_px: Price,
+        last_qty: Quantity,
         ts_event: int,
     ) -> None:
-        """Convert a quote-denominated spot market buy to base units on first fill.
+        """Hold a spot cash buy's quantity above the base the venue has credited.
 
         A Gate.io spot market buy is submitted as a cash amount, so the order's
         quantity is denominated in the quote currency while its fills are
-        denominated in the base currency. The order is restated in base units at
-        the venue's own fill price before the first fill is applied, so that
-        position and PnL arithmetic downstream works in one unit.
+        denominated in the base currency. The platform compares the two with no
+        unit check at all — ``Order._filled`` (model/orders/base.pyx:1176-1180)
+        is a raw ``filled_qty + last_qty < quantity`` — so the order needs a
+        base-denominated quantity before its first fill is applied, and
+        ``OrderUpdated`` carrying ``is_quote_quantity=False`` is the only
+        carrier the platform offers for it.
+
+        The venue states this order's base total exactly once, when the order
+        finishes. Until then the quantity here is a **bound**, and it is built
+        from the venue's own fill amounts rather than computed from a price.
+
+        The predecessor divided the cash by the *first* fill's price. That
+        estimate is an arithmetic the venue never took part in, and it fails in
+        both directions: one increment low and the engine's overfill check
+        discards the venue's fill outright (``allow_overfills`` defaults False),
+        losing an execution; one increment high and the order can never reach
+        FILLED and stays open for ever, which is what the mainnet step found. On
+        a fill that sweeps two price levels it cannot come out right at all —
+        every later fill of a buy is at a worse price than the one divided by.
+
+        Holding the quantity one size increment above what the venue has
+        credited removes the low case by construction: no fill is ever
+        discarded, and no fill can complete the order before the venue says it
+        is finished. ``_close_finished_cash_buy`` then replaces the bound with
+        the venue's own base total and closes the order on it.
         """
-        if order.client_order_id in self._quote_quantity_converted:
-            # This order's quantity is already stated in base units. Both guards
-            # below read the order, which still carries its pre-update state
-            # while the engine's queue is undrained, so a second fill in the same
-            # frame would otherwise convert a second time.
+        entry = self._cash_buy_bounds.get(order.client_order_id)
+        if entry is None:
+            if not order.is_quote_quantity:
+                return
+            credited, stated = Decimal(0), None
+        else:
+            credited, stated = entry
+
+        credited += last_qty.as_decimal()
+        if stated is not None and stated > credited:
+            # The standing bound still covers this fill, so the order needs no
+            # restatement — only the running total moves.
+            self._cash_buy_bounds[order.client_order_id] = (credited, stated)
             return
-        if not order.is_quote_quantity or order.filled_qty.as_decimal() > 0:
-            return
-        price = last_px.as_decimal()
-        if price <= 0:
-            return
-        base_quantity = instrument.make_qty(order.quantity.as_decimal() / price)
-        self._quote_quantity_converted.add(order.client_order_id)
+
+        increment = Decimal(1).scaleb(-instrument.size_precision)
+        quantity = instrument.make_qty(credited + increment)
+        self._cash_buy_bounds[order.client_order_id] = (credited, quantity.as_decimal())
         self.generate_order_updated(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
             client_order_id=order.client_order_id,
             venue_order_id=venue_order_id,
-            quantity=base_quantity,
+            quantity=quantity,
             price=getattr(order, "price", None),
             trigger_price=None,
             ts_event=ts_event,
             is_quote_quantity=False,
         )
+
+    def _close_finished_cash_buy(
+        self,
+        order: Order,
+        payload: dict[str, Any],
+        instrument: Instrument | None,
+        venue_order_id: VenueOrderId,
+        ts_event: int,
+    ) -> None:
+        """Close a spot cash buy the venue finished, on the venue's own base total.
+
+        ``filled_amount`` is the one base-denominated figure Gate.io states for
+        this order, and it states it when the order finishes. Restating the
+        quantity to it squares the bound the fills were applied against, so the
+        order records no remainder the venue never had.
+
+        The close itself has to be ``OrderCanceled``. ``OrderUpdated`` triggers
+        no state transition (``Order.apply``, model/orders/base.pyx:1069-1073),
+        so a restatement on its own leaves the order PARTIALLY_FILLED with
+        nothing left to fill — open for ever, and unreachable by reconciliation,
+        which returns "reconciled" for exactly this shape. ``PARTIALLY_FILLED ->
+        CANCELED`` is the transition the platform holds for the real-world case
+        (base.pyx:132-133), it preserves the filled quantity, and it states what
+        the venue did: a Gate.io spot market buy is IOC or FOK, so whatever the
+        cash did not buy was canceled rather than left working.
+
+        A fill still in flight on the trade stream is already covered. Gate.io
+        does not order ``spot.orders`` against ``spot.usertrades``, and
+        ``_handle_late_fill`` routes a fill arriving after a CANCELED close
+        through reconciliation — the ordinary IOC case for this venue.
+        """
+        if order.is_closed:
+            self._forget_order(order.client_order_id)
+            return
+
+        filled_base: Decimal | None = None
+        try:
+            filled_base = optional_exact_decimal(
+                payload,
+                "filled_amount",
+                what=f"spot order {payload.get('id')!r}",
+            )
+        except ValueError as e:
+            # The venue stated its base total and this client cannot read it.
+            # Restating on a guess would misstate the quantity, so the order is
+            # closed on what is certain — that the venue finished it — and the
+            # quantity is left to reconciliation.
+            self._log.error(
+                f"Cannot read the base total Gate.io states for {order.client_order_id!r}: "
+                f"{e}. The order is closed on the venue's word without restating its "
+                f"quantity, which the next reconciliation pass recovers",
+            )
+
+        stated = (self._cash_buy_bounds.get(order.client_order_id) or (None, None))[1]
+        if filled_base and filled_base > 0 and instrument is not None:
+            quantity = instrument.make_qty(filled_base)
+            if quantity.as_decimal() != stated:
+                self.generate_order_updated(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=venue_order_id,
+                    quantity=quantity,
+                    price=getattr(order, "price", None),
+                    trigger_price=None,
+                    ts_event=ts_event,
+                    is_quote_quantity=False,
+                )
+
+        self.generate_order_canceled(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=venue_order_id,
+            ts_event=ts_event,
+        )
+        self._forget_order(order.client_order_id)
 
     def _handle_balance_payload(self, product: GateioProductType, payload: dict[str, Any]) -> None:
         """Fold a balance change into the account state and publish it."""

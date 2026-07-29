@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A quote-denominated spot market buy is no longer left open for ever, and
+  no longer loses a fill** (`REC-09` in docs/review-matrix.md, found by live
+  validation against the real venue). Gate.io denominates a spot market buy
+  in the quote currency and states the base quantity it bought only when the
+  order finishes; the client used to restate the order on its first fill to
+  `cash / first_fill_price`. NautilusTrader decides an order's terminal state
+  by comparing its filled quantity against its quantity with no regard for
+  units and no tolerance, so that estimate governed the outcome — and against
+  a venue that publishes its own arithmetic it is wrong in both directions.
+  One increment high and no fill could ever complete the order: it stayed
+  open in the cache while the venue had finished it, reconciliation reported
+  it as already reconciled, and a cancel came back `ORDER_NOT_FOUND` and was
+  turned into a rejection that reopened it. One increment low and the
+  engine's overfill check discarded the venue's fill, so a trade that
+  happened was not booked. Across two price levels the estimate could not
+  come out right at all.
+
+  The order no longer carries an estimate. While it works, its quantity is a
+  bound built from the venue's own fill amounts — one size increment above
+  the base credited so far — so no fill can be discarded and none can close
+  the order before the venue says it is finished. When Gate.io finishes it,
+  its `filled_amount` replaces the bound and the order is closed with
+  `OrderCanceled`, preserving the filled quantity. A Gate.io spot market buy
+  is IOC or FOK, so whatever the cash did not buy was canceled rather than
+  left working — **a cash buy therefore ends `CANCELED` rather than `FILLED`
+  even when it spends all of its cash**, and its outcome is read from
+  `filled_qty` and the resulting position. Separately, a cash buy's
+  completion is now decided in quote units (`filled_total` against `amount`)
+  instead of across denominations, so it no longer depends on whether the
+  pair's base number happens to be larger than its quote number.
+
+- **Cancelling an order Gate.io no longer holds no longer reopens it**
+  (part of `REC-09`). The venue answers such a cancel with `ORDER_NOT_FOUND`,
+  `ORDER_CLOSED`, `ORDER_CANCELLED` or `ORDER_FINISHED`, and its own error
+  tables class these as benign idempotent races; because this client's
+  transport replays `DELETE`, one of them is also the ordinary answer to a
+  cancellation that worked. They were reported as `OrderCancelRejected`,
+  which the platform applies by reverting the order to its previous status —
+  so the order stood open here while the venue held nothing, and a strategy
+  re-quoting on the rejection would have replaced an order that no longer
+  existed. The client now re-reads the order and lets its own statement
+  decide, falling back to `OrderCanceled` only when the re-read cannot answer
+  at all; a partly filled order keeps its fills. `CANCEL_FAIL` and
+  `NO_CHANGE` still report a refusal, because neither says the order is gone.
+
 - **A recovered trade whose order the engine refused to adopt no longer
   crashes startup reconciliation** (`REC-08` in docs/review-matrix.md, found
   and closed by live validation against the real venue). The recovery

@@ -32,6 +32,7 @@ from nautilus_trader.model.events import (
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Price, Quantity
 
+from nautilus_gateio.common.enums import GateioProductType
 from nautilus_gateio.common.errors import (
     GateioClientError,
     GateioError,
@@ -324,10 +325,11 @@ class TestAmbiguousCancel:
         assert order.status == OrderStatus.PENDING_CANCEL
 
     def test_a_proven_refusal_is_still_a_cancel_reject(self, harness):
+        """A 4xx that names something other than a missing order is a refusal."""
         harness.spot.responses["cancel_order"] = GateioClientError(
-            404,
-            "ORDER_NOT_FOUND",
-            "no such order",
+            400,
+            "INVALID_PARAM_VALUE",
+            "bad currency pair",
         )
         order = harness.accepted(_limit_order(harness), "1001")
         _pending_cancel(harness, order)
@@ -337,7 +339,126 @@ class TestAmbiguousCancel:
 
         rejections = harness.events_of(OrderCancelRejected)
         assert len(rejections) == 1
-        assert "ORDER_NOT_FOUND" in rejections[0].reason
+        assert "INVALID_PARAM_VALUE" in rejections[0].reason
+        assert order.status == OrderStatus.ACCEPTED
+
+
+class TestCancelOfAnOrderTheVenueNoLongerHolds:
+    """``ORDER_NOT_FOUND`` on a cancel is not a refusal, and must not reopen the order.
+
+    ``Order.apply(OrderCancelRejected)`` reverts the order to its previous
+    status, so reporting this label as a refusal leaves the order open here
+    while Gate.io holds nothing — and a strategy that re-quotes on the
+    rejection replaces an order that no longer exists. Gate.io's own error
+    tables class these labels as benign idempotent races on cancel, and this
+    client's transport replays ``DELETE``, so the label is also the ordinary
+    answer to a cancellation that worked.
+    """
+
+    LABELS = ("ORDER_NOT_FOUND", "ORDER_CLOSED", "ORDER_CANCELLED", "ORDER_FINISHED")
+
+    @staticmethod
+    def _finished_order_payload(order: Any) -> dict[str, Any]:
+        return {
+            "id": "1001",
+            "id_string": "1001",
+            "currency_pair": "BTC_USDT",
+            "type": "limit",
+            "side": "buy",
+            "account": "spot",
+            "amount": "0.010000",
+            "left": "0.010000",
+            "filled_amount": "0",
+            "filled_total": "0",
+            "price": "60000.00",
+            "status": "cancelled",
+            "finish_as": "cancelled",
+            "text": f"t-{order.client_order_id.value}",
+            "update_time_ms": "1785000000001",
+        }
+
+    @pytest.mark.parametrize("label", LABELS)
+    def test_the_order_is_re_read_and_closed_on_its_own_statement(self, harness, label):
+        order = harness.accepted(_limit_order(harness), "1001")
+        harness.client._register_text(order.client_order_id, f"t-{order.client_order_id.value}")
+        harness.spot.responses["cancel_order"] = GateioClientError(404, label, "gone")
+        harness.spot.responses["get_order"] = self._finished_order_payload(order)
+        _pending_cancel(harness, order)
+
+        _cancel(harness, order)
+        harness.drain(order)
+
+        assert harness.events_of(OrderCancelRejected) == []
+        assert order.status == OrderStatus.CANCELED
+        assert harness.spot.called("get_order")
+
+    def test_an_unanswerable_re_read_still_closes_the_order(self, harness):
+        """The venue said it holds no live order; that much is not in doubt."""
+        order = harness.accepted(_limit_order(harness), "1001")
+        harness.spot.responses["cancel_order"] = GateioClientError(
+            404,
+            "ORDER_NOT_FOUND",
+            "gone",
+        )
+        harness.spot.responses["get_order"] = GateioServerError(502, "INTERNAL", "later")
+        _pending_cancel(harness, order)
+
+        _cancel(harness, order)
+        harness.drain(order)
+
+        assert harness.events_of(OrderCancelRejected) == []
+        assert order.status == OrderStatus.CANCELED
+
+    def test_a_partly_filled_order_keeps_its_fills_when_it_closes(self, harness):
+        """``PARTIALLY_FILLED -> CANCELED`` preserves the filled quantity."""
+        order = harness.accepted(_limit_order(harness), "1001")
+        harness.client._register_text(order.client_order_id, f"t-{order.client_order_id.value}")
+        harness.client._handle_fill_payload(
+            GateioProductType.SPOT,
+            {
+                "id": "TF-1",
+                "currency_pair": "BTC_USDT",
+                "order_id": "1001",
+                "side": "buy",
+                "amount": "0.004000",
+                "price": "60000.00",
+                "fee": "0.000004",
+                "fee_currency": "BTC",
+                "role": "maker",
+                "create_time_ms": "1785000000000",
+                "text": f"t-{order.client_order_id.value}",
+            },
+        )
+        harness.drain(order)
+        assert order.status == OrderStatus.PARTIALLY_FILLED
+
+        harness.spot.responses["cancel_order"] = GateioClientError(
+            404,
+            "ORDER_NOT_FOUND",
+            "gone",
+        )
+        harness.spot.responses["get_order"] = GateioServerError(502, "INTERNAL", "later")
+        _pending_cancel(harness, order)
+
+        _cancel(harness, order)
+        harness.drain(order)
+
+        assert order.status == OrderStatus.CANCELED
+        assert order.filled_qty == Quantity.from_str("0.004000")
+
+    @pytest.mark.parametrize("label", ("CANCEL_FAIL", "NO_CHANGE"))
+    def test_a_label_that_does_not_say_the_order_is_gone_is_still_a_refusal(self, harness, label):
+        """Reading "the cancel did not happen" as "the order is closed" is the
+        same defect pointing the other way.
+        """
+        harness.spot.responses["cancel_order"] = GateioClientError(400, label, "no")
+        order = harness.accepted(_limit_order(harness), "1001")
+        _pending_cancel(harness, order)
+
+        _cancel(harness, order)
+        harness.drain(order)
+
+        assert len(harness.events_of(OrderCancelRejected)) == 1
         assert order.status == OrderStatus.ACCEPTED
 
 
