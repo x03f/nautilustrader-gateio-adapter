@@ -137,7 +137,31 @@ NautilusTrader 1.230.0; the same ordering applies to every unimplemented
 | `request_trade_ticks` | REST `*/trades` | At most 1000 rows, filtered client-side to the `start`/`end` window (see the caveat below) |
 | `request_funding_rates` | REST `/futures/{settle}/funding_rate` | Perpetual only; at most 1000 records, filtered client-side to the `start`/`end` window; sorted oldest-first |
 | `request_order_book_snapshot` | REST `*/order_book` | Depth clamped to a value the product accepts; published as one `F_SNAPSHOT` batch |
-| `request_instrument` / `request_instruments` | Instrument provider | Loads on demand if not already cached |
+| `request_instrument` | Instrument provider | Loads that one instrument from the venue if it is not already cached |
+| `request_instruments` | Instrument provider | Answers with the provider's current contents; loads nothing |
+
+**Caveat on venue-wide instrument requests.** The plural form is a read of the
+provider, not a fetch. A client configured with
+`InstrumentProviderConfig(load_all=False)` and no `load_ids` therefore completes
+the request with an empty instruments response and no diagnostic — the request
+succeeds, and nothing arrives. Configure the provider with what the strategy
+needs, or ask for instruments one at a time. This is the same choice the Tardis,
+Polymarket and dYdX adapters make, all of them provider-backed; BitMEX, Kraken,
+OKX and Deribit take the other one and re-fetch from the venue on the plural
+request. Answering from the provider keeps one definition of an instrument in
+the process, which is what reconciliation and order validation both read.
+
+**How the platform answers an instrument request.** This surprises people, so it
+is worth stating: NautilusTrader 1.230.0 does not deliver instruments in the
+response. Every instrument is handled individually and published on
+`data.instrument.<venue>.*`, and the final `DataResponse` carries an empty data
+list — the data engine's response handling forces it for an `Instrument`
+response (`DataEngine._handle_response`, `data/engine.pyx`, verified against
+1.230.0). There is no plural instrument callback on `Actor` at all; the method
+of that name on the platform's own `DataTester` is never invoked by anything.
+Read the instruments in `on_instrument` as they arrive. A caller that counts
+what came back in the response will read zero no matter which adapter answered,
+and that is a property of the platform rather than of the venue behind it.
 
 **Caveat on historical trades.** The client asks the venue only for the most
 recent rows and applies `start`/`end` itself; it does not page backwards through
