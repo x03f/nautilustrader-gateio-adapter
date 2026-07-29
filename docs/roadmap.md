@@ -295,7 +295,10 @@ plan._
 
 Bounded live validation on the venue: the smallest orders that prove submission, acknowledgement,
 fill handling, cancellation, the conditional-order transition, balance and position convergence, and
-restart recovery. Account cleanliness checked before, between and after.
+restart recovery. Account cleanliness checked before, between and after. Live validation found and
+closed `REC-08` — a node start crashed when the recovery sweep read the engine's index entry for a
+filtered external order as a bookable one — recorded with the recovery findings in the
+[review matrix](review-matrix.md#recovery-findings-raised-after-this-review).
 
 _Exit: results recorded per product and account mode; every capability's status earned rather than
 assumed._

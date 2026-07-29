@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A recovered trade whose order the engine refused to adopt no longer
+  crashes startup reconciliation** (`REC-08` in docs/review-matrix.md, found
+  and closed by live validation against the real venue). The recovery
+  sweep's last-resort branch trusted the venue-order-id index as proof the
+  single-report channel could book, but the engine also writes that index
+  for an unclaimed external order it has just filtered
+  (`filter_unclaimed_external_orders`) without creating the order — and a
+  lone `FillReport` sent at such a dangling entry crashed the engine's
+  fallback lookup (`Cache.orders(side=None)`, `TypeError: an integer is
+  required`) instead of deferring, taking the whole startup mass status with
+  it: the node reported RUNNING with an unreconciled execution state. The
+  channel is now gated on the cached order object. An order the engine
+  declined to adopt keeps its executions excluded with it, logged per trade
+  — that refusal is the engine's configured ruling. A trade whose order
+  statement cannot be obtained at all now makes the pass refuse honestly
+  instead of returning a book that silently lacks a venue execution: the
+  startup mass status is refused (`None`, so the kernel declines to start
+  and the next attempt heals), the reconnect keeps its stale-but-honest
+  state, and the stream route logs the standing loss for the next
+  reconciliation to repair.
+
 - **The staleness protection now covers every trade a recovery pass books
   over prior knowledge, closing the two doors its arming rule left open**
   (`REC-07` in docs/review-matrix.md, found by the eighth round's audit).

@@ -1279,7 +1279,21 @@ class GateioExecutionClient(LiveExecutionClient):
         self._record_recovery_bookings(unbooked_before, known_before, positions_before)
 
         self._send_mass_status_report(mass_status)
-        await self._hand_over_unapplied_fills(fill_reports, listed_orders)
+        try:
+            await self._hand_over_unapplied_fills(fill_reports, listed_orders)
+        except FillReportsUnavailable as e:
+            # The sweep found a venue-named trade whose order statement did not
+            # come back readably. On this route the grouped hand-over above has
+            # already applied what it could; the remaining executions stand at
+            # the venue, and the next reconnect or restart re-reads the order
+            # and books them. Stale-but-honest, as with the failed trade
+            # listing above (REC-08).
+            self._log.error(
+                f"Cannot finish reconciling after the {product.value} reconnect: {e}. "
+                f"Keeping local state until a complete answer; the next reconnect or "
+                f"restart recovers it",
+            )
+            return
 
         self._log.info(
             f"Reconciled {len(order_reports)} order and {len(fill_reports)} fill reports after "
@@ -1358,6 +1372,11 @@ class GateioExecutionClient(LiveExecutionClient):
         that trade paid — a spot buy's fee is withheld in the base currency, so
         the position is overstated by it — and destroys the only key by which a
         later replay of that trade could be recognised.
+
+        Raises :class:`FillReportsUnavailable` when a venue-named trade cannot
+        be booked because no readable statement of its order could be obtained
+        at all (REC-08): each calling pass turns that into its own honest
+        refusal — a ``None`` startup mass status, a kept reconnect state.
         """
         unapplied: dict[VenueOrderId | None, list[FillReport]] = {}
         for report in fill_reports:
@@ -1403,10 +1422,11 @@ class GateioExecutionClient(LiveExecutionClient):
         external) and regardless of the net delta of the bookings. The
         memory then clears only on venue proof (see the reader). The set
         recorded is what the listings named, not what the in-call sweep
-        managed to book: on the restart route the sweep's single-order
-        re-read can go unanswered, and the trade is then booked moments
-        later by the engine's own reconciliation of the very mass status
-        this pass returns — after any post-sweep arming would have run. By
+        managed to book: a trade the sweep leaves unbooked with its order in
+        the cache is booked moments later by the engine's own reconciliation
+        of the very mass status this pass returns — after any post-sweep
+        arming would have run (and a sweep that cannot obtain any statement
+        of the order now refuses the whole mass status instead, REC-08). By
         the time a position answer is judged, a recorded trade is either in
         the cache (so agreement clears the memory) or genuinely missing from
         the book (so withholding is the correct fail-safe: the alternative
@@ -1874,14 +1894,43 @@ class GateioExecutionClient(LiveExecutionClient):
         (:1878-1910) implements: it creates the external order from the order
         report, indexes its venue order id, and only then applies the trades
         grouped under that id, each keeping its own ``trade_id`` and commission.
+
+        The gate is the cached order object, not the index (REC-08): the engine
+        indexes the ids of an order report it declined to adopt
+        (``filter_unclaimed_external_orders``, installed
+        live/execution_engine.py:1915-1925), and a lone fill sent at such a
+        dangling entry crashes in ``_find_order_by_venue_order_id(order_side=None)``
+        -> ``Cache.orders(side=None)`` — TypeError("an integer is required") —
+        instead of deferring. Only an order the cache actually holds can take a
+        single report; everything else goes the grouped route, whose
+        no-statement raise is caught here and logged as a standing loss, since
+        a stream-driven hand-over has no reconciliation pass to refuse.
         """
-        if self._cache.client_order_id(report.venue_order_id) is not None:
+        client_order_id = self._cache.client_order_id(report.venue_order_id)
+        if client_order_id is not None and self._cache.order(client_order_id) is not None:
             self._send_fill_report(report)
             return
         self.create_task(
-            self._hand_over_fills_with_their_order([report]),
+            self._hand_over_stream_fill(report),
             log_msg=f"hand_over_fill_{report.trade_id.value}",
         )
+
+    async def _hand_over_stream_fill(self, report: FillReport) -> None:
+        """Run the grouped hand-over for a stream fill, absorbing its refusal.
+
+        On the recovery routes a :class:`FillReportsUnavailable` from the
+        grouped hand-over makes the pass refuse (a ``None`` mass status, a
+        kept reconnect state). A stream fill has no pass to refuse — the next
+        reconciliation is the retry — so the raise becomes the loss report the
+        stream route owes and nothing else.
+        """
+        try:
+            await self._hand_over_fills_with_their_order([report])
+        except FillReportsUnavailable as e:
+            self._log.error(
+                f"Cannot book stream trade {report.trade_id.value}: {e}. The execution "
+                f"stands at the venue and is recovered by the next reconciliation pass",
+            )
 
     async def _hand_over_fills_with_their_order(self, reports: list[FillReport]) -> None:
         """Re-read one order and hand it over with every trade recovered for it.
@@ -1894,6 +1943,33 @@ class GateioExecutionClient(LiveExecutionClient):
         subset makes that comparison disagree by the trades left out, and the
         engine closes the difference with an inferred fill carrying a synthetic
         id and no commission — replacing real executions with a fabricated one.
+
+        When the grouped hand-over leaves trades unbooked, what remains depends
+        on one question — *does the cache hold the order object?* — and the
+        answer decides between three exits (REC-08):
+
+        * the order is cached: the single-report channel can attach the
+          executions, and does, loudly (the last-resort loop below);
+        * the order is not cached but the venue's statement was delivered: the
+          engine heard the statement and declined to adopt the order
+          (``filter_unclaimed_external_orders``), which is its configured
+          ruling — the executions are excluded with their order and the
+          exclusion is logged, never overridden and never escalated;
+        * neither order nor statement: the trade is stated by the venue and
+          cannot be attributed honestly, so this method raises
+          :class:`FillReportsUnavailable` for the calling pass to refuse —
+          the startup sweep turns it into a refused mass status, the reconnect
+          keeps its stale-but-honest state, and the stream route logs the
+          standing loss for the next reconciliation to repair.
+
+        The index alone decides nothing. Live validation caught the previous
+        reading — "the order is at least indexed, so the single-report path can
+        still attach the executions" — booking a lone fill at an index entry the
+        engine had written for an order it refused to create, which crashed the
+        whole mass status inside ``Cache.orders(side=None)`` (see the comment at
+        the check below). A dangling index is the engine's filtering read back
+        as a promise: the swallowed-refusal-as-presence shape again, one level
+        up from the payload readers.
         """
         if not reports:
             return
@@ -1927,25 +2003,62 @@ class GateioExecutionClient(LiveExecutionClient):
         if not unbooked:
             return
 
-        if self._cache.client_order_id(first.venue_order_id) is None:
-            for report in unbooked:
-                self._log.error(
-                    f"Trade {report.trade_id.value} on {report.instrument_id} cannot be booked: "
-                    f"Gate.io did not answer for order {report.venue_order_id!r}, and the "
-                    f"execution engine discards a fill report whose venue order id it has never "
-                    f"seen. {report.last_qty} at {report.last_px} is traded and missing from "
-                    f"the position",
-                )
-            return
+        # What the last-resort single-report channel needs is the cached order
+        # OBJECT, and a bare index entry is not one. The engine indexes the ids
+        # of an order report it has just declined to adopt —
+        # `_reconcile_execution_mass_status` (installed
+        # live/execution_engine.py:1915-1925) writes `add_venue_order_id` after
+        # `filter_unclaimed_external_orders` dropped the order inside
+        # `_generate_order` — so "indexed" proves only that the engine has heard
+        # the id. A lone fill sent at such a dangling entry does not defer: the
+        # engine resolves the index, misses the order, and falls into
+        # `_find_order_by_venue_order_id(order_side=None)`, whose
+        # `Cache.orders(side=None)` call the Cython signature refuses with
+        # TypeError("an integer is required") — the crash that took down live
+        # startup reconciliation (REC-08).
+        client_order_id = self._cache.client_order_id(first.venue_order_id)
+        order = self._cache.order(client_order_id) if client_order_id is not None else None
+
+        if order is None:
+            if order_report is not None:
+                # Gate.io delivered its statement, the grouped hand-over offered
+                # it, and the engine declined to adopt the order — its configured
+                # ruling on unclaimed external orders (or an instrument it does
+                # not carry). The executions are excluded together with their
+                # order; recording that ruling is honest, overriding it is not.
+                for report in unbooked:
+                    self._log.warning(
+                        f"Trade {report.trade_id.value} of {report.last_qty} at "
+                        f"{report.last_px} on {report.instrument_id} is not booked: the "
+                        f"execution engine did not adopt the venue's statement of order "
+                        f"{report.venue_order_id!r} (unclaimed external orders can be "
+                        f"filtered by configuration), so the execution is excluded "
+                        f"together with its order",
+                    )
+                return
+            # No statement and no order: Gate.io names this trade, was asked for
+            # the order it belongs to, and no readable statement came back.
+            # Nothing can book the execution honestly — the engine discards a
+            # fill report whose venue order id it has never seen — so the
+            # failure is raised for the calling pass to refuse. An unanswered
+            # question is not the absence of the trade.
+            raise FillReportsUnavailable(
+                f"Gate.io did not deliver a readable statement of order "
+                f"{first.venue_order_id!r} for recovered trade(s) "
+                f"({', '.join(report.trade_id.value for report in unbooked)}); "
+                f"{', '.join(f'{report.last_qty} at {report.last_px}' for report in unbooked)} "
+                f"on {first.instrument_id} cannot be booked without it",
+                unbooked,
+            )
 
         # The grouped hand-over did not book them either — the re-read answered
         # with a status that short-circuits the trade loop, or the engine's
         # duplicate filter removed the order report and its trades with it. The
-        # order is at least indexed, so the single-report path can still attach
-        # the executions. It is taken last and never silently: the order may be
-        # left with a quantity it can no longer reach, and an execution recorded
-        # against an order that stays open is a smaller loss than an execution
-        # not recorded at all.
+        # order itself is in the cache, so the single-report path can still
+        # attach the executions. It is taken last and never silently: the order
+        # may be left with a quantity it can no longer reach, and an execution
+        # recorded against an order that stays open is a smaller loss than an
+        # execution not recorded at all.
         for report in unbooked:
             self._log.error(
                 f"Trade {report.trade_id.value} of {report.last_qty} at {report.last_px} on "
@@ -4985,7 +5098,18 @@ class GateioExecutionClient(LiveExecutionClient):
                 position.instrument_id for position in self._cache.positions_open(venue=None)
             }
             self._record_recovery_bookings(unbooked_before, known_before, positions_before)
-            await self._hand_over_unapplied_fills(unbooked_before, listed_orders)
+            try:
+                await self._hand_over_unapplied_fills(unbooked_before, listed_orders)
+            except FillReportsUnavailable as e:
+                # A venue-named execution whose order statement was asked for
+                # and not delivered readably: booking without it fabricates,
+                # and returning a mass status that silently lacks it reports
+                # success over a book that is missing money. The platform
+                # posture again (REC-08): refuse the whole mass status and let
+                # the kernel refuse to start; the next attempt re-reads the
+                # order and heals.
+                self._log.exception("Cannot reconcile execution state", e)
+                return None
             booked_now = [r for r in unbooked_before if self._fill_is_booked(r)]
             orders = self._prune_reports_the_sweep_outran(orders, booked_now)
 

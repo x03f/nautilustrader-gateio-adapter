@@ -818,6 +818,23 @@ be applied against whatever quantity the local order still carries, and since
 `OrderUpdated` triggers no state transition, an order whose quantity the venue
 has moved on from could never reach a terminal status again.
 
+What remains after that grouped re-offer is decided by whether the cache holds
+the order *object* — never by the venue-order-id index alone, which the engine
+also writes for an order it has just declined to adopt
+(`filter_unclaimed_external_orders` drops an unclaimed external order and
+indexes its ids anyway; live validation caught a lone fill sent at exactly that
+dangling entry crashing the whole startup mass status, `REC-08` in the
+[review matrix](review-matrix.md#recovery-findings-raised-after-this-review)).
+Three exits: an order the cache holds takes the remaining trades over the
+single-report channel, loudly; a statement the engine heard and declined leaves
+the executions excluded together with their order, logged per trade, because
+that refusal is the engine's configured ruling; and a trade whose order
+statement could not be obtained at all makes the pass refuse honestly —
+`FillReportsUnavailable` turns into a `None` startup mass status (the kernel
+declines to start and the next attempt re-reads and heals), a kept
+reconnect state, or a logged standing loss on the stream route, which has no
+pass to refuse.
+
 The sweep now runs on both routes: after the grouped hand-over on a reconnect,
 and inside `generate_mass_status` on a restart — before the engine has
 reconciled anything, which is the ordering the withdrawn repair below got

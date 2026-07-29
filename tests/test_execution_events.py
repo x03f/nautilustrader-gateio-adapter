@@ -2458,3 +2458,245 @@ class TestStartupRecoverySweep:
         kept = env.client._prune_reports_the_sweep_outran([stale, untouched], [booked_fill])
 
         assert kept == [untouched]
+
+
+class TestRecoveredTradeWithoutAdoptedOrder:
+    """Regression (REC-08): a dangling venue-order-id index is not an order.
+
+    Live validation caught the pairing every offline round had missed: the
+    engine, configured with ``filter_unclaimed_external_orders=True``, drops an
+    unclaimed external order inside ``_generate_order`` and *still* indexes its
+    client/venue order ids afterwards (``_reconcile_execution_mass_status``,
+    installed live/execution_engine.py:1915-1925). The recovery sweep then read
+    that bare index entry as proof the single-report channel could book, and
+    the lone ``FillReport`` it sent crashed the engine instead of deferring:
+    ``_reconcile_fill_report_single`` resolves the index, misses the order and
+    calls ``_find_order_by_venue_order_id(order_side=None)``, whose
+    ``Cache.orders(side=None)`` the Cython signature refuses with
+    ``TypeError("an integer is required")``. The TypeError escaped
+    ``generate_mass_status``, the engine logged "Failed to generate mass
+    status", and the node started without a reconciled execution state.
+    """
+
+    FOREIGN_TEXT = "t-O-20260729-043212-002-002-1"
+    FOREIGN_ORDER_ID = "910001"
+
+    @classmethod
+    def _foreign_settled_order_payload(cls) -> dict[str, Any]:
+        """The venue's statement of a spot cash market buy another run settled."""
+        return {
+            "id": cls.FOREIGN_ORDER_ID,
+            "text": cls.FOREIGN_TEXT,
+            "currency_pair": "BTC_USDT",
+            "type": "market",
+            "account": "spot",
+            "side": "buy",
+            "amount": "590",  # quote cash, as Gate.io states a market buy
+            "price": "0",
+            "status": "closed",
+            "time_in_force": "ioc",
+            "left": "0.01",
+            "filled_amount": "0.010000",
+            "avg_deal_price": "59000.00",
+            "fee": "0.0000098",
+            "fee_currency": "BTC",
+            "create_time": RECENT_SECS - 3600,
+            "update_time": RECENT_SECS - 3599,
+        }
+
+    @classmethod
+    def _foreign_settled_trade_payload(cls) -> dict[str, Any]:
+        return {
+            "id": "T-FOREIGN",
+            "currency_pair": "BTC_USDT",
+            "order_id": cls.FOREIGN_ORDER_ID,
+            "side": "buy",
+            "amount": "0.010000",
+            "price": "59000.00",
+            "fee": "0.0000098",
+            "fee_currency": "BTC",
+            "role": "taker",
+            "create_time_ms": str((RECENT_SECS - 3599) * 1000),
+            "text": cls.FOREIGN_TEXT,
+        }
+
+    @classmethod
+    def _wire_foreign_history(cls, env: ExecHarness) -> None:
+        """A fresh account whose trade listing names one settled foreign trade."""
+        env.spot.responses["open_orders"] = []
+        env.spot.responses["list_price_orders"] = []
+        env.spot.responses["list_orders"] = []
+        env.spot.responses["my_trades"] = lambda **kwargs: (
+            [cls._foreign_settled_trade_payload()] if kwargs.get("page", 1) == 1 else []
+        )
+        env.spot.responses["get_order"] = cls._foreign_settled_order_payload()
+
+    @classmethod
+    def _foreign_fill_report(cls, env: ExecHarness) -> Any:
+        instrument = env.cache.instrument(SPOT_BTC_USDT)
+        return env.client._parse_fill_report(
+            GateioProductType.SPOT,
+            cls._foreign_settled_trade_payload(),
+            instrument,
+        )
+
+    @staticmethod
+    def _seed_dangling_index(env: ExecHarness, client_order_id_value: str, venue_id: str) -> None:
+        """The cache state the engine's filtered-external-order path leaves behind."""
+        from nautilus_trader.model.identifiers import ClientOrderId
+
+        env.cache.add_venue_order_id(
+            client_order_id=ClientOrderId(client_order_id_value),
+            venue_order_id=VenueOrderId(venue_id),
+        )
+
+    def test_the_live_crash_a_filtered_external_order_no_longer_kills_the_mass_status(
+        self,
+        spot_harness,
+    ):
+        """The exact live pairing, against the real installed engine.
+
+        Pre-fix this raised ``TypeError: an integer is required`` out of
+        ``generate_mass_status`` — the crash the live node logged as "Failed
+        to generate mass status" before starting unusable.
+        """
+        from nautilus_trader.live.config import LiveExecEngineConfig
+        from nautilus_trader.live.execution_engine import LiveExecutionEngine
+        from nautilus_trader.model.identifiers import ClientOrderId
+
+        env = spot_harness
+        # The harness endpoints make way for the real engine's own.
+        env.msgbus.deregister(endpoint="ExecEngine.process", handler=env.events.append)
+        env.msgbus.deregister(
+            endpoint="ExecEngine.reconcile_execution_report",
+            handler=env.reports.append,
+        )
+        engine = LiveExecutionEngine(
+            loop=env.loop,
+            msgbus=env.msgbus,
+            cache=env.cache,
+            clock=env.clock,
+            config=LiveExecEngineConfig(filter_unclaimed_external_orders=True),
+        )
+        engine.register_client(env.client)
+        self._wire_foreign_history(env)
+
+        mass_status = env.run(env.client.generate_mass_status(None))
+
+        # The mass status survives, carrying the venue's own answers.
+        assert mass_status is not None
+        assert [
+            fill.trade_id for fill in mass_status.fill_reports[VenueOrderId(self.FOREIGN_ORDER_ID)]
+        ] == [TradeId("T-FOREIGN")]
+
+        # The engine's filtering left exactly the state the old sweep misread:
+        # the ids indexed, the order never created. Documented here because it
+        # is the whole mechanism of the defect.
+        indexed = env.cache.client_order_id(VenueOrderId(self.FOREIGN_ORDER_ID))
+        assert indexed == ClientOrderId("O-20260729-043212-002-002-1")
+        assert env.cache.order(indexed) is None
+
+        # And the engine's own front-door reconciliation of the returned mass
+        # status must not crash on the excluded trade either.
+        assert engine._reconcile_execution_mass_status(mass_status) is True
+
+    def test_a_dangling_index_entry_is_not_read_as_a_bookable_order(self, spot_harness):
+        """No lone ``FillReport`` may be sent where only the index answers.
+
+        Pre-fix the sweep sent one ("could only be booked without the venue's
+        statement"), which is precisely the send that crashed live: the
+        single-report channel cannot resolve an order the engine refused to
+        create.
+        """
+        env = spot_harness
+        mass_statuses: list[Any] = []
+        env.msgbus.register(
+            endpoint="ExecEngine.reconcile_execution_mass_status",
+            handler=mass_statuses.append,
+        )
+        self._wire_foreign_history(env)
+        self._seed_dangling_index(env, "O-20260729-043212-002-002-1", self.FOREIGN_ORDER_ID)
+        fill = self._foreign_fill_report(env)
+
+        env.run(env.client._hand_over_fills_with_their_order([fill]))
+
+        # The grouped offer went out with the venue's statement; nothing was
+        # sent over the channel that cannot book it.
+        assert len(mass_statuses) == 1
+        assert env.reports == []
+
+    def test_an_unobtainable_order_statement_refuses_the_startup_mass_status(
+        self,
+        spot_harness,
+    ):
+        """Asked-and-unanswered is a refusal, not a silently lighter book.
+
+        Pre-fix the sweep logged the loss and returned a mass status that
+        simply lacked the venue's execution: reconciliation reported success
+        over a book missing money. The platform posture for an unanswerable
+        listing — refuse the whole mass status, let the kernel decline to
+        start, heal on the next attempt — applies to the one-order statement
+        a recovered trade cannot be booked without.
+        """
+        env = spot_harness
+        self._wire_foreign_history(env)
+        env.spot.responses["get_order"] = GateioClientError(404, "ORDER_NOT_FOUND", "not found")
+
+        mass_status = env.run(env.client.generate_mass_status(None))
+
+        assert mass_status is None
+        assert env.reports == []  # nothing half-booked on the way down
+
+    def test_the_reconnect_sweep_keeps_state_when_the_statement_is_unobtainable(
+        self,
+        spot_harness,
+    ):
+        """The reconnect route has no mass status to refuse: it keeps its state.
+
+        The grouped hand-over has already applied what it could; the raise from
+        the sweep is absorbed into the same stale-but-honest posture as a
+        failed trade listing, and the next reconnect or restart re-reads the
+        order.
+        """
+        env = spot_harness
+        mass_statuses: list[Any] = []
+        env.msgbus.register(
+            endpoint="ExecEngine.reconcile_execution_mass_status",
+            handler=mass_statuses.append,
+        )
+        env.spot.responses["accounts"] = []
+        self._wire_foreign_history(env)
+        env.spot.responses["get_order"] = GateioClientError(404, "ORDER_NOT_FOUND", "not found")
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.SPOT))
+
+        # The grouped pass delivered the listings; the unanswerable statement
+        # neither crashed the pass nor produced a lone fill report.
+        assert len(mass_statuses) == 1
+        assert [type(r).__name__ for r in env.reports] == []
+
+    def test_a_stream_fill_at_a_dangling_index_goes_the_grouped_route(self, spot_harness):
+        """The runtime twin of the startup crash, closed by the same gate.
+
+        ``_hand_over_fill`` used to send a lone ``FillReport`` whenever the
+        index answered — the same dangling entry would crash the engine from
+        the WebSocket path at runtime, after startup had already survived.
+        """
+        env = spot_harness
+        mass_statuses: list[Any] = []
+        env.msgbus.register(
+            endpoint="ExecEngine.reconcile_execution_mass_status",
+            handler=mass_statuses.append,
+        )
+        self._wire_foreign_history(env)
+        self._seed_dangling_index(env, "O-20260729-043212-002-002-1", self.FOREIGN_ORDER_ID)
+        fill = self._foreign_fill_report(env)
+
+        env.client._hand_over_fill(fill)
+        env.run(_drain_tasks(env))
+
+        # The grouped route asked the venue for the order; the lone-report
+        # channel that cannot resolve it was never used.
+        assert env.spot.called("get_order")
+        assert len(mass_statuses) == 1
+        assert env.reports == []
