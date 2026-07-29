@@ -378,6 +378,7 @@ in public-data-only mode. Values are stripped of surrounding whitespace.
 | [configuration.md](docs/configuration.md) | Complete field reference for both config classes |
 | [market-data.md](docs/market-data.md) | Subscriptions, requests, order book synchronisation |
 | [execution.md](docs/execution.md) | Order translation, every rejection path, reconciliation |
+| [errors.md](docs/errors.md) | Every exception raised on purpose, and who handles it — you or the engine |
 | [migration-0.1-to-0.2.md](docs/migration-0.1-to-0.2.md) | Every breaking change from 0.1.0 |
 | [validation.md](docs/validation.md) | What has actually been exercised, and where |
 | [testing.md](docs/testing.md) | Running the suite, coverage areas, credentialed-test rules |

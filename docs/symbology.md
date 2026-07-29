@@ -17,11 +17,26 @@ loaded through other NautilusTrader components. Version 0.1.0 of this adapter
 used `GATEIO`; see the [migration guide](migration-0.1-to-0.2.md).
 
 ```python
-from nautilus_gateio import GATEIO, GATEIO_VENUE
+from nautilus_gateio import GATEIO, GATEIO_CLIENT_ID, GATEIO_VENUE
 
-GATEIO        # "GATE_IO"
-GATEIO_VENUE  # Venue("GATE_IO")
+GATEIO           # "GATE_IO"
+GATEIO_VENUE     # Venue("GATE_IO")
+GATEIO_CLIENT_ID # ClientId("GATE_IO")
 ```
+
+The three constants are the same string wearing the three types the platform
+asks for it in:
+
+* `GATEIO` is the registration key — the `name` you pass to
+  `node.add_data_client_factory(GATEIO, ...)` and
+  `node.add_exec_client_factory(GATEIO, ...)`.
+* `GATEIO_VENUE` is the `Venue`, for anything venue-scoped: building an
+  `InstrumentId` by hand, filtering cache queries.
+* `GATEIO_CLIENT_ID` is the `ClientId`, for commands that address a specific
+  client. The factories create each client with `ClientId(name)` — the id *is*
+  the registration name — so `GATEIO_CLIENT_ID` matches whenever you registered
+  under the conventional `GATEIO` key. Register under a different name and the
+  client id follows that name instead.
 
 ## Instrument id per product
 
@@ -73,7 +88,8 @@ anything else                      ->  SPOT
 
 The settlement currency of a perpetual follows from the quote currency: a `USD`
 quote is BTC-settled (`settle=btc`), everything else is USDT-settled
-(`settle=usdt`).
+(`settle=usdt`). `GateioProductType.settle` returns exactly that path
+parameter.
 
 ## API
 
@@ -93,6 +109,8 @@ gateio_to_instrument_id(GateioProductType.PERP, "BTC_USDT")
 
 instrument_id_to_gateio("BTC_USDT-PERP.GATE_IO")
 # (GateioProductType.PERP, "BTC_USDT")
+instrument_id_to_gateio("BTC_USD-PERP.GATE_IO")
+# (GateioProductType.INVERSE, "BTC_USD")
 
 product_of("BTC_USDT_20260807.GATE_IO")     # GateioProductType.FUT
 raw_symbol_of("BTC_USDT-PERP.GATE_IO")      # "BTC_USDT"
@@ -104,8 +122,35 @@ parse_delivery_symbol("BTC_USDT_20260807")
 # ("BTC_USDT", "20260807")
 ```
 
-`instrument_id_to_gateio` raises `ValueError` on an empty or malformed symbol
-rather than guessing.
+`gateio_to_instrument_id(product, raw_symbol)` builds the canonical id: the
+venue symbol upper-cased, `-PERP` appended when the product is a perpetual, and
+the `GATE_IO` venue unless you pass another. `instrument_id_to_gateio` is its
+inverse and accepts either an `InstrumentId` or its string: it strips the
+venue, removes the `-PERP` marker if present, and infers the product from the
+symbol's shape — which is why the two directions never disagree. `product_of`
+and `raw_symbol_of` are the two halves of that answer individually.
+
+The `parse_*` symbol helpers decompose the two symbol shapes that carry
+structure: `parse_option_symbol` returns
+`(underlying, expiry, strike, is_call)` and `parse_delivery_symbol` returns
+`(pair, expiry)`, and both raise `ValueError` on a symbol that is not in the
+stated form. `instrument_id_to_gateio` (and through it `product_of` and
+`raw_symbol_of`) raises `ValueError` on an empty symbol; a non-empty symbol
+that matches none of the structured shapes is a spot pair by the inference rule
+above, not an error.
+
+Two more helpers live in `nautilus_gateio.common.symbols` without a top-level
+export, because ordinary code goes through the pair above: `nautilus_symbol`
+(the symbol string alone, without the venue) and `product_from_raw_symbol` (the
+inference rule, with a `perpetual` flag to disambiguate the one case the
+symbol alone cannot).
+
+The similarly named `parse_instrument` / `parse_spot_instrument` /
+`parse_perpetual_instrument` / `parse_delivery_instrument` /
+`parse_option_instrument` are a different layer: they build full Nautilus
+instrument definitions from Gate.io API payloads, applying
+`gateio_to_instrument_id` for the id, and belong to instrument loading (see
+[products.md](products.md)) rather than symbology.
 
 ## Quantity semantics
 

@@ -5028,10 +5028,12 @@ class GateioExecutionClient(LiveExecutionClient):
         the failure and returning the rest is indistinguishable from "the
         venue holds no such orders": a cached order the missing row would have
         closed then stays open locally with only a debug line downstream, an
-        open/closed disagreement with the venue (REC-06). The raise cannot
-        fabricate anywhere it lands: the startup path refuses the mass status
-        (kernel refuses to start), the open-order check skips one cycle, and
-        the single-order path answers ``None``.
+        open/closed disagreement with the venue (REC-06). Where the raise
+        lands: the startup path refuses the mass status (kernel refuses to
+        start), the single-order path answers ``None``, and the open-order
+        check swallows it per client and proceeds on an empty answer — see
+        :class:`OrderReportsUnavailable` for the non-default configuration in
+        which that empty answer can still fabricate.
 
         A wallet Gate.io has not created is not a failure: it holds no orders,
         which is a definite answer of none.
