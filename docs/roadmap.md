@@ -295,11 +295,12 @@ plan._
 
 Done for the alpha, and deliberately not finished. Bounded live validation ran on mainnet at the
 smallest size each instrument permits, with account cleanliness checked before, between and after.
-It confirmed the market-data paths, the spot execution path end to end, and one USDT perpetual for a
-short series of orders — and it left the derivatives beyond that perpetual, every margin ledger and
-the adoption of venue state into a fresh cache unproven at the venue. Every result, including the
-runs that failed and the recorded checks that turned out not to check what they claimed, is in the
-[validation status](validation.md).
+It confirmed the market-data paths, the spot execution path end to end, a series of orders on one
+USDT perpetual including a position read back from the venue by a node that had not opened it, and
+three orders on one option contract — and it left inverse perpetuals, delivery futures, every margin
+ledger and the adoption of a resting order into a fresh cache unproven at the venue. Every result,
+including the runs that failed and the recorded checks that turned out not to check what they
+claimed, is in the [validation status](validation.md).
 
 The runs paid for themselves in defects: `REC-08`, where a node start crashed because the recovery
 sweep read the engine's index entry for a filtered external order as a bookable one, and `REC-09`,

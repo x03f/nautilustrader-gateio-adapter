@@ -18,8 +18,8 @@ package for NautilusTrader 1.230.0, written in pure Python, not an official
 integration: it deliberately departs from the preferred in-tree Rust and PyO3
 adapter architecture, and no migration to that architecture is promised. And it
 is an alpha release — suitable for evaluation and controlled use, with live
-validation that reaches spot, and one USDT perpetual for a short series of
-orders, and stops there ([validation status](validation.md)).
+validation that reaches spot, one USDT perpetual and one option contract, and
+stops there ([validation status](validation.md)).
 
 ```python
 from nautilus_gateio import GateioProductType, GateioSpotAccountMode
@@ -44,11 +44,13 @@ Live exercise is graded separately, and only on one page:
 [validation status](validation.md). In short: the spot market-data paths are
 confirmed on mainnet, as are the instrument load on every configured product and
 the ticker-derived streams on the USDT perpetual; on the execution side, **spot,
-plus one USDT perpetual** — a market sell, its reduce-only close, a reduce-only
-order the venue refused, and conditional orders armed, cancelled and re-armed
-without ever firing. No order has been sent to Gate.io for an inverse perpetual,
-a delivery contract or an option, and no margin, cross-margin or unified spot
-ledger has carried one. A row below saying *implemented and mock-tested* is
+one USDT perpetual and one option contract** — on the perpetual both position
+sides, the reduce-only flag and its refusal, conditional orders armed, cancelled
+and re-armed without ever firing, and a position read back from the venue by a
+node that did not open it; on the option a resting limit buy, an aggressive one
+that filled, and a covered limit sell. No order has been sent to Gate.io for an
+inverse perpetual or a delivery contract, and no margin, cross-margin or unified
+spot ledger has carried one. A row below saying *implemented and mock-tested* is
 making no claim whatsoever about the venue.
 
 | Status | Meaning here |

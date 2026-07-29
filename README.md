@@ -12,7 +12,7 @@ margin, perpetual futures (linear and inverse), delivery futures and options,
 over the Gate.io API v4 REST and WebSocket interfaces.
 
 This project is not affiliated with, maintained by, or endorsed by Gate.io or
-Nautech Systems. Current maturity is **alpha (v0.2.0)**, developed against
+Nautech Systems. Current maturity is **alpha (v0.2.0a1)**, developed against
 `nautilus_trader` 1.230.0 on Python 3.13.
 
 Upgrading from 0.1.0? Read the
@@ -40,8 +40,9 @@ instrument ids and the execution environment default all changed.
   instead of reporting flat, a failed fill query is raised to the engine, and
   an unfinished quote-denominated spot market buy no longer restates the order
   to a partial figure. [execution.md](docs/execution.md) states each mechanism,
-  the residual risks, and the repair that was tried first and withdrawn;
-  everything is offline-proven only, mainnet validation pending.
+  the residual risks, and the repair that was tried first and withdrawn. A node
+  that had never seen the account has read an open perpetual position back out
+  of the venue and traded it flat; the rest is offline-proven only.
 * **Usable standalone.** The async REST transport with its typed per-product
   namespaces, and the self-healing WebSocket clients, work without a Nautilus
   node.
@@ -62,18 +63,17 @@ the successes in [docs/validation.md](docs/validation.md) — including two runs
 that ended with an order still resting at the venue, after cancelling everything
 that had been resting when they began to stop.
 
-On the derivative side the venue has seen orders on one USDT perpetual and
-nothing else: a market sell that opened a short, a reduce-only order that closed
-it, a reduce-only order with no position that the venue refused, stop-market and
-market-if-touched pairs armed and then cancelled without firing, and an armed
-stop cancelled and re-placed at a new trigger ten times over. **Everything else
-on the derivatives is offline evidence only** — inverse perpetuals, delivery
-futures and options have never had an order sent, and neither has any margin,
-cross-margin or unified spot ledger. Of the start-up path, the venue has
-answered this client's order status report and mass status; adopting that state
-into a fresh cache, and restart recovery with it, remain offline evidence only.
+On the derivative side the venue has seen orders on one USDT perpetual and one
+option contract. The perpetual carried both position sides, the reduce-only flag
+and its refusal, conditional orders armed and re-armed without firing, and a
+long that a second node read back out of the venue and flattened. The option
+took a resting limit buy, an aggressive one that filled, and a limit sell
+covered by the resulting long. **Everything else on the derivatives is offline
+evidence only** — inverse perpetuals and delivery futures have never had an
+order sent, and neither has any margin, cross-margin or unified spot ledger.
 Nothing is marked *Stable*: one recorded run shows that a path works, not that
-it keeps working.
+it keeps working, and one shutdown path here came out two ways in four runs of
+the same code.
 
 Use it for evaluation and controlled use. Start on the testnet, then start
 small, and verify anything you are about to trust with money.
@@ -114,8 +114,8 @@ venue has never seen that path.
 | **Implemented — mainnet validation pending** | Implemented, but the offline suite does not assert this end to end, and no live run covers it |
 | **Unsupported** | Not implemented |
 
-No feature is marked *Stable*. Several spot rows have been confirmed on mainnet,
-but a single recorded run is not evidence of stability — see
+No feature is marked *Stable*. Many rows below have now been confirmed on
+mainnet, but a single recorded run is not evidence of stability — see
 [why nothing is marked Stable](docs/validation.md#why-nothing-is-marked-stable).
 
 ### Market data
@@ -150,18 +150,18 @@ but a single recorded run is not evidence of stability — see
 
 | Feature | Spot | Perpetual | Inverse | Delivery | Options | Status | Mainnet |
 |---|---|---|---|---|---|---|---|
-| MARKET | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (buy, closing sell, both time-in-force families, quote-denominated buy); USDT perpetual (sell opening a short) |
-| LIMIT (GTC / IOC / FOK) | yes | yes | yes | yes | GTC/IOC | Implemented — mock-tested | spot (both sides accepted; aggressive IOC and FOK filled, passive IOC cancelled, passive FOK rejected) |
+| MARKET | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (buy, closing sell, both time-in-force families, quote-denominated buy); USDT perpetual (a sell opening a short, a buy opening a long, and a two-contract sell flipping one to the other) |
+| LIMIT (GTC / IOC / FOK) | yes | yes | yes | yes | GTC/IOC | Implemented — mock-tested | spot (both sides accepted; aggressive IOC and FOK filled, passive IOC cancelled, passive FOK rejected); options (a passive buy cancelled, an aggressive IOC buy filled, a covered passive sell cancelled) |
 | Post-only (`poc`, GTC only) | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (accepted when passive; rejected by the venue when it would cross) |
 | STOP_MARKET / STOP_LIMIT | yes | yes | yes | yes | no | Implemented — mock-tested | spot (STOP_LIMIT, buy side only) and USDT perpetual (STOP_MARKET, both sides, plus cancel-replace of the armed order); nothing triggered |
 | MARKET_IF_TOUCHED / LIMIT_IF_TOUCHED | yes | yes | yes | yes | no | Implemented — mock-tested | spot (LIMIT_IF_TOUCHED, buy side only) and USDT perpetual (MARKET_IF_TOUCHED, both sides), armed and cancelled; nothing triggered |
-| Reduce-only | n/a | yes | yes | yes | yes | Implemented — mock-tested | USDT perpetual (closed a short; refused by the venue with no position open) |
+| Reduce-only | n/a | yes | yes | yes | yes | Implemented — mock-tested | USDT perpetual (closed a short, and refused by the venue with no position open) |
 | Iceberg (`display_qty`, non-zero) | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (accepted carrying its display quantity) |
 | Quote-denominated quantity | market buy | no | no | no | no | Implemented — mock-tested | spot (filled, reported back in base units) |
-| Cancel / cancel-all / batch cancel | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (single cancel, repeated cancel, cancel-replace and cancel-all, each clearing what was resting); the batch endpoint has no live run, and two runs ended with an order submitted after the sweep still resting |
+| Cancel / cancel-all / batch cancel | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (single cancel, repeated cancel, cancel-replace and cancel-all, each clearing what was resting); options (a resting buy and a resting sell cancelled); the batch endpoint has no live run, and two shutdowns left behind an order submitted after the sweep |
 | Modify (amend) | yes | yes | yes | no | no | Partial (delivery and options reject explicitly) | spot (price amendment acknowledged) |
 | Private WebSocket lifecycle | yes | yes | yes | yes | yes | Implemented — mock-tested | — |
-| Order status / fill / position reports | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (a fresh node's mass status answered from the venue, carrying the order left resting for it); what the engine then does with such a report has no live run |
+| Order status / fill / position reports | yes | yes | yes | yes | yes | Implemented — mock-tested | spot and USDT perpetual (a fresh node's mass status answered from the venue: order, fill and position reports for state it had never seen). The perpetual's position was adopted into that node's cache; the orders were filtered by the platform as unclaimed, so order adoption has no live run |
 | Internal wallet transfers | yes | yes | yes | yes | yes | Implemented — mock-tested | — |
 | Hedge (dual) position mode | n/a | refused | refused | refused | n/a | Unsupported (detected and refused, never switched) | n/a |
 
@@ -170,7 +170,7 @@ but a single recorded run is not evidence of stability — see
 | Feature | Status | Mainnet | Notes |
 |---|---|---|---|
 | Cash account (spot only, plain ledger) | Implemented — mock-tested | spot | Every recorded live order ran on this account type |
-| Margin account (any other product combination) | Implemented — mock-tested | USDT perpetual (every derivative order listed below) | One Nautilus account, wallets aggregated per currency |
+| Margin account (any other product combination) | Implemented — mock-tested | USDT perpetual and options (every derivative order listed below ran on a `MARGIN` account) | One Nautilus account, wallets aggregated per currency |
 | Isolated margin ledger | Implemented — mock-tested | — | `spot_account_mode=MARGIN` |
 | Cross margin ledger | Implemented — mock-tested | — | Requires a unified account on the venue |
 | Unified account | Implemented — mock-tested | — | `single_currency` has no balance minimum; per Gate.io's documentation `multi_currency` needs > 500 USDT and `portfolio` > 1000 USDT, which this adapter neither enforces nor checks |
@@ -180,7 +180,7 @@ but a single recorded run is not evidence of stability — see
 ### Mainnet validation results
 
 Recorded on 2026-07-29 against Gate.io mainnet, at the smallest size each
-instrument permits — the spot rows on a cash account, the perpetual rows on a
+instrument permits — the spot rows on a cash account, the derivative rows on a
 margin account:
 
 * **Public market data.** Instruments loaded for spot, USDT perpetual, delivery
@@ -200,13 +200,14 @@ margin account:
 * **Spot cancels.** Cancel-replace passed: orders cancelled, replacements
   accepted, none rejected, and the cancel-all on stop cleared what was still
   resting. Cancelling an already-cancelled order passed: no fabricated
-  rejection, no reopened order. Two runs **failed with the same signature**:
-  each cancelled both orders that were resting when it began to stop, then
-  submitted one more and ended with that one accepted and resting at the venue.
-  Neither of those runs reached the batch endpoint, which therefore has no live
-  evidence at all. A post-only order priced to cross was rejected by the venue
-  with its own reason and nothing filled, but that step too is recorded as
-  failed, on the check about how the reason is worded.
+  rejection, no reopened order. Clearing resting orders on the way down was run
+  four times and **failed twice**: every run cancelled everything that was
+  resting when it began to stop, and two of them then submitted one more order
+  that was still there when the run ended. No run has reached the batch
+  endpoint, which therefore has no live evidence at all. A post-only order
+  priced to cross was rejected by the venue with its own reason and nothing
+  filled, but that step is recorded as failed, on the check about how the reason
+  is worded.
 * **Spot conditional orders.** Stop-limit and limit-if-touched armed at the
   venue and cancelled on stop — on the buy side only: a resting conditional sell
   needs base currency, and on a cash account holding none the platform denied
@@ -218,20 +219,27 @@ margin account:
   nothing and created nothing; stop-market and market-if-touched orders on both
   sides were armed and cancelled without firing; and one armed stop was
   cancelled and re-placed at a new trigger ten times in three minutes, every
-  replacement accepted. That is the entire derivative record.
-* **Reading state back from the venue.** A node that had never seen the account
-  asked for its execution state and got it: one order status report for the
-  order deliberately left resting, and a mass status the engine reconciled. The
-  orders did not enter that node's cache — it ran with the platform's default
-  filter for unclaimed external orders and a lookback shorter than the age of
-  the fill — so the client's reporting is confirmed live and the adoption of
-  that state is not.
+  replacement accepted.
+* **Options execution — one contract.** A resting limit buy was accepted, did
+  not fill, and was cancelled; an aggressive IOC limit buy filled and opened a
+  long; a limit sell was accepted against that long — covered, never naked —
+  and cancelled on stop with the long intact. Options take no market order here
+  and this adapter refuses conditional orders on them.
+* **Reading state back from the venue.** Nodes that had never seen the account
+  asked for its execution state and got it — order, fill and position reports,
+  and a mass status the engine reconciled. On the perpetual an open long was
+  adopted into the fresh cache with the venue's own quantity and entry price,
+  and a later step flipped and flattened it. The spot orders left resting for
+  the same test did not enter the cache: those runs kept the platform's default
+  filter for unclaimed external orders, and one looked back over a window
+  shorter than the age of the fill. Position adoption is confirmed; order
+  adoption is not.
 
 Nothing else has been run against the exchange — no order on an inverse
-perpetual, a delivery contract or an option, nothing on a margin, cross-margin
-or unified spot ledger, and no restart recovery. The full record, including what
-each run checked, what it did not, the steps that failed and the three recorded
-checks that do not check what they claim, is in
+perpetual or a delivery contract, nothing on a margin, cross-margin or unified
+spot ledger, and no restart of a node onto its own live state. The full record,
+including what each run checked, what it did not, the steps that failed and the
+three recorded checks that do not check what they claim, is in
 [docs/validation.md](docs/validation.md).
 
 ## Symbology in one table
@@ -472,11 +480,12 @@ to Gate.io are marked `integration` and deselected by default
 
 ## Known limitations
 
-* **Mainnet validation covers market data, spot execution, and one USDT
-  perpetual.** No inverse, delivery or options order, nothing on a margin or
-  unified spot ledger and no restart recovery has been run against the exchange;
-  two runs left an order resting at the venue after stopping; and nothing is
-  marked *Stable*. See [docs/validation.md](docs/validation.md).
+* **Mainnet validation covers market data, spot execution, one USDT perpetual
+  and one option contract.** No inverse or delivery order, nothing on a margin
+  or unified spot ledger and no restart of a node onto its own live state has
+  been run against the exchange; two shutdowns out of four left an order resting
+  at the venue; and nothing is marked *Stable*. See
+  [docs/validation.md](docs/validation.md).
 * **Testnet covers spot and USDT perpetuals only.** Inverse perpetuals, delivery
   futures and options have no testnet endpoint, and configuring them with
   `environment="testnet"` is rejected up front.

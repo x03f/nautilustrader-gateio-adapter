@@ -25,19 +25,23 @@ mark, index and funding on a perpetual — and the spot execution path end to en
 from a market buy through post-only, iceberg, amendment, cancel-replace,
 cancel-all and a repeated cancel to a closed position, in both time-in-force
 families and denominated in either currency. On the derivative side one USDT
-perpetual carried a market sell into a short, its reduce-only close, a
-reduce-only order the venue refused, and conditional orders armed, re-armed and
-cancelled without ever firing. Nothing else has been sent to the exchange: no
-inverse perpetual, no delivery contract, no option, and not one order on a
-margin, cross-margin or unified spot ledger.
+perpetual carried a market sell into a short and a market buy into a long, a
+reduce-only close, a reduce-only order the venue refused, conditional orders
+armed, re-armed and cancelled without ever firing, and a position read back out
+of the venue by a node that had not opened it and then flattened; one option
+contract carried a resting limit buy, an aggressive one that filled, and a limit
+sell covered by the resulting long. Nothing else has been sent to the exchange:
+no inverse perpetual, no delivery contract, and not one order on a margin,
+cross-margin or unified spot ledger.
 
 It stays an alpha, and nothing is marked *Stable*, because a single recorded run
-shows that a path works and not that it keeps working. The runs that failed are
-published beside the ones that passed: two ended with an order still resting at
-the venue, each having cancelled everything that was resting when it began to
-stop and then submitted one more; the batch-cancel route was never reached at
-all; and the run meant to read venue state back into a fresh cache proved this
-client's reports rather than the platform's adoption of them.
+shows that a path works and not that it keeps working. One shutdown path made
+that concrete by coming out two ways in four runs of the same code: each run
+cancelled everything that was resting when it began to stop, and two of them
+then submitted one more order that was still at the venue when the run ended.
+The batch-cancel route was never reached at all, and of the state a fresh node
+reads back from the venue, the open position was adopted while the resting order
+was filtered out by the platform as unclaimed.
 [docs/validation.md](docs/validation.md) carries every run, what it checked,
 what it did not, and three recorded checks that do not check what they claim.
 

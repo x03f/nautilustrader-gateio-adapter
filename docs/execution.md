@@ -20,23 +20,27 @@ affiliated with Gate.io or Nautech Systems. It deliberately deviates from the
 preferred in-tree Rust/PyO3 adapter architecture; a Rust migration is a possible
 future project, not a plan.
 
-**Live validation of the execution path covers spot, plus one USDT perpetual.**
-Gate.io has accepted, filled, amended and cancelled real spot orders placed
-through this client and closed the resulting position; on a USDT perpetual it
-has filled a market sell into a short, accepted the reduce-only order that
-closed it, refused a reduce-only order sent with no position, and taken
-conditional orders on both sides that were armed, cancelled and re-armed at
-moving triggers. The runs and their checks are recorded in
+**Live validation of the execution path covers spot, one USDT perpetual and one
+option contract.** Gate.io has accepted, filled, amended and cancelled real spot
+orders placed through this client and closed the resulting position; on a USDT
+perpetual it has filled market orders into a short and into a long, accepted the
+reduce-only order that closed one, refused a reduce-only order sent with no
+position, and taken conditional orders on both sides that were armed, cancelled
+and re-armed at moving triggers; on an option it has taken a resting limit buy,
+filled an aggressive one, and accepted a limit sell covered by the resulting
+long. The runs and their checks are recorded in
 [validation.md](validation.md) — including the steps that failed there. Two of
 those are worth carrying in mind while reading this page: a run that cancels
 every resting order as it stops can still end with one at the venue if the
-strategy submits another while the node is stopping, and the batch-cancel route
-has never been reached by a live run at all. **No order has been sent to the
-venue for an inverse perpetual, a delivery contract or an option, none on a
-margin, cross-margin or unified spot ledger, and nothing on the USDT perpetual
+strategy submits another while the node is stopping, which happened in two of
+four recorded shutdowns, and the batch-cancel route has never been reached by a
+live run at all. **No order has been sent to the
+venue for an inverse perpetual or a delivery contract, none on a margin,
+cross-margin or unified spot ledger, and nothing on the perpetual or the option
 beyond what is listed there.** The reports this client generates have been
-answered by the venue for a fresh node; adopting that state into a cache, and
-recovering a restart with it, have not been shown live.
+answered by the venue for nodes that had never seen the account, and an open
+perpetual position was adopted from them; adopting a resting order the same way,
+and recovering a restart with it, have not been shown live.
 
 Underneath that, and behind every row on this page, is an offline test suite
 that drives the real NautilusTrader `Order` state machine with recorded venue
@@ -1185,7 +1189,7 @@ execution tests.
   cannot be fetched either, the loss is logged as an error rather than passing
   silently.
 * Only the paths listed in [validation.md](validation.md) have been exercised
-  against Gate.io itself — spot, and one USDT perpetual. Every margin ledger,
-  every other product and every path not named there has not. Start on the
-  testnet, then start small, and record what you find in
+  against Gate.io itself — spot, one USDT perpetual and one option contract.
+  Every margin ledger, every other product and every path not named there has
+  not. Start on the testnet, then start small, and record what you find in
   [validation.md](validation.md).

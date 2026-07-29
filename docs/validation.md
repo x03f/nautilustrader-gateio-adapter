@@ -38,19 +38,19 @@ whether an order on that product would be accepted.
 |---|---|---|---|
 | Spot | **mainnet-confirmed** | **mainnet-confirmed**, with the failures recorded below | Instruments, quotes, trades, bars, book deltas and the managed book built from them, the snapshot request and the historical requests; the whole order lifecycle, both time-in-force families, amend, cancel per order, cancel-all, repeated cancel, cancel-replace, iceberg and position close; conditional orders on the buy side only. Listed in detail below, including the steps that failed |
 | Spot on a margin ledger (isolated, cross, unified) | **mainnet-confirmed**, as spot — the public streams do not depend on the ledger | **offline-harness** | Nothing. No order has been placed on any margin ledger, and no margin balance has been read from the venue |
-| USDT perpetual (linear) | **mainnet-confirmed** for the instrument load, the mark, index and funding streams and the funding-rate history; the remaining streams were subscribed in a run that counts arrivals per data type, not per instrument | **mainnet-confirmed** for a short opened and closed, one refusal, armed conditional orders on both sides and their cancel-replace; **offline-harness** for everything else | Instrument definitions loaded and the ticker-derived streams arrived; a market sell opened a short, a reduce-only order closed it, a reduce-only order sent with no position was refused, stop-market and market-if-touched orders on both sides were armed and cancelled, and an armed stop was cancelled and re-placed at a new trigger ten times over |
+| USDT perpetual (linear) | **mainnet-confirmed** for the instrument load, the mark, index and funding streams and the funding-rate history; the remaining streams were subscribed in a run that counts arrivals per data type, not per instrument | **mainnet-confirmed** for both position sides, the reduce-only flag, one refusal, armed conditional orders on both sides with their cancel-replace, and position reconciliation into a node that did not open the position; **offline-harness** for everything else | Instrument definitions loaded and the ticker-derived streams arrived; a market sell opened a short and a reduce-only order closed it; a market buy opened a long, a fresh node read that long back from the venue with its quantity and entry price, and a two-contract sell flipped it to a short that was then flattened; a reduce-only order sent with no position was refused; stop-market and market-if-touched orders on both sides were armed and cancelled, and an armed stop was cancelled and re-placed at a new trigger ten times over |
 | Inverse perpetual (BTC-margined) | **offline-harness** | **offline-harness** | Nothing. No run has configured this product against the venue |
-| Delivery futures | **mainnet-confirmed** for the instrument load; every stream is **offline-harness** | **offline-harness** | The instrument definition loaded and its subscriptions were accepted, but no arrival is attributable to this product |
-| Options | **mainnet-confirmed** for the instrument load; every stream is **offline-harness** | **offline-harness** | The instrument definition loaded and its subscriptions were accepted, but no arrival is attributable to this product |
+| Delivery futures | **mainnet-confirmed** for the instrument load; every stream is **offline-harness** | **offline-harness** | The instrument definition loaded and its subscriptions were accepted, but no arrival is attributable to this product, and no order has been sent |
+| Options | **mainnet-confirmed** for the instrument load; every stream is **offline-harness** | **mainnet-confirmed** for a passive limit buy, an aggressive limit buy that filled, and a covered passive limit sell; **offline-harness** for everything else | The instrument definition loaded and its subscriptions were accepted, but no data arrival is attributable to it. On the execution side one contract took a resting limit buy that was cancelled, an aggressive IOC limit buy that filled and opened a long, and a limit sell placed while that long was held |
 
-**The USDT perpetual is the only derivative that has carried a live order.** It
-is also the only product whose conditional orders the venue has seen on both
-sides: a spot conditional sell needs base currency the cash account under test
-did not hold, so the platform's own risk engine denied every one before it could
-be sent. Beyond the orders listed above nothing on the perpetual has been
-exercised — no limit order, no amend, no fill from a trigger. Inverse
-perpetuals, delivery futures and options have never had an order sent to the
-venue at all.
+**Inverse perpetuals and delivery futures have never had an order sent to the
+venue.** The USDT perpetual is the only product whose conditional orders the
+venue has seen on both sides: a spot conditional sell needs base currency the
+cash account under test did not hold, so the platform's own risk engine denied
+every one before it could be sent. On the option contract nothing beyond the
+three orders above has been exercised — no market order, no conditional order,
+which the adapter refuses for options in any case, and no close of the long that
+those runs opened.
 
 ## Status by account mode
 
@@ -60,7 +60,7 @@ venue at all.
 | `MARGIN` — `spot_account_mode=MARGIN` (isolated) | as spot; the streams do not depend on the ledger | **offline-harness** | Nothing |
 | `MARGIN` — `spot_account_mode=CROSS_MARGIN` | as spot; the streams do not depend on the ledger | **offline-harness** | Nothing. Requires an account upgraded out of classic mode |
 | `MARGIN` — `spot_account_mode=UNIFIED` | as spot; the streams do not depend on the ledger | **offline-harness** | Nothing. Requires a unified account on the venue |
-| `MARGIN` — any configuration including a derivative product | see the product table | **mainnet-confirmed**, for the USDT perpetual runs only | The client reported a `MARGIN` account to the platform, and the venue took the market sell, the reduce-only close, the refusal and the armed conditional orders recorded below |
+| `MARGIN` — any configuration including a derivative product | see the product table | **mainnet-confirmed**, for the USDT perpetual and option runs | The client reported a `MARGIN` account to the platform in every derivative run, and the venue took the perpetual orders and the option orders recorded below |
 
 <!-- VALIDATION RESULTS PLACEHOLDER
      Fill this section in as validation runs complete. One row per exercised
@@ -84,16 +84,18 @@ instrument permits. Failures are rows here too.
 | 2026-07-29 | Spot | Time in force: market IOC, market FOK, quote-denominated market buy, aggressive and passive IOC limit, aggressive and passive FOK limit | `TRX_USDT.GATE_IO` | Passed. Both market orders filled carrying the requested time in force; the quote-denominated buy filled and reported its quantity in base units; the aggressive IOC and FOK limits filled, the FOK in a single fill event; the passive IOC was finished immediately by the venue without a fill, and the passive FOK was rejected. Every position closed on stop |
 | 2026-07-29 | Spot | Cancel-replace, and cancel-all on stop | `TRX_USDT.GATE_IO` | Passed. Orders were cancelled and their replacements accepted as the market moved, no replacement was rejected, and the cancel-all issued on stop cleared both orders still resting, leaving nothing open |
 | 2026-07-29 | Spot | Cancelling an order the venue has already cancelled | `TRX_USDT.GATE_IO` | Passed. The order was cancelled once, the second cancel fabricated no rejection, and the order did not reopen |
-| 2026-07-29 | Spot | Clearing several resting orders on stop, once with a cancel per order and once with the step set to use the batch endpoint | `TRX_USDT.GATE_IO` | **Failed, in both runs, identically** — and not where the check suggests. In each run two orders were resting when the wind-down began, a cancel went out for each, and both were cancelled by the venue; the strategy then submitted a fresh limit order after that sweep, and the run ended with it accepted and resting. A later account check found both leftovers still open at the venue. So the cancel reached every order it was given, and what is not confirmed is that a node stops clean while its strategy is still quoting. Neither run reached the batch endpoint: both issued a cancel per order, so the batch route has no live evidence at all |
+| 2026-07-29 | Spot | Clearing several resting orders on stop, with a cancel per order | `TRX_USDT.GATE_IO` | **Four runs: two failed, two passed.** Every run cancelled every order that was resting when its wind-down began, and the venue honoured every one. The two that failed then submitted one further order after their own sweep and ended with it accepted and resting; a later account check found both leftovers still open at the venue, and the two that passed left nothing. The route is therefore confirmed and its timing is not — the same shutdown, the same code, opposite outcomes — which is the plainest reason nothing on this page is called *Stable*. Two of the four runs were configured to cancel through the batch endpoint and none of them reached it: every cancel went out per order, so **the batch route has no live evidence at all** |
 | 2026-07-29 | Spot | A post-only order priced to cross the book | `TRX_USDT.GATE_IO` | Partly. The venue rejected every such order and nothing filled, and the client surfaced the venue's own reason (`POC_FILL_IMMEDIATELY`) rather than inventing one. The step is nonetheless recorded as failed: the check that the reason names the post-only violation did not match that wording. The refusal is confirmed; the assertion about how it is phrased is not |
 | 2026-07-29 | Spot | Conditional orders: stop-limit and limit-if-touched, buy and sell attempted | `TRX_USDT.GATE_IO` | Partly, and on one side only. In each run the buy was armed at the venue and cancelled on stop, and nothing triggered or filled. Every sell was denied inside the platform for want of base currency on a cash account (`CUM_NOTIONAL_EXCEEDS_FREE_BALANCE`) and never reached Gate.io, so **the recorded step's claim that both sides were accepted is not one the venue supports** — the check reads the cache, which holds denied orders too. Arming and cancelling a spot conditional buy is confirmed; the sell side and the fire path are not |
 | 2026-07-29 | USDT perpetual | Market sell opening a short, then a reduce-only order to close it | `DOGE_USDT-PERP.GATE_IO`, one contract | Passed, on a `MARGIN` account. The market sell filled and opened a SHORT position, the closing order carried reduce-only and left the position flat, and no closing order was rejected |
 | 2026-07-29 | USDT perpetual | Reduce-only order sent with no position open | `DOGE_USDT-PERP.GATE_IO` | Passed. The venue refused it (`INCREASE_POSITION: empty position`), nothing filled, and no position was created |
 | 2026-07-29 | USDT perpetual | Conditional orders: stop-market and market-if-touched, buy and sell | `DOGE_USDT-PERP.GATE_IO` | Partly. All four were accepted by the venue — both sides genuinely, this being a margin account with collateral rather than inventory — and all four were cancelled on stop; none triggered or filled, so arming and cancellation are confirmed on this product and firing is not |
 | 2026-07-29 | USDT perpetual | Cancel-replace of an armed stop as its trigger offset moves | `DOGE_USDT-PERP.GATE_IO` | Recorded failed; what the venue did is not in doubt. Over three minutes the client cancelled and re-placed the armed stop ten times, each replacement carrying a trigger one increment from the last, every one accepted, and nothing was left open at the end. The step's first check asks for strictly more acceptances than cancellations as its signature of a re-placement, and cancelling the last replacement on stop made the two counts equal. Arming, cancelling and re-arming a conditional order on this product is confirmed; the check that was supposed to say so is unsound |
-| 2026-07-29 | Spot | Leaving a resting order and a filled order at the venue, then reading them back with a fresh node | `TRX_USDT.GATE_IO` | Mixed, and the failures are the scenario's, not the venue's. One order was left resting and one left filled, as intended. The fresh node then asked the venue for its state and **the client answered from the venue it had never seen before: one order status report for the resting order, and a mass status the engine reconciled successfully.** Neither order reached the cache, for two reasons that belong to the run's configuration rather than to this adapter: the node was left at the platform default `filter_unclaimed_external_orders=True` while its dry-run strategy claimed nothing, so the engine filtered the order it had just been handed; and the fill lay outside the five-minute reconciliation lookback the run used. The clean-up step then sold the inventory the earlier step had bought, which a node that never adopted the buy books as a short of its own. The venue was left flat but for dust, with one order still resting |
+| 2026-07-29 | USDT perpetual | A position left open at the venue, read back by a node that did not open it, flipped and flattened | `DOGE_USDT-PERP.GATE_IO`, one and two contracts | Passed, every step. A market buy left a long open; a fresh node with reconciliation on and a strategy that placed nothing read that long back from the venue with the venue's own quantity and entry price; a two-contract sell closed it and opened a short in one operation; the last step left the account flat with no order outstanding. The venue's order and fill for the position were reported to that fresh node as well, and excluded from its books with the reason logged per trade, because the engine had declined to adopt the unclaimed order they belonged to — the behaviour this client was changed to have |
+| 2026-07-29 | Options (USDT-settled) | A resting limit buy, an aggressive limit buy that filled, and a limit sell placed against the resulting long | a USDT-settled BTC call, one contract | Passed. The passive limit buy was accepted and did not fill, and was cancelled leaving nothing open; an aggressive IOC limit buy filled and opened a long; a limit sell was then accepted while that long was held — never naked — and was cancelled on stop with the long intact. Options take no market order at this venue and this adapter refuses conditional orders on them, so nothing beyond this has been tried |
+| 2026-07-29 | Spot | Leaving a resting order and a filled order at the venue for a fresh node to read back | `TRX_USDT.GATE_IO` | Set up, not yet settled. The step left one order resting and one filled, as intended and as recorded. The read-back step had not been recorded as passing when this page was written, and an earlier attempt at it showed why the question is subtle rather than answering it: the client answered the fresh node with an order status report for the resting order and a mass status the engine reconciled, and the order still did not enter the cache, because that node kept the platform's default `filter_unclaimed_external_orders=True` while its strategy claimed nothing, and because the fill lay outside the run's five-minute reconciliation lookback. The perpetual row above is the closest thing to an answer on record |
 
-Four things about how to read those rows.
+Five things about how to read those rows.
 
 **Attribution.** The market-data run subscribed spot, USDT perpetual, delivery
 and options at once and counted arrivals by data type rather than by instrument,
@@ -102,11 +104,11 @@ alone — the narrowest reading the record supports, not necessarily the whole o
 what arrived.
 
 **Vintage.** The market-data, cancel, quote-denominated-buy, conditional,
-perpetual and reconciliation runs were made on the released tree. The lifecycle,
-the other time-in-force steps and the spot stop-limit step were made earlier the
-same day, before the last execution fix landed. That fix changed how a cash buy
-completes and how a cancel of an order the venue no longer holds is reported —
-and every path it touched was exercised again afterwards, by the
+perpetual, option and reconciliation runs were made on the released tree. The
+lifecycle, the other time-in-force steps and the spot stop-limit step were made
+earlier the same day, before the last execution fix landed. That fix changed how
+a cash buy completes and how a cancel of an order the venue no longer holds is
+reported — and every path it touched was exercised again afterwards, by the
 quote-denominated buy and by the cancel steps, each of which opens and closes a
 position of its own.
 
@@ -120,34 +122,43 @@ prices, and the venue accepted them. The cancel-replace check infers a
 re-placement from having more acceptances than cancellations, which the
 cancellation on stop can make untrue while the re-placements plainly happened.
 
-**Failures stand.** The rows that failed are left here rather than re-run into
-silence, including the two whose substance the venue actually delivered: a
-validation record that only keeps its successes is not a record.
+**Failures stand.** A failure is not deleted here because a later run passed,
+and two rows above say both things at once. The two whose substance the venue
+did deliver — the post-only refusal and the re-armed trigger — keep their failed
+verdicts beside what actually happened. A validation record that only keeps its
+successes is not a record.
+
+**This is a snapshot.** These rows are what had been recorded when the page was
+written, on an account with a fixed budget and a campaign still adding to it. A
+row that is absent is a run that had not happened, not a run that was hidden.
 
 ### What the runs did not confirm
 
 Stated explicitly, because a passing lifecycle invites the assumption that
 everything next to it also passed:
 
-* stopping cleanly while a strategy is still quoting — **attempted twice and
-  failed both times**, as above, each run leaving behind an order it had
-  submitted after its own cancel sweep;
-* the batch-cancel endpoint, which no live run has reached — the step meant to
-  exercise it sent a cancel per order instead;
+* stopping cleanly while a strategy is still quoting — **two of four runs
+  failed at this**, as above;
+* the batch-cancel endpoint, which no live run has reached — the two steps meant
+  to exercise it sent a cancel per order instead;
 * the sell side of a spot conditional order, which the platform denied for want
   of base currency before it could be sent;
 * the conditional-order trigger and fire path — arming, cancelling and re-arming
   are confirmed, firing is not;
 * any stream on delivery futures or options individually, and every stream on
   inverse perpetuals;
-* adoption of venue state into the cache at start-up. The client's order status
-  report and mass status were exercised live and answered; what has not been
-  shown live is a resting order and a fill being taken into the cache and used,
-  because the run that tried filtered the order and looked back past the fill;
-* restart recovery against the real venue — resting orders and open positions
-  surviving a node restart is proven at *offline-harness* only;
-* every order path on inverse perpetuals, delivery futures and options; and on
-  the USDT perpetual, everything except the steps recorded above.
+* adoption of a resting **order** into a fresh cache. An open position was read
+  back from the venue and adopted, on the perpetual; the order and fill reports
+  that accompanied it were answered by the client and then filtered by the
+  platform, because no strategy claimed them. What the venue has confirmed is
+  that this client reports its state; what no run has confirmed is a resting
+  order being taken up and traded on by a node that did not place it;
+* restart recovery against the real venue — a node stopping and restarting onto
+  its own live state is proven at *offline-harness* only, and the position
+  reconciliation above is one half of it;
+* every order path on inverse perpetuals and delivery futures; on options,
+  everything except the three orders recorded above; and on the USDT perpetual,
+  everything except the steps recorded above.
 
 ### Testnet validation results
 
@@ -179,7 +190,8 @@ mistaken for "not attempted":
 | Unified `multi_currency` mode | Gate.io requires an account balance above 500 USDT |
 | Unified `portfolio` mode | Gate.io requires an account balance above 1000 USDT |
 | Inverse (BTC-settled) perpetuals | No testnet endpoint; mainnet validation needs a funded BTC-margined wallet |
-| Delivery futures, options | No testnet endpoint; the wallets are created by a first internal transfer, and an option position cannot be opened for the price of a spot test |
+| Delivery futures | No testnet endpoint, and the wallet is created by a first internal transfer. The instrument loads and its subscriptions are accepted; no order has been sent inside this validation's budget |
+| Options beyond one contract | No testnet endpoint. The contract that was traded had to pass a screen — two-sided book, a spread under a third, open interest, and more than twelve hours to expiry — and its premium had to fit the budget, so the option evidence is one contract wide and says nothing about the rest of the chain |
 | Hedge (dual) position mode | The adapter refuses it by design and never switches it on, so the refusal is what gets tested, not the mode |
 | Liquidation and auto-deleveraging paths | Cannot be provoked safely |
 | Conditional-order trigger and fire | Requires the market to cross a trigger inside the run; a trigger placed close enough to fire reliably is a trigger that risks an unintended position |

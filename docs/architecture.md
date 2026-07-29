@@ -16,10 +16,11 @@ explains why, and — more importantly — what that decision does *not* excuse.
 
 **The release is alpha.** The behaviour described here is implemented and
 covered by the unit suite against recorded and simulated venue payloads.
-Live-venue validation covers the market-data paths, spot execution and a short
-series of orders on one USDT perpetual; no inverse, delivery or options order
-and no margin spot ledger has been exercised against Gate.io. See
-[validation.md](validation.md).
+Live-venue validation covers the market-data paths, spot execution, a series of
+orders on one USDT perpetual including a position read back from the venue by a
+node that did not open it, and three orders on one option contract; no inverse
+or delivery order and no margin spot ledger has been exercised against Gate.io.
+See [validation.md](validation.md).
 Where this page classifies a capability it uses exactly one of: *implemented and
 mock-tested*, *implemented, mainnet validation pending*, *experimental*,
 *unsupported*, *not applicable*. Nothing here is described as stable or
