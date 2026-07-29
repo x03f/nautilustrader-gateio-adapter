@@ -355,9 +355,11 @@ which is a definite answer, not a failed query.
 
 ## What NautilusTrader handles for you
 
-To summarise the division of labour at its proven level (offline tests drive
-the real platform state machine; none of this is mainnet-validated — see
-[execution.md](execution.md), "Maturity"):
+To summarise the division of labour at its proven level (offline tests drive the
+real platform state machine; the only error handling a live run has exercised is
+what the recorded runs happened to meet — a post-only refusal and a repeated
+cancel on spot, a reduce-only refusal on the perpetual, and the local denial of
+a sell the account could not cover — see [validation.md](validation.md)):
 
 * **Order commands**: every exception becomes `OrderDenied`, `OrderRejected`,
   `OrderModifyRejected`/`OrderCancelRejected`, or a logged unresolved outcome

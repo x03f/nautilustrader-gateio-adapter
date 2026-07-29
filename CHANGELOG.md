@@ -7,7 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+Nothing yet.
+
+## [0.2.0a1] - 2026-07-29
+
+The first release of this adapter that Gate.io itself has answered. Everything
+before it rested on an offline suite driving the real NautilusTrader engines
+against recorded venue payloads, which is evidence about the code and not about
+the exchange. This release adds a bounded campaign of live runs on mainnet, at
+the smallest size each instrument permits, and takes its status vocabulary from
+what those runs recorded rather than from what the code intends.
+
+What the venue has confirmed is the market-data path — instruments for spot,
+perpetual, delivery and options; quotes, trades, bars, incremental book deltas
+and the book built from them; the snapshot request and the historical requests;
+mark, index and funding on a perpetual — and the spot execution path end to end,
+from a market buy through post-only, iceberg, amendment, cancel-replace,
+cancel-all and a repeated cancel to a closed position, in both time-in-force
+families and denominated in either currency. On the derivative side one USDT
+perpetual carried a market sell into a short, its reduce-only close, a
+reduce-only order the venue refused, and conditional orders armed, re-armed and
+cancelled without ever firing. Nothing else has been sent to the exchange: no
+inverse perpetual, no delivery contract, no option, and not one order on a
+margin, cross-margin or unified spot ledger.
+
+It stays an alpha, and nothing is marked *Stable*, because a single recorded run
+shows that a path works and not that it keeps working. The runs that failed are
+published beside the ones that passed: two ended with an order still resting at
+the venue, each having cancelled everything that was resting when it began to
+stop and then submitted one more; the batch-cancel route was never reached at
+all; and the run meant to read venue state back into a fresh cache proved this
+client's reports rather than the platform's adoption of them.
+[docs/validation.md](docs/validation.md) carries every run, what it checked,
+what it did not, and three recorded checks that do not check what they claim.
+
+The first three entries below were found by those runs rather than by review,
+which is the argument for having run them.
+
+### Fixed — recovery, reconciliation and order state
 
 - **A quote-denominated spot market buy is no longer left open for ever, and
   no longer loses a fill** (`REC-09` in docs/review-matrix.md, found by live
@@ -273,7 +310,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   USDT-settled perpetual and the USDT options wallet add up rather than
   overwrite one another.
 
-### Fixed
+### Fixed — execution, data, accounting and transport
 
 - **Reconnect recovery of an order that missed more than one fill.** Every
   recovered trade of one order is now handed over under the venue's own
@@ -581,20 +618,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this adapter has not implemented yet (both trailing types and attached
   take-profit / stop-loss exist at the venue).
 
-## [0.2.0a1] - 2026-07-26
+### The rebuild from 0.1.0
 
-An alpha. 0.1.0 was a spot-only adapter with a flat module layout; 0.2.0a1 is a
+0.1.0 was a spot-only adapter with a flat module layout; 0.2.0a1 is a
 multi-product connector built on real venue data throughout. See
 [docs/migration-0.1-to-0.2.md](docs/migration-0.1-to-0.2.md) for the upgrade
 path.
 
-Released as an alpha, not a stable version, because real-world validation and
-external user feedback are still limited. The test suite is extensive and runs
-without credentials, but a passing suite is evidence about the code, not about
-the exchange. Treat every capability as needing your own verification before it
-carries money. The per-capability status is in
-[docs/validation.md](docs/validation.md); the audit trail behind the code is in
-[docs/review-matrix.md](docs/review-matrix.md).
+Live validation is bounded, and external user feedback has not happened yet, so
+treat every capability as needing your own verification before it carries money.
+The per-capability status is in [docs/validation.md](docs/validation.md); the
+audit trail behind the code is in [docs/review-matrix.md](docs/review-matrix.md).
 
 0.1.0 remains available: its tag and release are untouched and its
 implementation is preserved on the `legacy/v0.1.0` branch.
@@ -676,7 +710,7 @@ implementation is preserved on the `legacy/v0.1.0` branch.
   base-denominated spot market buy is expressed as an IOC limit, bounded by the
   pair's own published slippage cap.
 
-### Added
+### Added in the rebuild
 
 - **Products**: spot, USDT perpetual futures, BTC-settled (inverse) perpetual
   futures, USDT delivery futures and USDT-settled options. One data client and
@@ -710,7 +744,7 @@ implementation is preserved on the `legacy/v0.1.0` branch.
   [migration](docs/migration-0.1-to-0.2.md), [validation
   status](docs/validation.md) and [releasing](docs/releasing.md).
 
-### Fixed
+### Fixed in the rebuild
 
 - **Documentation described a testnet default that the code does not have.**
   Every page now states the mainnet default, and a regression test compares the
@@ -759,6 +793,6 @@ Initial release.
 - Documentation set: architecture, configuration, market data, execution, testing, and troubleshooting guides.
 - Unit test suite (no network access required) and continuous integration workflow.
 
-[Unreleased]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.1.0...v0.2.0
+[Unreleased]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.2.0a1...HEAD
+[0.2.0a1]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.1.0...v0.2.0a1
 [0.1.0]: https://github.com/x03f/nautilustrader-gateio-adapter/releases/tag/v0.1.0

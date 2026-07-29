@@ -6,8 +6,9 @@ Every configuration class lives in `nautilus_gateio.config`. Both are frozen
 directly in a `TradingNodeConfig`.
 
 This adapter is an external, community-maintained integration for
-NautilusTrader 1.230.0, written in pure Python, and released as **alpha**. No
-live-venue validation has been performed: see
+NautilusTrader 1.230.0, written in pure Python, and released as **alpha**.
+Live-venue validation covers market data, spot execution and a short series of
+orders on one USDT perpetual, and no further: see
 [validation.md](validation.md) for what has and has not been exercised. Read
 this page as the description of what the code does, not as a promise about what
 the venue will do with it.

@@ -20,11 +20,29 @@ affiliated with Gate.io or Nautech Systems. It deliberately deviates from the
 preferred in-tree Rust/PyO3 adapter architecture; a Rust migration is a possible
 future project, not a plan.
 
-**No part of the execution path has been validated against the live venue.**
-What exists is an offline test suite that drives the real NautilusTrader `Order`
-state machine with recorded venue payload shapes, so an event sequence the
-framework would reject fails a test rather than passing quietly. That proves the
-adapter is internally consistent; it does not prove Gate.io agrees with it.
+**Live validation of the execution path covers spot, plus one USDT perpetual.**
+Gate.io has accepted, filled, amended and cancelled real spot orders placed
+through this client and closed the resulting position; on a USDT perpetual it
+has filled a market sell into a short, accepted the reduce-only order that
+closed it, refused a reduce-only order sent with no position, and taken
+conditional orders on both sides that were armed, cancelled and re-armed at
+moving triggers. The runs and their checks are recorded in
+[validation.md](validation.md) — including the steps that failed there. Two of
+those are worth carrying in mind while reading this page: a run that cancels
+every resting order as it stops can still end with one at the venue if the
+strategy submits another while the node is stopping, and the batch-cancel route
+has never been reached by a live run at all. **No order has been sent to the
+venue for an inverse perpetual, a delivery contract or an option, none on a
+margin, cross-margin or unified spot ledger, and nothing on the USDT perpetual
+beyond what is listed there.** The reports this client generates have been
+answered by the venue for a fresh node; adopting that state into a cache, and
+recovering a restart with it, have not been shown live.
+
+Underneath that, and behind every row on this page, is an offline test suite
+that drives the real NautilusTrader `Order` state machine with recorded venue
+payload shapes, so an event sequence the framework would reject fails a test
+rather than passing quietly. That proves the adapter is internally consistent;
+it does not prove Gate.io agrees with it.
 
 Capabilities on this page carry one of these labels:
 
@@ -36,9 +54,11 @@ Capabilities on this page carry one of these labels:
 | unsupported | Not available. The client says so explicitly instead of approximating |
 | not applicable | The concept does not exist on that product, or not in this layer |
 
-*Mainnet validation pending* applies to every row on the page, including the
-ones labelled *implemented and mock-tested*. See
-[validation.md](validation.md), which is where real-venue results get recorded.
+Both labels are statements about the repository, not about the exchange: a row
+marked *implemented and mock-tested* is still unproven on the venue unless
+[validation.md](validation.md) records a run for it. That page grades every
+product and account mode separately, and it is the only place where a live
+result counts.
 
 **`environment` defaults to `"mainnet"`.** Set `environment="testnet"`
 explicitly for the Gate.io testnet, and note that Gate.io serves only spot and
@@ -1164,6 +1184,8 @@ execution tests.
   a filter was narrower than the account's actual history; if the definition
   cannot be fetched either, the loss is logged as an error rather than passing
   silently.
-* Nothing on this page has been exercised against Gate.io itself. Start on the
+* Only the paths listed in [validation.md](validation.md) have been exercised
+  against Gate.io itself — spot, and one USDT perpetual. Every margin ledger,
+  every other product and every path not named there has not. Start on the
   testnet, then start small, and record what you find in
   [validation.md](validation.md).

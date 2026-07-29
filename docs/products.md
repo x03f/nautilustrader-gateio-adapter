@@ -17,8 +17,9 @@ Two things to have in mind while reading it. This is an external community
 package for NautilusTrader 1.230.0, written in pure Python, not an official
 integration: it deliberately departs from the preferred in-tree Rust and PyO3
 adapter architecture, and no migration to that architecture is promised. And it
-is an alpha release — suitable for evaluation and controlled use, with limited
-real-world validation behind it.
+is an alpha release — suitable for evaluation and controlled use, with live
+validation that reaches spot, and one USDT perpetual for a short series of
+orders, and stops there ([validation status](validation.md)).
 
 ```python
 from nautilus_gateio import GateioProductType, GateioSpotAccountMode
@@ -36,11 +37,19 @@ selected with `spot_account_mode` and expressed as `GateioSpotAccountMode`. See
 
 ## How to read the status column
 
-This is alpha software. **No capability listed on this page has been exercised
-against the live venue**, on mainnet or on the testnet — see
-[validation status](validation.md). Statuses below therefore describe how well a
-claim is grounded in the repository, not how well it has survived contact with
-real money.
+This is alpha software. The statuses below describe how well a claim is grounded
+in the repository — not how well it has survived contact with real money.
+
+Live exercise is graded separately, and only on one page:
+[validation status](validation.md). In short: the spot market-data paths are
+confirmed on mainnet, as are the instrument load on every configured product and
+the ticker-derived streams on the USDT perpetual; on the execution side, **spot,
+plus one USDT perpetual** — a market sell, its reduce-only close, a reduce-only
+order the venue refused, and conditional orders armed, cancelled and re-armed
+without ever firing. No order has been sent to Gate.io for an inverse perpetual,
+a delivery contract or an option, and no margin, cross-margin or unified spot
+ledger has carried one. A row below saying *implemented and mock-tested* is
+making no claim whatsoever about the venue.
 
 | Status | Meaning here |
 |---|---|
@@ -52,7 +61,14 @@ real money.
 
 *Implemented and mock-tested* is a statement about the adapter agreeing with its
 authors, never about Gate.io agreeing with the adapter. Only a live round trip
-settles that, and none has been recorded.
+settles that, and the ones on record are listed, product by product, in
+[validation status](validation.md).
+
+The second label carries its historical name and is graded on the same axis as
+the first: *implemented, mainnet validation pending* means no test asserts the
+behaviour, not that the venue has been asked and has not answered. A spot row
+carrying it may still appear as mainnet-confirmed on the validation page, which
+is the only page that grades live evidence.
 
 ## Products at a glance
 

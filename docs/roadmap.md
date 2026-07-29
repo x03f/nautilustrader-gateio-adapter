@@ -293,20 +293,29 @@ plan._
 
 ### Stage 6 — Validation
 
-Bounded live validation on the venue: the smallest orders that prove submission, acknowledgement,
-fill handling, cancellation, the conditional-order transition, balance and position convergence, and
-restart recovery. Account cleanliness checked before, between and after. Live validation found and
-closed `REC-08` — a node start crashed when the recovery sweep read the engine's index entry for a
-filtered external order as a bookable one — recorded with the recovery findings in the
+Done for the alpha, and deliberately not finished. Bounded live validation ran on mainnet at the
+smallest size each instrument permits, with account cleanliness checked before, between and after.
+It confirmed the market-data paths, the spot execution path end to end, and one USDT perpetual for a
+short series of orders — and it left the derivatives beyond that perpetual, every margin ledger and
+the adoption of venue state into a fresh cache unproven at the venue. Every result, including the
+runs that failed and the recorded checks that turned out not to check what they claimed, is in the
+[validation status](validation.md).
+
+The runs paid for themselves in defects: `REC-08`, where a node start crashed because the recovery
+sweep read the engine's index entry for a filtered external order as a bookable one, and `REC-09`,
+where a quote-denominated spot market buy carried an estimated quantity that could leave the order
+open for ever or discard a fill. Both are recorded with the recovery findings in the
 [review matrix](review-matrix.md#recovery-findings-raised-after-this-review).
 
-_Exit: results recorded per product and account mode; every capability's status earned rather than
-assumed._
+_Exit met: results recorded per product and account mode, and every capability's status earned
+rather than assumed — which for most products means a status well below confirmed._
 
 ### Stage 7 — Release `v0.2.0a1`
 
-Packaging verified from the installed artefact, documentation carrying the real validation results,
-tag on the exact validated commit.
+Packaging verified from the installed artefact — the wheel and the source distribution both
+installed into a clean environment outside the source tree and exercised there — documentation
+carrying the real validation results rather than a placeholder, and the tag placed on the exact
+commit the validation runs were made against.
 
 ### Stage 8 — Toward beta and a stable release
 

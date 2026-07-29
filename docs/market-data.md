@@ -24,8 +24,10 @@ the configuration never asked for.
 ## Maturity of this page
 
 This is an alpha release of an external, community-maintained adapter, written in
-pure Python against NautilusTrader 1.230.0. **No part of it has been validated
-against the live venue.** The statuses below therefore mean:
+pure Python against NautilusTrader 1.230.0. **Live validation of market data
+covers the spot streams and requests, the instrument load on every configured
+product, and the ticker-derived streams on the USDT perpetual — and stops
+there.** The statuses below mean:
 
 * *implemented and mock-tested* — the path is exercised by the offline test suite
   against payload shapes that mirror what Gate.io sends, with no socket opened and
@@ -34,24 +36,33 @@ against the live venue.** The statuses below therefore mean:
   and reviewed, but the offline suite does not cover it end to end;
 * *unsupported* — not implemented.
 
-| Capability | Status |
-|---|---|
-| Instrument loading through the provider | implemented and mock-tested |
-| Instrument reload task inside the data client | implemented, mainnet validation pending |
-| Trade ticks | implemented and mock-tested |
-| Quote ticks from `book_ticker` | implemented and mock-tested |
-| Order book deltas, sequence validation and gap resync | implemented and mock-tested |
-| Order book snapshot on request | implemented and mock-tested |
-| Bars from the candlestick streams | implemented and mock-tested |
-| Historical bars and trades over REST | implemented, mainnet validation pending |
-| Mark price, index price, funding rate | implemented, mainnet validation pending |
-| Historical funding rates over REST | implemented, mainnet validation pending |
-| Book resynchronisation after a reconnect | implemented, mainnet validation pending |
-| `OrderBookDepth10` subscriptions | unsupported |
-| The periodic `*.order_book` snapshot channel | unsupported by the data client |
+The **mainnet** column is a separate axis: it names the products for which a
+recorded live run exists, with the run itself written down in
+[validation.md](validation.md). A dash means the venue has never been observed
+to serve this path through the adapter.
 
-Nothing here is described as stable, and nothing should be treated as validated
-until [validation.md](validation.md) records a result against the real venue.
+| Capability | Status | Mainnet |
+|---|---|---|
+| Instrument loading through the provider | implemented and mock-tested | spot, perpetual, delivery, options |
+| Instrument reload task inside the data client | implemented, mainnet validation pending | — |
+| Trade ticks | implemented and mock-tested | spot |
+| Quote ticks from `book_ticker` | implemented and mock-tested | spot |
+| Order book deltas, sequence validation and gap resync | implemented and mock-tested | spot (deltas, interval snapshots and the managed book) |
+| Order book snapshot on request | implemented and mock-tested | spot |
+| Bars from the candlestick streams | implemented and mock-tested | spot |
+| Historical bars and trades over REST | implemented; the offline suite covers the HTTP layer only | spot |
+| Mark price, index price, funding rate | implemented and mock-tested | USDT perpetual |
+| Historical funding rates over REST | implemented; the offline suite covers the HTTP layer only | USDT perpetual |
+| Book resynchronisation after a reconnect | implemented, mainnet validation pending | — |
+| `OrderBookDepth10` subscriptions | unsupported | not applicable |
+| The periodic `*.order_book` snapshot channel | unsupported by the data client | not applicable |
+
+Nothing here is described as stable. A dash means no recorded run credits that
+path to the venue: the instrument reload timer and the post-reconnect book
+resynchronisation were never observed live, and the delivery and options streams
+were subscribed in a run that counts arrivals per data type rather than per
+instrument, so nothing is attributed to them individually. The detail is in
+[validation.md](validation.md).
 
 ## Connecting
 
