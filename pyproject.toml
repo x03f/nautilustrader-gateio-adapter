@@ -74,6 +74,14 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The suite imports its shared fixtures as `tests.test_execution_orders`, so the
+# repository root has to be importable. `python -m pytest` puts the working
+# directory on `sys.path` and hides the need for this; the bare `pytest` that CI
+# runs does not — which is why the suite passed locally and failed in CI with
+# `ModuleNotFoundError: No module named 'tests'`. Stating it here makes both
+# invocations behave the same, instead of leaving each test module to carry its
+# own import fallback.
+pythonpath = ["."]
 asyncio_mode = "auto"
 markers = [
     "integration: tests requiring Gate.io credentials (deselected by default)",
