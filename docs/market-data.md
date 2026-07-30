@@ -24,8 +24,10 @@ the configuration never asked for.
 ## Maturity of this page
 
 This is an alpha release of an external, community-maintained adapter, written in
-pure Python against NautilusTrader 1.230.0. **No part of it has been validated
-against the live venue.** The statuses below therefore mean:
+pure Python against NautilusTrader 1.230.0. **Live validation of market data
+covers the spot streams and requests, the instrument load on every configured
+product, and the ticker-derived streams on the USDT perpetual — and stops
+there.** The statuses below mean:
 
 * *implemented and mock-tested* — the path is exercised by the offline test suite
   against payload shapes that mirror what Gate.io sends, with no socket opened and
@@ -34,24 +36,33 @@ against the live venue.** The statuses below therefore mean:
   and reviewed, but the offline suite does not cover it end to end;
 * *unsupported* — not implemented.
 
-| Capability | Status |
-|---|---|
-| Instrument loading through the provider | implemented and mock-tested |
-| Instrument reload task inside the data client | implemented, mainnet validation pending |
-| Trade ticks | implemented and mock-tested |
-| Quote ticks from `book_ticker` | implemented and mock-tested |
-| Order book deltas, sequence validation and gap resync | implemented and mock-tested |
-| Order book snapshot on request | implemented and mock-tested |
-| Bars from the candlestick streams | implemented and mock-tested |
-| Historical bars and trades over REST | implemented, mainnet validation pending |
-| Mark price, index price, funding rate | implemented, mainnet validation pending |
-| Historical funding rates over REST | implemented, mainnet validation pending |
-| Book resynchronisation after a reconnect | implemented, mainnet validation pending |
-| `OrderBookDepth10` subscriptions | unsupported |
-| The periodic `*.order_book` snapshot channel | unsupported by the data client |
+The **mainnet** column is a separate axis: it names the products for which a
+recorded live run exists, with the run itself written down in
+[validation.md](validation.md). A dash means the venue has never been observed
+to serve this path through the adapter.
 
-Nothing here is described as stable, and nothing should be treated as validated
-until [validation.md](validation.md) records a result against the real venue.
+| Capability | Status | Mainnet |
+|---|---|---|
+| Instrument loading through the provider | implemented and mock-tested | spot, perpetual, delivery, options |
+| Instrument reload task inside the data client | implemented, mainnet validation pending | — |
+| Trade ticks | implemented and mock-tested | spot |
+| Quote ticks from `book_ticker` | implemented and mock-tested | spot |
+| Order book deltas, sequence validation and gap resync | implemented and mock-tested | spot (deltas, interval snapshots and the managed book) |
+| Order book snapshot on request | implemented and mock-tested | spot |
+| Bars from the candlestick streams | implemented and mock-tested | spot |
+| Historical bars and trades over REST | implemented; the offline suite covers the HTTP layer only | spot |
+| Mark price, index price, funding rate | implemented and mock-tested | USDT perpetual |
+| Historical funding rates over REST | implemented; the offline suite covers the HTTP layer only | USDT perpetual |
+| Book resynchronisation after a reconnect | implemented, mainnet validation pending | — |
+| `OrderBookDepth10` subscriptions | unsupported | not applicable |
+| The periodic `*.order_book` snapshot channel | unsupported by the data client | not applicable |
+
+Nothing here is described as stable. A dash means no recorded run credits that
+path to the venue: the instrument reload timer and the post-reconnect book
+resynchronisation were never observed live, and the delivery and options streams
+were subscribed in a run that counts arrivals per data type rather than per
+instrument, so nothing is attributed to them individually. The detail is in
+[validation.md](validation.md).
 
 ## Connecting
 
@@ -137,7 +148,31 @@ NautilusTrader 1.230.0; the same ordering applies to every unimplemented
 | `request_trade_ticks` | REST `*/trades` | At most 1000 rows, filtered client-side to the `start`/`end` window (see the caveat below) |
 | `request_funding_rates` | REST `/futures/{settle}/funding_rate` | Perpetual only; at most 1000 records, filtered client-side to the `start`/`end` window; sorted oldest-first |
 | `request_order_book_snapshot` | REST `*/order_book` | Depth clamped to a value the product accepts; published as one `F_SNAPSHOT` batch |
-| `request_instrument` / `request_instruments` | Instrument provider | Loads on demand if not already cached |
+| `request_instrument` | Instrument provider | Loads that one instrument from the venue if it is not already cached |
+| `request_instruments` | Instrument provider | Answers with the provider's current contents; loads nothing |
+
+**Caveat on venue-wide instrument requests.** The plural form is a read of the
+provider, not a fetch. A client configured with
+`InstrumentProviderConfig(load_all=False)` and no `load_ids` therefore completes
+the request with an empty instruments response and no diagnostic — the request
+succeeds, and nothing arrives. Configure the provider with what the strategy
+needs, or ask for instruments one at a time. This is the same choice the Tardis,
+Polymarket and dYdX adapters make, all of them provider-backed; BitMEX, Kraken,
+OKX and Deribit take the other one and re-fetch from the venue on the plural
+request. Answering from the provider keeps one definition of an instrument in
+the process, which is what reconciliation and order validation both read.
+
+**How the platform answers an instrument request.** This surprises people, so it
+is worth stating: NautilusTrader 1.230.0 does not deliver instruments in the
+response. Every instrument is handled individually and published on
+`data.instrument.<venue>.*`, and the final `DataResponse` carries an empty data
+list — the data engine's response handling forces it for an `Instrument`
+response (`DataEngine._handle_response`, `data/engine.pyx`, verified against
+1.230.0). There is no plural instrument callback on `Actor` at all; the method
+of that name on the platform's own `DataTester` is never invoked by anything.
+Read the instruments in `on_instrument` as they arrive. A caller that counts
+what came back in the response will read zero no matter which adapter answered,
+and that is a property of the platform rather than of the venue behind it.
 
 **Caveat on historical trades.** The client asks the venue only for the most
 recent rows and applies `start`/`end` itself; it does not page backwards through

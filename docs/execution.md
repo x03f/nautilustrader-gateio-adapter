@@ -20,11 +20,33 @@ affiliated with Gate.io or Nautech Systems. It deliberately deviates from the
 preferred in-tree Rust/PyO3 adapter architecture; a Rust migration is a possible
 future project, not a plan.
 
-**No part of the execution path has been validated against the live venue.**
-What exists is an offline test suite that drives the real NautilusTrader `Order`
-state machine with recorded venue payload shapes, so an event sequence the
-framework would reject fails a test rather than passing quietly. That proves the
-adapter is internally consistent; it does not prove Gate.io agrees with it.
+**Live validation of the execution path covers spot, one USDT perpetual and one
+option contract.** Gate.io has accepted, filled, amended and cancelled real spot
+orders placed through this client and closed the resulting position; on a USDT
+perpetual it has filled market orders into a short and into a long, accepted the
+reduce-only order that closed one, refused a reduce-only order sent with no
+position, and taken conditional orders on both sides that were armed, cancelled
+and re-armed at moving triggers; on an option it has taken a resting limit buy,
+filled an aggressive one, and accepted a limit sell covered by the resulting
+long. The runs and their checks are recorded in
+[validation.md](validation.md) — including the steps that failed there. Two of
+those are worth carrying in mind while reading this page: a run that cancels
+every resting order as it stops can still end with one at the venue if the
+strategy submits another while the node is stopping, which happened in two of
+four recorded shutdowns, and the batch-cancel route has never been reached by a
+live run at all. **No order has been sent to the
+venue for an inverse perpetual or a delivery contract, none on a margin,
+cross-margin or unified spot ledger, and nothing on the perpetual or the option
+beyond what is listed there.** The reports this client generates have been
+answered by the venue for nodes that had never seen the account, and an open
+perpetual position was adopted from them; adopting a resting order the same way,
+and recovering a restart with it, have not been shown live.
+
+Underneath that, and behind every row on this page, is an offline test suite
+that drives the real NautilusTrader `Order` state machine with recorded venue
+payload shapes, so an event sequence the framework would reject fails a test
+rather than passing quietly. That proves the adapter is internally consistent;
+it does not prove Gate.io agrees with it.
 
 Capabilities on this page carry one of these labels:
 
@@ -36,9 +58,11 @@ Capabilities on this page carry one of these labels:
 | unsupported | Not available. The client says so explicitly instead of approximating |
 | not applicable | The concept does not exist on that product, or not in this layer |
 
-*Mainnet validation pending* applies to every row on the page, including the
-ones labelled *implemented and mock-tested*. See
-[validation.md](validation.md), which is where real-venue results get recorded.
+Both labels are statements about the repository, not about the exchange: a row
+marked *implemented and mock-tested* is still unproven on the venue unless
+[validation.md](validation.md) records a run for it. That page grades every
+product and account mode separately, and it is the only place where a live
+result counts.
 
 **`environment` defaults to `"mainnet"`.** Set `environment="testnet"`
 explicitly for the Gate.io testnet, and note that Gate.io serves only spot and
@@ -310,6 +334,25 @@ Those are matched back to this client's armed orders and closed explicitly,
 rather than being pushed through the order-payload path where they would not be
 understood.
 
+**Cancelling an order the venue no longer holds is not a refusal.** Gate.io
+answers such a cancel with `ORDER_NOT_FOUND`, `ORDER_CLOSED`, `ORDER_CANCELLED`
+or `ORDER_FINISHED`, and its own error tables class these as benign idempotent
+races on cancel. This client's transport replays `DELETE` on a transient
+failure, so one of these labels is also the ordinary answer to a cancellation it
+already performed. Reporting it as an `OrderCancelRejected` would be a
+misstatement with consequences: the platform reverts the order to its previous
+status, leaving it open here while the venue holds nothing, and a strategy that
+re-quotes on the rejection replaces an order that no longer exists.
+
+The client asks instead of inferring: the order is re-read and its own statement
+decides, through the same translation as any other order frame. Only when the
+re-read cannot answer at all is the outcome taken from the label, and then it is
+`OrderCanceled` — the venue said it holds no live order, and that transition
+preserves the filled quantity of a partly filled order. `CANCEL_FAIL` and
+`NO_CHANGE` are deliberately excluded: neither says the order is gone, and
+reading "the cancel did not happen" as "the order is closed" is the same
+mistake pointing the other way.
+
 ### Rejection, denial and expiry
 
 **Who refused the order decides which event says so.** `OrderDenied` is the
@@ -479,9 +522,30 @@ filled before its answer was lost is found as well.
   GT-fee deduction is enabled on the account. A derivative fill is commissioned in
   the instrument's settlement currency; a payload that carries no `fee` field at
   all is reported with a zero commission rather than an invented one.
-* A quote-denominated spot market buy is restated in base units at the venue's
-  own fill price before its first fill is applied, so that position and PnL
-  arithmetic downstream works in one unit.
+* A quote-denominated spot market buy is restated in base units before its first
+  fill is applied, because NautilusTrader compares an order's filled quantity
+  against its quantity without regard to units. Gate.io states the base total
+  for such an order exactly once — when the order finishes — so until then the
+  order's quantity is a **bound**: one size increment above the base the venue
+  has credited so far, recomputed from the venue's own fill amounts. That is why
+  the order reads `PARTIALLY_FILLED` with one increment outstanding while it is
+  still working. The bound is not an estimate of the total, and deliberately so:
+
+  * a quantity below what the venue credits makes the execution engine discard
+    the venue's fill as an overfill, so a trade that happened is not booked;
+  * a quantity above it can never be reached by fills, and the platform offers
+    no way to close such an order afterwards — `OrderUpdated` triggers no state
+    transition, and reconciliation reports it as already reconciled.
+
+  When Gate.io finishes the order, its `filled_amount` replaces the bound and
+  the order is closed with `OrderCanceled`, preserving the filled quantity. A
+  Gate.io spot market buy is IOC or FOK, so whatever the cash did not buy was
+  canceled rather than left working; **a cash buy therefore ends `CANCELED`
+  rather than `FILLED`, including when it spent all of its cash.** Read the
+  outcome from `filled_qty` and the resulting position, not from the terminal
+  status. A fill still travelling on the trade stream when the order closes is
+  routed through reconciliation, which is the platform's own route for a fill
+  that lands on a canceled order.
 
 ## Conditional order identity
 
@@ -818,6 +882,23 @@ be applied against whatever quantity the local order still carries, and since
 `OrderUpdated` triggers no state transition, an order whose quantity the venue
 has moved on from could never reach a terminal status again.
 
+What remains after that grouped re-offer is decided by whether the cache holds
+the order *object* — never by the venue-order-id index alone, which the engine
+also writes for an order it has just declined to adopt
+(`filter_unclaimed_external_orders` drops an unclaimed external order and
+indexes its ids anyway; live validation caught a lone fill sent at exactly that
+dangling entry crashing the whole startup mass status, `REC-08` in the
+[review matrix](review-matrix.md#recovery-findings-raised-after-this-review)).
+Three exits: an order the cache holds takes the remaining trades over the
+single-report channel, loudly; a statement the engine heard and declined leaves
+the executions excluded together with their order, logged per trade, because
+that refusal is the engine's configured ruling; and a trade whose order
+statement could not be obtained at all makes the pass refuse honestly —
+`FillReportsUnavailable` turns into a `None` startup mass status (the kernel
+declines to start and the next attempt re-reads and heals), a kept
+reconnect state, or a logged standing loss on the stream route, which has no
+pass to refuse.
+
 The sweep now runs on both routes: after the grouped hand-over on a reconnect,
 and inside `generate_mass_status` on a restart — before the engine has
 reconciled anything, which is the ordering the withdrawn repair below got
@@ -1107,6 +1188,8 @@ execution tests.
   a filter was narrower than the account's actual history; if the definition
   cannot be fetched either, the loss is logged as an error rather than passing
   silently.
-* Nothing on this page has been exercised against Gate.io itself. Start on the
-  testnet, then start small, and record what you find in
+* Only the paths listed in [validation.md](validation.md) have been exercised
+  against Gate.io itself — spot, one USDT perpetual and one option contract.
+  Every margin ledger, every other product and every path not named there has
+  not. Start on the testnet, then start small, and record what you find in
   [validation.md](validation.md).

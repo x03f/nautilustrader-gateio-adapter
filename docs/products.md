@@ -17,8 +17,9 @@ Two things to have in mind while reading it. This is an external community
 package for NautilusTrader 1.230.0, written in pure Python, not an official
 integration: it deliberately departs from the preferred in-tree Rust and PyO3
 adapter architecture, and no migration to that architecture is promised. And it
-is an alpha release — suitable for evaluation and controlled use, with limited
-real-world validation behind it.
+is an alpha release — suitable for evaluation and controlled use, with live
+validation that reaches spot, one USDT perpetual and one option contract, and
+stops there ([validation status](validation.md)).
 
 ```python
 from nautilus_gateio import GateioProductType, GateioSpotAccountMode
@@ -36,11 +37,21 @@ selected with `spot_account_mode` and expressed as `GateioSpotAccountMode`. See
 
 ## How to read the status column
 
-This is alpha software. **No capability listed on this page has been exercised
-against the live venue**, on mainnet or on the testnet — see
-[validation status](validation.md). Statuses below therefore describe how well a
-claim is grounded in the repository, not how well it has survived contact with
-real money.
+This is alpha software. The statuses below describe how well a claim is grounded
+in the repository — not how well it has survived contact with real money.
+
+Live exercise is graded separately, and only on one page:
+[validation status](validation.md). In short: the spot market-data paths are
+confirmed on mainnet, as are the instrument load on every configured product and
+the ticker-derived streams on the USDT perpetual; on the execution side, **spot,
+one USDT perpetual and one option contract** — on the perpetual both position
+sides, the reduce-only flag and its refusal, conditional orders armed, cancelled
+and re-armed without ever firing, and a position read back from the venue by a
+node that did not open it; on the option a resting limit buy, an aggressive one
+that filled, and a covered limit sell. No order has been sent to Gate.io for an
+inverse perpetual or a delivery contract, and no margin, cross-margin or unified
+spot ledger has carried one. A row below saying *implemented and mock-tested* is
+making no claim whatsoever about the venue.
 
 | Status | Meaning here |
 |---|---|
@@ -52,7 +63,14 @@ real money.
 
 *Implemented and mock-tested* is a statement about the adapter agreeing with its
 authors, never about Gate.io agreeing with the adapter. Only a live round trip
-settles that, and none has been recorded.
+settles that, and the ones on record are listed, product by product, in
+[validation status](validation.md).
+
+The second label carries its historical name and is graded on the same axis as
+the first: *implemented, mainnet validation pending* means no test asserts the
+behaviour, not that the venue has been asked and has not answered. A spot row
+carrying it may still appear as mainnet-confirmed on the validation page, which
+is the only page that grades live evidence.
 
 ## Products at a glance
 
@@ -297,8 +315,14 @@ cached last trade, then the cached quote's mid, then the venue ticker; if none o
 those is available the order is rejected rather than priced by guesswork.
 
 Fill quantities for such an order are read from `filled_amount` (base), never
-from the submitted `amount`, which is why a partially filled quote-denominated
-buy never restates the order quantity (*implemented and mock-tested*).
+from the submitted `amount`, which is quote-currency cash. The two denominations
+are never compared: an order's completion is decided in quote units
+(`filled_total` against `amount`), and its quantity in base units. A
+quote-denominated buy carries a bound in base units while it works and is closed
+with `OrderCanceled` on the venue's own `filled_amount` when Gate.io finishes
+it, so it ends `CANCELED` rather than `FILLED` — see
+[execution](execution.md#fills) for why the platform allows no other close
+(*implemented and mock-tested*).
 
 ## Time in force by product
 

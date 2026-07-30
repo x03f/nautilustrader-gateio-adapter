@@ -7,7 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+Nothing yet.
+
+## [0.2.0a1] - 2026-07-29
+
+The first release of this adapter that Gate.io itself has answered. Everything
+before it rested on an offline suite driving the real NautilusTrader engines
+against recorded venue payloads, which is evidence about the code and not about
+the exchange. This release adds a bounded campaign of live runs on mainnet, at
+the smallest size each instrument permits, and takes its status vocabulary from
+what those runs recorded rather than from what the code intends.
+
+What the venue has confirmed is the market-data path — instruments for spot,
+perpetual, delivery and options; quotes, trades, bars, incremental book deltas
+and the book built from them; the snapshot request and the historical requests;
+mark, index and funding on a perpetual — and the spot execution path end to end,
+from a market buy through post-only, iceberg, amendment, cancel-replace,
+cancel-all and a repeated cancel to a closed position, in both time-in-force
+families and denominated in either currency. On the derivative side one USDT
+perpetual carried a market sell into a short and a market buy into a long, a
+reduce-only close, a reduce-only order the venue refused, conditional orders
+armed, re-armed and cancelled without ever firing, and a position read back out
+of the venue by a node that had not opened it and then flattened; one option
+contract carried a resting limit buy, an aggressive one that filled, and a limit
+sell covered by the resulting long. Nothing else has been sent to the exchange:
+no inverse perpetual, no delivery contract, and not one order on a margin,
+cross-margin or unified spot ledger.
+
+It stays an alpha, and nothing is marked *Stable*, because a single recorded run
+shows that a path works and not that it keeps working. One shutdown path made
+that concrete by coming out two ways in four runs of the same code: each run
+cancelled everything that was resting when it began to stop, and two of them
+then submitted one more order that was still at the venue when the run ended.
+The batch-cancel route was never reached at all, and of the state a fresh node
+reads back from the venue, the open position was adopted while the resting order
+was filtered out by the platform as unclaimed.
+[docs/validation.md](docs/validation.md) carries every run, what it checked,
+what it did not, and three recorded checks that do not check what they claim.
+
+The first three entries below were found by those runs rather than by review,
+which is the argument for having run them.
+
+### Fixed — recovery, reconciliation and order state
+
+- **A quote-denominated spot market buy is no longer left open for ever, and
+  no longer loses a fill** (`REC-09` in docs/review-matrix.md, found by live
+  validation against the real venue). Gate.io denominates a spot market buy
+  in the quote currency and states the base quantity it bought only when the
+  order finishes; the client used to restate the order on its first fill to
+  `cash / first_fill_price`. NautilusTrader decides an order's terminal state
+  by comparing its filled quantity against its quantity with no regard for
+  units and no tolerance, so that estimate governed the outcome — and against
+  a venue that publishes its own arithmetic it is wrong in both directions.
+  One increment high and no fill could ever complete the order: it stayed
+  open in the cache while the venue had finished it, reconciliation reported
+  it as already reconciled, and a cancel came back `ORDER_NOT_FOUND` and was
+  turned into a rejection that reopened it. One increment low and the
+  engine's overfill check discarded the venue's fill, so a trade that
+  happened was not booked. Across two price levels the estimate could not
+  come out right at all.
+
+  The order no longer carries an estimate. While it works, its quantity is a
+  bound built from the venue's own fill amounts — one size increment above
+  the base credited so far — so no fill can be discarded and none can close
+  the order before the venue says it is finished. When Gate.io finishes it,
+  its `filled_amount` replaces the bound and the order is closed with
+  `OrderCanceled`, preserving the filled quantity. A Gate.io spot market buy
+  is IOC or FOK, so whatever the cash did not buy was canceled rather than
+  left working — **a cash buy therefore ends `CANCELED` rather than `FILLED`
+  even when it spends all of its cash**, and its outcome is read from
+  `filled_qty` and the resulting position. Separately, a cash buy's
+  completion is now decided in quote units (`filled_total` against `amount`)
+  instead of across denominations, so it no longer depends on whether the
+  pair's base number happens to be larger than its quote number.
+
+- **Cancelling an order Gate.io no longer holds no longer reopens it**
+  (part of `REC-09`). The venue answers such a cancel with `ORDER_NOT_FOUND`,
+  `ORDER_CLOSED`, `ORDER_CANCELLED` or `ORDER_FINISHED`, and its own error
+  tables class these as benign idempotent races; because this client's
+  transport replays `DELETE`, one of them is also the ordinary answer to a
+  cancellation that worked. They were reported as `OrderCancelRejected`,
+  which the platform applies by reverting the order to its previous status —
+  so the order stood open here while the venue held nothing, and a strategy
+  re-quoting on the rejection would have replaced an order that no longer
+  existed. The client now re-reads the order and lets its own statement
+  decide, falling back to `OrderCanceled` only when the re-read cannot answer
+  at all; a partly filled order keeps its fills. `CANCEL_FAIL` and
+  `NO_CHANGE` still report a refusal, because neither says the order is gone.
+
+- **A recovered trade whose order the engine refused to adopt no longer
+  crashes startup reconciliation** (`REC-08` in docs/review-matrix.md, found
+  and closed by live validation against the real venue). The recovery
+  sweep's last-resort branch trusted the venue-order-id index as proof the
+  single-report channel could book, but the engine also writes that index
+  for an unclaimed external order it has just filtered
+  (`filter_unclaimed_external_orders`) without creating the order — and a
+  lone `FillReport` sent at such a dangling entry crashed the engine's
+  fallback lookup (`Cache.orders(side=None)`, `TypeError: an integer is
+  required`) instead of deferring, taking the whole startup mass status with
+  it: the node reported RUNNING with an unreconciled execution state. The
+  channel is now gated on the cached order object. An order the engine
+  declined to adopt keeps its executions excluded with it, logged per trade
+  — that refusal is the engine's configured ruling. A trade whose order
+  statement cannot be obtained at all now makes the pass refuse honestly
+  instead of returning a book that silently lacks a venue execution: the
+  startup mass status is refused (`None`, so the kernel declines to start
+  and the next attempt heals), the reconnect keeps its stale-but-honest
+  state, and the stream route logs the standing loss for the next
+  reconciliation to repair.
 
 - **The staleness protection now covers every trade a recovery pass books
   over prior knowledge, closing the two doors its arming rule left open**
@@ -207,7 +314,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   USDT-settled perpetual and the USDT options wallet add up rather than
   overwrite one another.
 
-### Fixed
+### Fixed — execution, data, accounting and transport
 
 - **Reconnect recovery of an order that missed more than one fill.** Every
   recovered trade of one order is now handed over under the venue's own
@@ -515,20 +622,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this adapter has not implemented yet (both trailing types and attached
   take-profit / stop-loss exist at the venue).
 
-## [0.2.0a1] - 2026-07-26
+### The rebuild from 0.1.0
 
-An alpha. 0.1.0 was a spot-only adapter with a flat module layout; 0.2.0a1 is a
+0.1.0 was a spot-only adapter with a flat module layout; 0.2.0a1 is a
 multi-product connector built on real venue data throughout. See
 [docs/migration-0.1-to-0.2.md](docs/migration-0.1-to-0.2.md) for the upgrade
 path.
 
-Released as an alpha, not a stable version, because real-world validation and
-external user feedback are still limited. The test suite is extensive and runs
-without credentials, but a passing suite is evidence about the code, not about
-the exchange. Treat every capability as needing your own verification before it
-carries money. The per-capability status is in
-[docs/validation.md](docs/validation.md); the audit trail behind the code is in
-[docs/review-matrix.md](docs/review-matrix.md).
+Live validation is bounded, and external user feedback has not happened yet, so
+treat every capability as needing your own verification before it carries money.
+The per-capability status is in [docs/validation.md](docs/validation.md); the
+audit trail behind the code is in [docs/review-matrix.md](docs/review-matrix.md).
 
 0.1.0 remains available: its tag and release are untouched and its
 implementation is preserved on the `legacy/v0.1.0` branch.
@@ -610,7 +714,7 @@ implementation is preserved on the `legacy/v0.1.0` branch.
   base-denominated spot market buy is expressed as an IOC limit, bounded by the
   pair's own published slippage cap.
 
-### Added
+### Added in the rebuild
 
 - **Products**: spot, USDT perpetual futures, BTC-settled (inverse) perpetual
   futures, USDT delivery futures and USDT-settled options. One data client and
@@ -644,7 +748,7 @@ implementation is preserved on the `legacy/v0.1.0` branch.
   [migration](docs/migration-0.1-to-0.2.md), [validation
   status](docs/validation.md) and [releasing](docs/releasing.md).
 
-### Fixed
+### Fixed in the rebuild
 
 - **Documentation described a testnet default that the code does not have.**
   Every page now states the mainnet default, and a regression test compares the
@@ -693,6 +797,6 @@ Initial release.
 - Documentation set: architecture, configuration, market data, execution, testing, and troubleshooting guides.
 - Unit test suite (no network access required) and continuous integration workflow.
 
-[Unreleased]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.1.0...v0.2.0
+[Unreleased]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.2.0a1...HEAD
+[0.2.0a1]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.1.0...v0.2.0a1
 [0.1.0]: https://github.com/x03f/nautilustrader-gateio-adapter/releases/tag/v0.1.0
