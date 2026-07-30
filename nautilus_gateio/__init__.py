@@ -26,6 +26,32 @@ Instrument ids use the exact Gate.io symbol, with the conventional ``-PERP``
 suffix on perpetual contracts (the only case where Gate.io reuses a symbol
 across products): ``BTC_USDT.GATE_IO``, ``BTC_USDT-PERP.GATE_IO``,
 ``BTC_USDT_20260807.GATE_IO``, ``BTC_USDT-20260729-70000-C.GATE_IO``.
+
+Venue-native data
+-----------------
+:class:`~nautilus_gateio.types.GateioTicker` carries the ticker fields
+NautilusTrader has no type of its own for: 24-hour statistics, implied
+volatilities, the greeks and the delivery basis. Subscribe to it with the
+metadata form, which is the topic the published rows are addressed to:
+
+.. code-block:: python
+
+    from nautilus_trader.model.data import DataType
+    from nautilus_gateio import GATEIO_CLIENT_ID, GateioTicker
+
+    self.subscribe_data(
+        DataType(GateioTicker, metadata={"instrument_id": instrument_id}),
+        client_id=GATEIO_CLIENT_ID,
+    )
+
+Importing this package registers ``GateioTicker`` with the platform's msgpack
+and Arrow serializers, so it can be persisted and sent over an external message
+bus. The registration is not called here, unlike the in-tree adapters that call
+``register_serializable_type`` in their own ``__init__``: their types are plain
+``Data`` subclasses, while ``GateioTicker`` is built with ``@customdataclass``,
+which performs both registrations itself at class definition
+(``model/custom.py:159-160``). Registering a type twice raises ``KeyError``, so
+repeating the in-tree call here would stop the package importing at all.
 """
 
 from nautilus_gateio.books import GateioOrderBook, OrderBookSequenceError
@@ -91,6 +117,7 @@ from nautilus_gateio.instruments import (
     parse_spot_instrument,
 )
 from nautilus_gateio.providers import GateioInstrumentProvider
+from nautilus_gateio.types import TICKER_FIELDS, GateioTicker
 from nautilus_gateio.websocket import (
     GateioPrivateWebSocket,
     GateioPublicWebSocket,
@@ -127,11 +154,13 @@ __all__ = [
     "GateioServerError",
     "GateioSpotAccountMode",
     "GateioSpotHttpAPI",
+    "GateioTicker",
     "GateioTimeInForce",
     "GateioWalletHttpAPI",
     "GateioWebSocketClient",
     "OrderBookSequenceError",
     "OrderValidationError",
+    "TICKER_FIELDS",
     "UnsupportedOrderError",
     "WalletNotProvisionedError",
     "WalletQueryRefusedError",

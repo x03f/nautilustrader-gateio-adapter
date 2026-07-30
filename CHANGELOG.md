@@ -7,7 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+This round closes hooks the adapter had left to the base class, where the base
+class does not fail cleanly: `LiveMarketDataClient` records a subscription before
+it starts the task that raises `NotImplementedError`, so an unimplemented hook
+leaves a subscription the client reports as held for the rest of its life and
+never retries. Everything below is implemented and mock-tested — the offline
+suite drives it against recorded venue payload shapes. None of it has been run
+against Gate.io: the mainnet column stays empty for every row this round adds.
+
+### Added
+
+- **`subscribe_order_book_depth` publishes `OrderBookDepth10`** on all five
+  products, from Gate.io's periodic `*.order_book` snapshot channel. That channel
+  is not the incremental stream the delta path uses: every message is a complete
+  book, so it needs no REST seed, no sequence algorithm and no rebuild after a
+  reconnect. Ten levels per side, both sides sorted and padded with the
+  platform's `NULL_ORDER` (the type requires equal lengths and Gate.io sends
+  asymmetric sides on thin contracts), zero per-level counts (the venue publishes
+  none), `F_LAST` rather than `F_SNAPSHOT`, and the venue's own sequence. The
+  push interval may be set per subscription through
+  `params={"interval": "100ms"}`. Holding deltas and depth for one instrument is
+  legal at the venue but gives NautilusTrader's single cached book two writers,
+  and the client warns when it sees that.
+
+- **`subscribe_instrument_status`**, polled from the instrument listings on the
+  reload cadence, with the mapping table and the diff in their own module
+  (`nautilus_gateio/common/status.py`). Gate.io publishes no status channel on
+  any product, which is also the honest limit: a halt shorter than the poll
+  interval is invisible. Subscribing reports the current status at once and then
+  only on change; `reason` names the venue field that decided it, verbatim; only
+  `TRADING`, `PRE_OPEN` and `NOT_AVAILABLE_FOR_TRADING` are ever emitted, because
+  Gate.io's listings distinguish nothing finer and the other actions would be
+  inventions of venue intent. An instrument absent from a listing that was read
+  is a delisting; one absent because the request failed is not.
+
+- **`subscribe_instrument_close`** for delivery futures and options, published
+  from the venue's settlement once the contract expires. `close_price` is not
+  optional and has no null form, so the three continuously trading products —
+  spot, perpetual, inverse perpetual — refuse the subscription with that reason
+  rather than accepting it and staying silent. A delivery close is published only
+  when the contract and the ticker state the same settlement price; an option's
+  close is its own value (the settlement row's `profit` over the contract
+  multiplier), cross-checked against the intrinsic value implied by the row's
+  settle price and strike, and never the underlying's settlement price.
+
+- **`GateioTicker`**, the venue ticker row as adapter-specific custom data,
+  reachable through `subscribe_data` and exported from the package. It carries
+  the fields NautilusTrader has no type for — 24-hour statistics, the delivery
+  basis, implied volatilities and greeks, the indicative next funding rate — and
+  deliberately not mark price, index price or funding rate, which are published
+  from the same message as the platform's own types. Subscribe with
+  `DataType(GateioTicker, metadata={"instrument_id": instrument_id})`: that is
+  the topic the rows are addressed to. The type registers itself with the
+  platform's msgpack and Arrow serializers on import.
+
+- **`submit_order_list`.** A list with no contingency is submitted in full:
+  grouped by product and sent as one batch request where Gate.io has one and the
+  group fits its caps (spot, perpetual, inverse), one order at a time everywhere
+  else. Attribution follows the client order id this client sent rather than the
+  row position; an order the response never mentioned is left in flight rather
+  than guessed at; an ambiguous whole-request failure leaves every leg
+  `SUBMITTED`. A list carrying `linked_order_ids` or a contingency type — every
+  bracket, OCO and OTO — is denied in full, every leg, with the reason: Gate.io's
+  attached take-profit / stop-loss accepts no client-supplied identifier for the
+  attached leg, so announcing legs that can never acquire a venue order id would
+  end with the platform reporting a stop-loss rejected while the venue holds it
+  live. Order emulation remains the supported route to brackets.
+
+- **`query_account`** re-reads every enabled product's wallet over REST and
+  publishes a fresh `AccountState`, naming at error level any wallet it could not
+  read — those figures are a restatement of the last reading, not a new one.
+  Before this the command raised `AttributeError` out of the live client, which
+  the execution engine does not guard.
+
+- **`request_quote_ticks` refuses explicitly.** Gate.io publishes no quote
+  history on any product: `GET /*/tickers` is one current row, not a series. The
+  refusal names the venue fact and the alternatives instead of raising
+  `NotImplementedError` from the base class, and never reads the ticker endpoint.
+  A refused request completes nothing — only a response closes the platform's
+  request group — which the documentation now states.
+
+### Fixed
+
+- **A published `GateioTicker` reached no subscriber.** The row was handed to
+  `_handle_data` unwrapped, and `DataEngine` dispatches a venue-native type only
+  through `CustomData`: anything else falls to `Cannot handle data: unrecognized
+  type` and is dropped, while the client goes on reporting the subscription held.
+  The publish now carries the in-tree wrapper and the instrument metadata that
+  makes the topic match the subscription. The suite gained an end-to-end test
+  through a real `DataEngine` and a real subscribing actor, because every other
+  test in that file reads the client's own publish seam and nothing in the
+  package ever saw what the engine did next.
+
+- **A ticker subscription lost to a reconnect no longer goes quiet.** A transient
+  WebSocket failure dropped the client's ticker registry entry; the transport
+  still replayed the subscription, and every replayed row was then discarded as
+  unsubscribed. The entry is now kept for a transient failure and dropped only
+  for a venue refusal, which is what every other subscription path in this client
+  already did.
+
+- **The depth sequence watermark is forgotten on a reconnect.** Gate.io restarts
+  the snapshot channel's sequence on a new connection, so the monotonic guard
+  read the whole new stream as reordered and dropped it into a counter with no
+  log line while the subscription still looked healthy.
+
+- **An unreadable `*.order_book` message is logged instead of dropped.** Every
+  message on that channel is a whole book, so silence there is indistinguishable
+  from a quiet market and leaves the managed book frozen at its last snapshot.
+
+- **An instrument status no longer quotes a field the venue payload never
+  carried.** A contract listing with no `in_delisting`, no `status` and no
+  `expire_time` was reported `TRADING` with the reason `in_delisting=false`. The
+  action is unchanged — nothing in that payload states a halt — but the reason
+  now names a field the payload did carry, which is the only thing it is for.
+
+- **An option close reads the contract terms from the instrument, not from its
+  venue payload.** The multiplier, the strike and the call/put kind are
+  first-class fields of `CryptoOption`; reading them from `info` meant an
+  instrument whose payload did not survive a round trip settled as a put with no
+  multiplier — silently, because `bool(None)` is `False`.
+
+### Changed
+
+- The market-data, products and execution pages and the README matrices state
+  what is now implemented, with the mainnet column empty for all of it. The
+  passage explaining that `subscribe_order_book_depth` is unimplemented is gone;
+  the platform behaviour it described is still documented, pinned against
+  `subscribe_option_greeks`, which is still not implemented.
 
 ## [0.2.0a1] - 2026-07-29
 

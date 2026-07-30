@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -25,9 +24,13 @@ from nautilus_trader.data.messages import RequestOrderBookSnapshot
 from nautilus_trader.model.data import (
     Bar,
     BarType,
+    CustomData,
     FundingRateUpdate,
     IndexPriceUpdate,
+    InstrumentClose,
+    InstrumentStatus,
     MarkPriceUpdate,
+    OptionGreeks,
     OrderBookDelta,
     OrderBookDeltas,
     OrderBookDepth10,
@@ -36,6 +39,7 @@ from nautilus_trader.model.data import (
 )
 from nautilus_trader.model.enums import BookAction, BookType, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
+from nautilus_trader.model.instruments import Instrument
 
 from nautilus_gateio import data as data_module
 from nautilus_gateio.books import GateioOrderBook
@@ -55,9 +59,6 @@ SPOT_ID = InstrumentId.from_str("BTC_USDT.GATE_IO")
 PERP_ID = InstrumentId.from_str("BTC_USDT-PERP.GATE_IO")
 OPTION_SYMBOL = "BTC_USDT-20260731-70000-C"
 OPTION_ID = InstrumentId.from_str(f"{OPTION_SYMBOL}.GATE_IO")
-
-#: The repository root, for the tests that check a claim against the code.
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # -- fixtures ----------------------------------------------------------------
@@ -135,13 +136,62 @@ def build_instruments() -> list[Any]:
     return [spot, perp, option]
 
 
+#: The concrete types ``DataEngine._handle_data`` dispatches on
+#: (``data/engine.pyx:2541-2571``). Everything else reaches its ``else`` branch
+#: and is logged as ``Cannot handle data: unrecognized type`` and dropped
+#: (``:2572-2573``), which is a failure only an error line records. A
+#: venue-native type therefore has to arrive wrapped in ``CustomData``.
+ENGINE_DISPATCHED_TYPES: tuple[type, ...] = (
+    OrderBookDelta,
+    OrderBookDeltas,
+    OrderBookDepth10,
+    QuoteTick,
+    TradeTick,
+    MarkPriceUpdate,
+    IndexPriceUpdate,
+    FundingRateUpdate,
+    Bar,
+    Instrument,
+    InstrumentStatus,
+    InstrumentClose,
+    OptionGreeks,
+    CustomData,
+)
+
+#: Types published through a `Harness` that `DataEngine._handle_data` would not
+#: dispatch. Written by the seam, read and cleared after every test by the
+#: `_no_undispatchable_publish` fixture in `tests/conftest.py`.
+UNDISPATCHABLE_PUBLISHES: list[str] = []
+
+
 class Harness:
     """A constructed data client plus everything the tests published through it."""
 
     def __init__(self, client: GateioDataClient) -> None:
         self.client = client
         self.published: list[Any] = []
-        client._handle_data = self.published.append  # type: ignore[method-assign]
+        client._handle_data = self._record  # type: ignore[method-assign]
+
+    def _record(self, data: Any) -> None:
+        """Record one published object, and note one the engine could not dispatch.
+
+        This seam is what hid a real defect: replacing ``_handle_data`` with
+        ``list.append`` meant an object the engine drops looked published to
+        every assertion in the suite, and a venue-native type published outside
+        ``CustomData`` passed 1968 tests while reaching no subscriber. The check
+        lives on the seam rather than in one test, so every data test in the
+        package carries it.
+
+        It records rather than raises because most publishes happen inside
+        ``_handle_ws_message``, which catches per-message exceptions so one bad
+        payload never kills the stream — an assertion here would be swallowed
+        exactly like the defect it is looking for. ``_no_undispatchable_publish``
+        in ``tests/conftest.py`` reads the record after the test, where nothing
+        can swallow it.
+        """
+        if not isinstance(data, ENGINE_DISPATCHED_TYPES):
+            UNDISPATCHABLE_PUBLISHES.append(type(data).__name__)
+        self.published.append(data)
 
     def deltas(self) -> list[OrderBookDeltas]:
         return [item for item in self.published if isinstance(item, OrderBookDeltas)]
@@ -948,8 +998,6 @@ async def test_transient_subscribe_failure_keeps_the_local_book(harness: Harness
     tracked: list[Any] = []
     client.create_task = lambda coro, **_: tracked.append(coro)  # type: ignore[method-assign]
 
-    from nautilus_trader.model.enums import BookType
-
     command = data_module.SubscribeOrderBook(
         instrument_id=PERP_ID,
         book_data_type=OrderBookDelta,
@@ -1517,52 +1565,6 @@ async def test_funding_rate_history_is_refused_for_a_product_without_funding(
 
     assert http.calls == []
     assert responses == []
-
-
-# -- the failure mode of an unimplemented subscribe hook ---------------------
-
-
-async def test_an_unimplemented_depth_subscription_leaves_a_phantom_subscription(
-    harness: Harness,
-) -> None:
-    """Regression for a documentation claim, checked against the platform itself.
-
-    ``docs/market-data.md`` used to say the base class's ``NotImplementedError``
-    made ``subscribe_order_book_depth`` "fail visibly rather than sitting there
-    delivering nothing". It does both. ``LiveMarketDataClient`` records the
-    subscription *before* it creates the task that raises, and
-    ``DataEngine._handle_subscribe_order_book`` then skips any instrument already
-    in ``subscribed_order_book_depth()``, so the failure is logged once and the
-    phantom subscription is never retried or cleared.
-    """
-    client = harness.client
-    client._loop = asyncio.get_running_loop()
-
-    command = data_module.SubscribeOrderBook(
-        instrument_id=SPOT_ID,
-        book_data_type=OrderBookDepth10,
-        book_type=BookType.L2_MBP,
-        client_id=GATEIO_CLIENT_ID,
-        venue=GATEIO_VENUE,
-        command_id=UUID4(),
-        ts_init=0,
-        depth=10,
-    )
-    client.subscribe_order_book_depth(command)
-    await asyncio.sleep(0)  # let the task that raises run to completion
-    await asyncio.sleep(0)
-
-    assert client.subscribed_order_book_depth() == [SPOT_ID], (
-        "the platform no longer records the subscription before the task raises; "
-        "the documented failure mode has to be re-checked"
-    )
-
-    page = (REPO_ROOT / "docs" / "market-data.md").read_text(encoding="utf-8")
-    assert "failure is **not** clean" in page, (
-        "market-data.md must state that an unimplemented depth subscription both "
-        "raises and leaves a subscription the client keeps reporting"
-    )
-    assert "the subscription fails visibly" not in page, "the retracted claim is still on the page"
 
 
 # -- s4: the client uses the platform's task machinery, not its own ----------

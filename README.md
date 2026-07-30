@@ -22,8 +22,11 @@ instrument ids and the execution environment default all changed.
 ## What it does
 
 * **Real market data only.** Trades, best bid/offer quotes, sequence-validated
-  order book deltas, closed bars, mark and index prices and funding rates — all
-  from the venue's own streams. Nothing is synthesised or interpolated.
+  order book deltas, ten-level depth from the venue's periodic snapshot channel,
+  closed bars, mark and index prices, funding rates, instrument status and
+  settlement closes — all from the venue's own streams and listings. Nothing is
+  synthesised or interpolated: where Gate.io publishes no history, the request is
+  refused rather than answered from a current row.
 * **Every tradable product.** One data client and one execution client
   multiplex spot, USDT perpetuals, BTC-settled perpetuals, USDT delivery futures
   and USDT-settled options.
@@ -137,6 +140,7 @@ mainnet, but a single recorded run is not evidence of stability — see
 | Trade ticks | yes | yes | yes | yes | yes | Implemented — mock-tested | spot | `*.trades`; venue trade id preserved |
 | Quote ticks (real BBO) | yes | yes | yes | yes | yes | Implemented — mock-tested | spot | `*.book_ticker`; no synthesised quotes anywhere |
 | Order book deltas | yes | yes | yes | yes | yes | Implemented — mock-tested | spot | REST snapshot + incremental stream, sequence-validated, resync on gap. Interval snapshots and the managed book were confirmed in the same run |
+| Order book depth (`OrderBookDepth10`) | yes | yes | yes | yes | yes | Implemented — mock-tested | — | The venue's periodic `*.order_book` snapshot channel, ten levels per side |
 | Order book snapshot request | yes | yes | yes | yes | yes | Implemented — mock-tested | spot | Depth clamped to what the product accepts |
 | Bars (closed only) | yes | yes | yes | yes | yes | Implemented — mock-tested | spot | 1s to 7d; delivery and options infer the close |
 | Historical bars / trades | yes | yes | yes | yes | yes | Partial (offline coverage reaches the HTTP layer only) | spot | Paginated REST, 1000 rows per call |
@@ -145,6 +149,10 @@ mainnet, but a single recorded run is not evidence of stability — see
 | Funding rate | n/a | yes | yes | n/a | n/a | Implemented — mock-tested | USDT perpetual | From `futures.tickers` |
 | Historical funding rates | n/a | yes | yes | n/a | n/a | Partial (offline coverage reaches the HTTP layer only) | USDT perpetual | REST `/futures/{settle}/funding_rate` |
 | Instrument updates | yes | yes | yes | yes | yes | Implemented — mock-tested | — | Polled; Gate.io has no instrument channel. The initial load is confirmed on mainnet (see Instruments below); the periodic reload is not |
+| Instrument status | yes | yes | yes | yes | yes | Implemented — mock-tested | — | Polled from the instrument listings; Gate.io publishes no status channel, so a halt shorter than the poll interval is invisible |
+| Instrument close | n/a | n/a | n/a | yes | yes | Implemented — mock-tested | — | Settlement after expiry; the three continuous products never settle and the subscription is refused |
+| `GateioTicker` custom data | yes | yes | yes | yes | yes | Implemented — mock-tested | — | The venue ticker fields the platform has no type for: 24h statistics, greeks, implied volatilities, delivery basis |
+| Historical quotes | n/a | n/a | n/a | n/a | n/a | Unsupported | n/a | Gate.io publishes no quote history; the request is refused rather than answered from the current ticker row |
 | Options underlying streams | n/a | n/a | n/a | n/a | yes | Partial | — | Reachable through the raw WebSocket client, not wired into the data engine |
 
 ### Instruments
@@ -170,6 +178,8 @@ mainnet, but a single recorded run is not evidence of stability — see
 | Reduce-only | n/a | yes | yes | yes | yes | Implemented — mock-tested | USDT perpetual (closed a short, and refused by the venue with no position open) |
 | Iceberg (`display_qty`, non-zero) | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (accepted carrying its display quantity) |
 | Quote-denominated quantity | market buy | no | no | no | no | Implemented — mock-tested | spot (the venue filled it and reported the quantity in base units; the order itself closes `CANCELED` on the venue's own base total, never `FILLED`) |
+| Order lists, no contingency | yes | yes | yes | yes | yes | Implemented — mock-tested | — | Batched where the venue has a batch endpoint and the group fits, otherwise one order at a time |
+| Order lists with a contingency (bracket, OCO, OTO) | no | no | no | no | no | Unsupported (denied in full, with the reason) | n/a | Gate.io's attached TP/SL carries no per-leg id, so the legs could never be identified; use order emulation |
 | Cancel / cancel-all / batch cancel | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (single cancel, repeated cancel, cancel-replace and cancel-all, each clearing what was resting); options (a resting buy and a resting sell cancelled); the batch endpoint has no live run, and two shutdowns left behind an order submitted after the sweep |
 | Modify (amend) | yes | yes | yes | no | no | Partial (delivery and options reject explicitly) | spot (price amendment acknowledged) |
 | Private WebSocket lifecycle | yes | yes | yes | yes | yes | Implemented — mock-tested | — |
@@ -186,6 +196,7 @@ mainnet, but a single recorded run is not evidence of stability — see
 | Isolated margin ledger | Implemented — mock-tested | — | `spot_account_mode=MARGIN` |
 | Cross margin ledger | Implemented — mock-tested | — | Requires a unified account on the venue |
 | Unified account | Implemented — mock-tested | — | `single_currency` has no balance minimum; per Gate.io's documentation `multi_currency` needs > 500 USDT and `portfolio` > 1000 USDT, which this adapter neither enforces nor checks |
+| `Strategy.query_account()` | Implemented — mock-tested | — | Re-reads every enabled product's wallet over REST; names the wallets it could not read |
 | Borrow / repay endpoints | Implemented — mock-tested | — | Exposed because isolated and cross margin need them; every liability-creating method says so |
 | Withdrawals, sub-accounts, Earn, Gate Pay, P2P, Copy Trading, Bots | Unsupported | n/a | Out of scope: unrelated to trading, no code exists for them |
 

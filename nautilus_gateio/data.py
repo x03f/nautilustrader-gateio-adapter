@@ -18,12 +18,29 @@ Nautilus subscription                   Gate.io source
 ``_subscribe_trade_ticks``              ``{spot,futures,options}.trades``
 ``_subscribe_quote_ticks``              ``{spot,futures,options}.book_ticker``
 ``_subscribe_order_book_deltas``        REST snapshot + ``*.order_book_update``
+``_subscribe_order_book_depth``         ``*.order_book`` (periodic snapshot)
 ``_subscribe_bars``                     ``*.candlesticks`` (closed bars only)
 ``_subscribe_mark_prices``              ``<ticker channel>.mark_price``
 ``_subscribe_index_prices``             ``<ticker channel>.index_price``
 ``_subscribe_funding_rates``            ``futures.tickers.funding_rate``
+``_subscribe`` (``GateioTicker``)       ``<ticker channel>`` (the whole row)
+``_subscribe_instrument_status``        polled instrument listings (no channel)
+``_subscribe_instrument_close``         polled settlement (dated products only)
 ``_request_funding_rates``              ``GET /futures/{settle}/funding_rate``
 ======================================  =======================================
+
+``_request_quote_ticks`` is implemented only to refuse: Gate.io publishes a
+live best bid/offer stream and no quote history on any product.
+
+Books
+-----
+The two book subscriptions read different venue channels and neither derives
+from the other. Deltas come from the incremental ``*.order_book_update`` stream
+aligned against a REST snapshot; ``OrderBookDepth10`` comes from the periodic
+``*.order_book`` snapshot channel, which is self-synchronising and needs no
+sequence algorithm, no REST seed and no rebuild after a reconnect. Holding both
+for one instrument is allowed by the venue but gives NautilusTrader's single
+cached ``OrderBook`` two writers, so the client warns when it sees that.
 
 Reference prices
 ----------------
@@ -71,25 +88,33 @@ from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.data.messages import (
     RequestBars,
+    RequestData,
     RequestFundingRates,
     RequestInstrument,
     RequestInstruments,
     RequestOrderBookSnapshot,
+    RequestQuoteTicks,
     RequestTradeTicks,
     SubscribeBars,
+    SubscribeData,
     SubscribeFundingRates,
     SubscribeIndexPrices,
     SubscribeInstrument,
+    SubscribeInstrumentClose,
     SubscribeInstruments,
+    SubscribeInstrumentStatus,
     SubscribeMarkPrices,
     SubscribeOrderBook,
     SubscribeQuoteTicks,
     SubscribeTradeTicks,
     UnsubscribeBars,
+    UnsubscribeData,
     UnsubscribeFundingRates,
     UnsubscribeIndexPrices,
     UnsubscribeInstrument,
+    UnsubscribeInstrumentClose,
     UnsubscribeInstruments,
+    UnsubscribeInstrumentStatus,
     UnsubscribeMarkPrices,
     UnsubscribeOrderBook,
     UnsubscribeQuoteTicks,
@@ -97,14 +122,20 @@ from nautilus_trader.data.messages import (
 )
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import (
+    NULL_ORDER,
     Bar,
     BarType,
     BookOrder,
+    CustomData,
+    DataType,
     FundingRateUpdate,
     IndexPriceUpdate,
+    InstrumentClose,
+    InstrumentStatus,
     MarkPriceUpdate,
     OrderBookDelta,
     OrderBookDeltas,
+    OrderBookDepth10,
     QuoteTick,
     TradeTick,
 )
@@ -113,11 +144,15 @@ from nautilus_trader.model.enums import (
     AggressorSide,
     BookAction,
     BookType,
+    InstrumentCloseType,
+    MarketStatusAction,
+    OptionKind,
     OrderSide,
     PriceType,
     RecordFlag,
     bar_aggregation_to_str,
     book_type_to_str,
+    market_status_action_to_str,
 )
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, TradeId
 from nautilus_trader.model.instruments import Instrument
@@ -128,6 +163,7 @@ from nautilus_gateio.books import (
     GateioOrderBook,
     OrderBookSequenceError,
     SnapshotStaleError,
+    parse_levels,
 )
 from nautilus_gateio.common.constants import (
     GATEIO_INTERVAL_MS,
@@ -143,6 +179,7 @@ from nautilus_gateio.common.parsing import (
     to_float,
     to_int,
 )
+from nautilus_gateio.common.status import diff_and_emit_statuses, market_status_action
 from nautilus_gateio.common.symbols import (
     gateio_to_instrument_id,
     instrument_id_to_gateio,
@@ -157,10 +194,12 @@ from nautilus_gateio.http.client import GateioHttpClient
 from nautilus_gateio.http.futures import GateioFuturesHttpAPI
 from nautilus_gateio.http.options import GateioOptionsHttpAPI
 from nautilus_gateio.http.spot import GateioSpotHttpAPI
+from nautilus_gateio.types import GateioTicker
 from nautilus_gateio.websocket.client import is_transient_ws_error
 from nautilus_gateio.websocket.public import (
     BOOK_INTERVALS_MS,
     BOOK_LEVELS,
+    BOOK_SNAPSHOT_PUSH_INTERVALS,
     GateioPublicWebSocket,
     nearest_snapshot_limit,
     tickers_channel,
@@ -188,13 +227,47 @@ BAR_CLOSE_GRACE_SECS: Final[float] = 5.0
 #: How often the pending-bar flush runs.
 BAR_FLUSH_INTERVAL_SECS: Final[float] = 1.0
 
+#: Levels per side an ``OrderBookDepth10`` carries. The type is fixed at ten
+#: (``core/includes/model.h`` ``DEPTH10_LEN``), and Gate.io's snapshot channel
+#: offers exactly ten on all five products, so nothing is truncated.
+DEPTH10_LEVELS: Final[int] = 10
+
+#: How often a settled contract is re-read while waiting for the venue to
+#: publish its settlement price, and how long that wait may last. Delivery
+#: settlement is published within minutes of expiry, but an option's settlement
+#: row appears on Gate.io's own schedule; the wait is bounded so that a
+#: subscription for a contract the venue never settles does not poll forever.
+INSTRUMENT_CLOSE_POLL_SECS: Final[float] = 30.0
+INSTRUMENT_CLOSE_TIMEOUT_SECS: Final[float] = 3600.0
+
+#: Half-width of the window searched for an option settlement row, in seconds.
+#: ``GET /options/settlements`` is queried by time range, and the row's own
+#: ``time`` is the venue's settlement instant, which need not equal the
+#: contract's stated ``expiration_time`` to the second.
+OPTION_SETTLEMENT_WINDOW_SECS: Final[int] = 86_400
+
 #: Subscription kinds sharing the ``futures.tickers`` channel.
 _MARK: Final[str] = "mark"
 _INDEX: Final[str] = "index"
 _FUNDING: Final[str] = "funding"
+#: The whole ticker row, published as :class:`GateioTicker`. It shares the same
+#: venue channel and the same reference count as the three above, so a strategy
+#: holding both a mark-price and a ticker subscription costs one subscription.
+_TICKER: Final[str] = "ticker"
 
 
 _NANOS_PER_SEC: Final[int] = 1_000_000_000
+
+
+class _SettlementConflict(Exception):
+    """Two venue sources disagreed about a settlement price.
+
+    Raised to stop a close watcher rather than to be reported to a caller: a
+    disagreement between two independent public fields is not transient, so
+    re-polling would produce the same contradiction every time, and
+    ``InstrumentClose.close_price`` has no null form in which to say "closed,
+    price unknown".
+    """
 
 
 class _PendingBar(NamedTuple):
@@ -409,6 +482,16 @@ class GateioDataClient(LiveMarketDataClient):
         self._book_streams: dict[InstrumentId, tuple[str, int | None]] = {}
         self._book_levels: dict[InstrumentId, int] = {}
         self._resyncing: set[InstrumentId] = set()
+        # Depth keeps its own registries rather than sharing the delta path's.
+        # Sharing `self._books` would make `_unsubscribe_order_book_deltas` tear
+        # down a live depth stream and would make `_handle_ws_reconnect` schedule
+        # a REST resnapshot for a channel that resynchronises itself.
+        self._depth_streams: dict[InstrumentId, tuple[int, str]] = {}
+        self._depth_sequences: dict[InstrumentId, int] = {}
+        self._instrument_status_subs: set[InstrumentId] = set()
+        self._status_cache: dict[InstrumentId, MarketStatusAction] = {}
+        self._instrument_close_tasks: dict[InstrumentId, asyncio.Task] = {}
+        self._instrument_close_emitted: set[InstrumentId] = set()
         self._bar_types: dict[tuple[GateioProductType, str], BarType] = {}
         self._bar_pending: dict[BarType, _PendingBar] = {}
         self._bar_published: dict[BarType, int] = {}
@@ -524,6 +607,10 @@ class GateioDataClient(LiveMarketDataClient):
         await self.cancel_pending_tasks()
         self._update_instruments_task = None
         self._bar_flush_task = None
+        # The close watchers were cancelled with everything else above; dropping
+        # the handles keeps `_subscribe_instrument_close` from reporting an
+        # already-subscribed instrument after a reconnect cycle.
+        self._instrument_close_tasks.clear()
 
         for product, client in self._ws_clients.items():
             try:
@@ -552,6 +639,11 @@ class GateioDataClient(LiveMarketDataClient):
                 await asyncio.sleep(interval_mins * 60)
                 await self._instrument_provider.initialize(reload=True)
                 self._send_all_instruments_to_data_engine()
+                # Status rides the instrument reload rather than a timer of its
+                # own, as Kraken's in-tree client does: the evidence is the same
+                # listing payloads, so a second cadence would double the traffic
+                # on a rate-limited public API and let the two views disagree.
+                await self._poll_instrument_statuses()
                 self._log.debug("Reloaded instruments")
             except asyncio.CancelledError:
                 self._log.debug("Canceled task 'update_instruments'")
@@ -641,7 +733,84 @@ class GateioDataClient(LiveMarketDataClient):
             interval_ms = 100
         return f"{interval_ms}ms", level
 
+    def _resolve_depth_stream(
+        self,
+        product: GateioProductType,
+        depth: int,
+        params: dict[str, Any] | None,
+    ) -> tuple[int, str]:
+        """Return the ``(limit, push interval)`` pair for the depth snapshot channel.
+
+        ``config.order_book_snapshot_limit`` is deliberately not consulted. That
+        setting exists to keep the REST seed aligned with the incremental
+        stream's level; applying it here would subscribe to a hundred levels and
+        discard ninety, and would make one configuration field mean two things.
+
+        The push interval comes off ``command.params`` rather than a new
+        configuration field, which is the in-tree precedent (Deribit reads its
+        venue-specific interval the same way). It matters on spot, where the
+        channel pushes the full book every 100 ms whether or not anything
+        changed; every other product accepts only ``"0"`` (push on change).
+        """
+        requested = depth or DEPTH10_LEVELS
+        if requested > DEPTH10_LEVELS:
+            self._log.warning(
+                f"OrderBookDepth10 carries {DEPTH10_LEVELS} levels per side; subscribing "
+                f"{DEPTH10_LEVELS} rather than the requested {requested} for {product.value}",
+            )
+            requested = DEPTH10_LEVELS
+        # Rounds *up* to a depth the product serves, so a request for three
+        # levels on spot becomes five rather than being rejected by the venue.
+        limit = nearest_snapshot_limit(product, requested)
+
+        intervals = BOOK_SNAPSHOT_PUSH_INTERVALS[product]
+        requested_interval = (params or {}).get("interval")
+        if requested_interval is None:
+            return limit, intervals[0]
+        interval = str(requested_interval)
+        if interval not in intervals:
+            self._log.warning(
+                f"{product.value} does not accept a {interval!r} snapshot push interval; "
+                f"using {intervals[0]!r} (accepted: {', '.join(intervals)})",
+            )
+            interval = intervals[0]
+        return limit, interval
+
     # -- subscriptions -----------------------------------------------------
+
+    async def _subscribe(self, command: SubscribeData) -> None:
+        """Subscribe a venue-native data type the platform has no first-class type for.
+
+        Today that is :class:`GateioTicker` alone. Everything else is refused
+        with a log line and a return rather than an exception:
+        ``LiveMarketDataClient.subscribe`` records the data type *before* it
+        creates the task running this coroutine, and ``DataEngine`` then skips
+        any data type already recorded, so raising here would leave a
+        subscription the client reports as held forever and never retries. The
+        engine's own ``except NotImplementedError`` around ``client.subscribe``
+        cannot help: on a live client the call returns before the task runs.
+
+        Rows are published under
+        ``DataType(GateioTicker, metadata={"instrument_id": instrument_id})``,
+        which is the data type to subscribe with: the platform addresses a custom
+        data type carrying metadata by that metadata
+        (``common/data_topics.pyx:189-210``), so a subscription taken out with a
+        bare ``DataType(GateioTicker)`` and a separate ``instrument_id`` listens
+        on a different topic from the one the rows arrive on. This is the in-tree
+        convention (``adapters/binance/data.py:1015-1020``).
+        """
+        data_type = command.data_type
+        if data_type.type is not GateioTicker:
+            self._log.error(f"Cannot subscribe to {data_type.type} (not implemented)")
+            return
+        instrument_id = self._custom_data_instrument_id(command)
+        if instrument_id is None:
+            self._log.error(
+                f"Cannot subscribe to {data_type}: no instrument ID on the command or in the "
+                f"`data_type` metadata",
+            )
+            return
+        await self._hold_ticker_channel(instrument_id, _TICKER)
 
     async def _subscribe_instruments(self, command: SubscribeInstruments) -> None:
         self._log.info(
@@ -780,6 +949,94 @@ class GateioDataClient(LiveMarketDataClient):
         except (GateioError, ValueError) as e:
             self._log.error(f"Cannot unsubscribe from the order book for {instrument_id}: {e}")
 
+    async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
+        """Subscribe the periodic ``*.order_book`` snapshot channel at ten levels.
+
+        This channel is self-synchronising: every message is a complete book of
+        the subscribed depth, so there is no sequence algorithm, no REST seed and
+        nothing to rebuild after a reconnect. It is a different venue channel
+        from the incremental stream the delta path uses, so holding both costs
+        two subscriptions at the venue and neither disturbs the other.
+        """
+        if command.book_type != BookType.L2_MBP:
+            self._log.error(
+                f"Cannot subscribe to {book_type_to_str(command.book_type)} order book depth: "
+                f"Gate.io publishes L2_MBP depth only",
+            )
+            return
+        instrument_id = command.instrument_id
+        if instrument_id not in self.subscribed_order_book_depth():
+            # The base class records the subscription before creating this task,
+            # so an absence here means it was withdrawn in between; subscribing
+            # now would leave a venue stream nobody is listening to.
+            return
+        resolved = self._resolve(instrument_id)
+        if resolved is None:
+            return
+        product, raw_symbol = resolved
+        client = self._ws(product)
+        if client is None:
+            return
+        if instrument_id in self._depth_streams:
+            self._log.warning(f"Already subscribed to order book depth for {instrument_id}")
+            return
+        if instrument_id in self._books:
+            # NautilusTrader keeps one `OrderBook` per instrument in the cache,
+            # and a managed subscription of either kind attaches its own writer
+            # to it. `apply_depth` *replaces* the book, so a depth message
+            # discards every delta level below the tenth and the book flaps
+            # between the two feeds. The adapter cannot fix this — the engine
+            # owns the cached book — so it says so rather than pretending
+            # otherwise or silently refusing one of the two.
+            self._log.warning(
+                f"Order book deltas and depth are both subscribed for {instrument_id}; "
+                f"NautilusTrader maintains a single cached order book per instrument, so the "
+                f"two feeds will overwrite each other",
+            )
+
+        limit, interval = self._resolve_depth_stream(product, command.depth, command.params)
+        self._depth_streams[instrument_id] = (limit, interval)
+        try:
+            await client.subscribe_order_book_snapshot(raw_symbol, limit=limit, interval=interval)
+        except (GateioError, ValueError) as e:
+            if is_transient_ws_error(e):
+                # The transport keeps the subscription and replays it, and this
+                # channel needs no local state to survive that, so the registry
+                # entry stays.
+                self._log.warning(
+                    f"Order book depth subscription for {instrument_id} did not complete ({e}); "
+                    f"it will be replayed on the next connection",
+                )
+                return
+            self._depth_streams.pop(instrument_id, None)
+            self._log.error(f"Cannot subscribe to order book depth for {instrument_id}: {e}")
+
+    async def _unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
+        instrument_id = command.instrument_id
+        stream = self._depth_streams.pop(instrument_id, None)
+        self._depth_sequences.pop(instrument_id, None)
+        if stream is None:
+            return
+        resolved = self._resolve(instrument_id)
+        if resolved is None:
+            return
+        product, raw_symbol = resolved
+        client = self._ws(product)
+        if client is None:
+            return
+        limit, interval = stream
+        # Gate.io identifies a subscription by its full argument list, so the
+        # unsubscribe must repeat the triple that was subscribed. Rebuilding it
+        # from defaults would be acknowledged and leave the stream running.
+        try:
+            await client.unsubscribe_order_book_snapshot(
+                raw_symbol,
+                limit=limit,
+                interval=interval,
+            )
+        except (GateioError, ValueError) as e:
+            self._log.error(f"Cannot unsubscribe from order book depth for {instrument_id}: {e}")
+
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         bar_type = command.bar_type
         if bar_type.aggregation_source != AggregationSource.EXTERNAL:
@@ -838,22 +1095,32 @@ class GateioDataClient(LiveMarketDataClient):
 
     # -- ticker-derived derivative streams ---------------------------------
 
-    async def _subscribe_ticker_stream(self, instrument_id: InstrumentId, kind: str) -> None:
-        """Subscribe the ticker channel, which carries mark, index and funding.
+    async def _hold_ticker_channel(self, instrument_id: InstrumentId, kind: str) -> None:
+        """Take a reference on the ticker channel for ``instrument_id``.
 
-        On futures that is ``futures.tickers``; on options it is
+        Not a platform hook, and deliberately not named like one: every
+        ``_subscribe_*`` / ``_unsubscribe_*`` method on a ``LiveMarketDataClient``
+        is a hook taking a single command object, and a private helper with a
+        different signature sitting in that namespace misleads a reader and any
+        sweep that enumerates hooks.
+
+        On futures the channel is ``futures.tickers``; on options it is
         ``options.contract_tickers``, which publishes ``mark_price`` and
-        ``index_price`` per contract. Gate.io has no dedicated channel for any of
-        the three, so one venue subscription serves every combination of them and
-        the subscribers are reference counted per instrument.
+        ``index_price`` per contract; on spot it is ``spot.tickers``, which
+        carries 24-hour statistics and a best bid/offer and none of the three
+        reference prices. Gate.io has no dedicated mark, index or funding
+        channel, so one venue subscription serves every combination and the
+        subscribers are reference counted per instrument.
         """
         resolved = self._resolve(instrument_id)
         if resolved is None:
             return
         product, raw_symbol = resolved
-        if product.is_spot:
+        if kind != _TICKER and product.is_spot:
             # A spot pair has no mark price, no index and no funding: the spot
-            # ticker is 24-hour trade statistics and nothing else.
+            # ticker is 24-hour trade statistics and nothing else. The row
+            # itself is real, though, which is why `GateioTicker` is allowed
+            # here and the three reference prices are not.
             self._log.error(
                 f"Cannot subscribe to {kind} prices for {instrument_id}: Gate.io publishes "
                 f"them for derivative products only",
@@ -878,10 +1145,22 @@ class GateioDataClient(LiveMarketDataClient):
             try:
                 await client.subscribe_tickers(raw_symbol)
             except (GateioError, ValueError) as e:
+                if is_transient_ws_error(e):
+                    # The transport holds the subscription and replays it on the
+                    # next connection, and the replayed rows are routed by this
+                    # registry alone: dropping the entry here would leave
+                    # `_handle_tickers` discarding every row of a stream the
+                    # venue is sending. Every other subscribe path in this client
+                    # keeps its registry entry for the same reason.
+                    self._log.warning(
+                        f"Ticker subscription for {instrument_id} did not complete ({e}); "
+                        f"it will be replayed on the next connection",
+                    )
+                    return
                 self._ticker_subs.pop(instrument_id, None)
                 self._log.error(f"Cannot subscribe to {kind} data for {instrument_id}: {e}")
 
-    async def _unsubscribe_ticker_stream(self, instrument_id: InstrumentId, kind: str) -> None:
+    async def _release_ticker_channel(self, instrument_id: InstrumentId, kind: str) -> None:
         kinds = self._ticker_subs.get(instrument_id)
         if not kinds:
             return
@@ -902,28 +1181,145 @@ class GateioDataClient(LiveMarketDataClient):
             self._log.error(f"Cannot unsubscribe from {kind} data for {instrument_id}: {e}")
 
     async def _subscribe_mark_prices(self, command: SubscribeMarkPrices) -> None:
-        await self._subscribe_ticker_stream(command.instrument_id, _MARK)
+        await self._hold_ticker_channel(command.instrument_id, _MARK)
 
     async def _unsubscribe_mark_prices(self, command: UnsubscribeMarkPrices) -> None:
-        await self._unsubscribe_ticker_stream(command.instrument_id, _MARK)
+        await self._release_ticker_channel(command.instrument_id, _MARK)
 
     async def _subscribe_index_prices(self, command: SubscribeIndexPrices) -> None:
-        await self._subscribe_ticker_stream(command.instrument_id, _INDEX)
+        await self._hold_ticker_channel(command.instrument_id, _INDEX)
 
     async def _unsubscribe_index_prices(self, command: UnsubscribeIndexPrices) -> None:
-        await self._unsubscribe_ticker_stream(command.instrument_id, _INDEX)
+        await self._release_ticker_channel(command.instrument_id, _INDEX)
 
     async def _subscribe_funding_rates(self, command: SubscribeFundingRates) -> None:
-        await self._subscribe_ticker_stream(command.instrument_id, _FUNDING)
+        await self._hold_ticker_channel(command.instrument_id, _FUNDING)
 
     async def _unsubscribe_funding_rates(self, command: UnsubscribeFundingRates) -> None:
-        await self._unsubscribe_ticker_stream(command.instrument_id, _FUNDING)
+        await self._release_ticker_channel(command.instrument_id, _FUNDING)
+
+    # -- instrument lifecycle ----------------------------------------------
+
+    async def _subscribe_instrument_status(self, command: SubscribeInstrumentStatus) -> None:
+        """Register a status subscription and report the instrument's state now.
+
+        Gate.io publishes no status channel on any product, so the source is the
+        instrument listing endpoints, polled on the instrument reload cadence.
+        Reporting immediately on subscribe is what makes a subscription useful in
+        a quiet market: the periodic diff only fires on a *change*, so without
+        this a strategy that subscribes to a healthy instrument would learn
+        nothing until it stopped being healthy. The in-tree polled adapters
+        (Kraken, dYdX) do the same.
+        """
+        resolved = self._resolve(command.instrument_id)
+        if resolved is None:
+            return
+        instrument_id = command.instrument_id
+        self._instrument_status_subs.add(instrument_id)
+        if not self._config.update_instruments_interval_mins:
+            self._log.warning(
+                f"Subscribed to the instrument status for {instrument_id}, but "
+                f"`update_instruments_interval_mins` is not set: Gate.io has no status channel, "
+                f"so the status will be read once now and never refreshed",
+            )
+
+        action_reason = self._cached_status(instrument_id)
+        if action_reason is None:
+            action_reason = await self._fetch_instrument_status(*resolved)
+        if action_reason is None:
+            self._log.warning(
+                f"Could not read the current instrument status for {instrument_id}; it will be "
+                f"reported at the next instrument reload",
+            )
+            return
+        action, reason = action_reason
+        self._status_cache[instrument_id] = action
+        self._emit_instrument_status(instrument_id, action, reason)
+
+    async def _unsubscribe_instrument_status(self, command: UnsubscribeInstrumentStatus) -> None:
+        # No venue channel to unsubscribe from; the status feed is derived from
+        # the instrument listings this client already reloads. The cache entry
+        # stays so that a later subscription can report the state at once.
+        self._instrument_status_subs.discard(command.instrument_id)
+
+    async def _subscribe_instrument_close(self, command: SubscribeInstrumentClose) -> None:
+        """Watch for the settlement of a dated contract, and refuse for the rest.
+
+        ``InstrumentClose.close_price`` is not optional and has no null form, so
+        an adapter that cannot obtain a real settlement price must publish
+        nothing at all. On Gate.io only delivery futures and options ever settle;
+        spot, perpetual and inverse perpetual markets trade continuously, so
+        there is no close price for them to publish and the subscription is
+        refused with the reason rather than accepted and left silent.
+        ``InstrumentCloseType.END_OF_SESSION`` is never emitted: Gate.io has no
+        sessions, so naming one would be a fabrication.
+        """
+        resolved = self._resolve(command.instrument_id)
+        if resolved is None:
+            return
+        product, _ = resolved
+        instrument_id = command.instrument_id
+        if not (product.is_delivery or product.is_option):
+            self._log.error(
+                f"Cannot subscribe to the instrument close for {instrument_id}: Gate.io "
+                f"{product.value} markets trade continuously and never settle, so there is no "
+                f"close price to publish; only delivery futures and options have one",
+            )
+            return
+        if instrument_id in self._instrument_close_tasks:
+            self._log.warning(f"Already subscribed to the instrument close for {instrument_id}")
+            return
+        self._instrument_close_tasks[instrument_id] = self.create_task(
+            self._watch_instrument_close(instrument_id),
+            log_msg=f"instrument close {instrument_id}",
+        )
+
+    async def _unsubscribe_instrument_close(self, command: UnsubscribeInstrumentClose) -> None:
+        task = self._instrument_close_tasks.pop(command.instrument_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _unsubscribe(self, command: UnsubscribeData) -> None:
+        data_type = command.data_type
+        if data_type.type is not GateioTicker:
+            self._log.error(f"Cannot unsubscribe from {data_type.type} (not implemented)")
+            return
+        instrument_id = self._custom_data_instrument_id(command)
+        if instrument_id is None:
+            self._log.error(
+                f"Cannot unsubscribe from {data_type}: no instrument ID on the command or in "
+                f"the `data_type` metadata",
+            )
+            return
+        await self._release_ticker_channel(instrument_id, _TICKER)
 
     async def _unsubscribe_instruments(self, command: UnsubscribeInstruments) -> None:
         pass  # No venue channel to unsubscribe from
 
     async def _unsubscribe_instrument(self, command: UnsubscribeInstrument) -> None:
         pass  # No venue channel to unsubscribe from
+
+    @staticmethod
+    def _custom_data_instrument_id(command: SubscribeData | UnsubscribeData) -> InstrumentId | None:
+        """Read the instrument a custom-data command names.
+
+        ``SubscribeData`` copies the instrument id into the ``DataType``
+        metadata as well as keeping it as a field, so the direct field is
+        preferred and the metadata is the fallback for a caller that built the
+        ``DataType`` by hand — which may leave a plain string there.
+        """
+        instrument_id = command.instrument_id
+        if instrument_id is not None:
+            return instrument_id
+        candidate = command.data_type.metadata.get("instrument_id")
+        if isinstance(candidate, InstrumentId):
+            return candidate
+        if isinstance(candidate, str):
+            try:
+                return InstrumentId.from_str(candidate)
+            except ValueError:
+                return None
+        return None
 
     # -- WebSocket handling ------------------------------------------------
 
@@ -955,6 +1351,12 @@ class GateioDataClient(LiveMarketDataClient):
                 self._handle_book_ticker(product, result)
             elif channel.endswith(".order_book_update"):
                 self._handle_book_update(product, result)
+            elif channel.endswith(".order_book"):
+                # After the incremental branch on purpose. The two suffixes are
+                # disjoint (`"spot.order_book_update".endswith(".order_book")`
+                # is False), so the order is not load-bearing, but keeping the
+                # more specific channel first states which is which.
+                self._handle_book_depth(product, result)
             elif channel.endswith("candlesticks"):
                 self._handle_candlesticks(product, result)
             elif channel == tickers_channel(product):
@@ -971,6 +1373,15 @@ class GateioDataClient(LiveMarketDataClient):
         one is rebuilt from a fresh REST snapshot.
         """
         self._reconnects[product.value] += 1
+        # The depth channel needs no resnapshot, but it does need its watermark
+        # dropped. Gate.io restarts the `id` sequence of the snapshot channel on a
+        # new connection, and the monotonic guard in `_handle_book_depth` would
+        # then read every message of the new stream as a reordered one and drop
+        # it silently while the subscription still looked healthy. The channel is
+        # self-synchronising, so forgetting the last sequence costs nothing.
+        for instrument_id in self._depth_streams:
+            if instrument_id_to_gateio(instrument_id)[0] is product:
+                self._depth_sequences.pop(instrument_id, None)
         book_ids = self._subscribed_book_ids(product)
         self._log.warning(
             f"Reconnected {product.value} WebSocket; resynchronising {len(book_ids)} order books",
@@ -1256,6 +1667,127 @@ class GateioDataClient(LiveMarketDataClient):
         self._handle_data(OrderBookDeltas(instrument_id=instrument_id, deltas=deltas_list))
         self._published["order_book_deltas"] += 1
 
+    def _handle_book_depth(self, product: GateioProductType, result: Any) -> None:
+        """Publish one ``*.order_book`` push as an ``OrderBookDepth10``.
+
+        A pure parse with no book state: the channel replaces the whole book on
+        every message, so there is nothing to accumulate and nothing to
+        reconcile. Routing the payload through :class:`GateioOrderBook` instead
+        would be the obvious reuse and would be wrong twice over — that class
+        demands an ``id`` or ``u`` sequence field while the spot push names it
+        ``lastUpdateId``, and it carries buffering, gap and staleness machinery
+        this channel has no use for.
+        """
+        if not isinstance(result, dict) or not (result.get("s") or result.get("contract")):
+            # Said out loud rather than dropped. Every message on this channel is
+            # a whole book, so a body this parser cannot read is a stream that
+            # has gone quiet while the subscription still reports healthy, and a
+            # managed book frozen at its last snapshot. The delta path survives
+            # the same silence because its sequence check notices the gap.
+            self._log.warning(
+                f"Discarding an unreadable {product.value} order book snapshot message: {result}",
+            )
+            return
+        raw_symbol = result["s"] if result.get("s") else result["contract"]
+        instrument_id = gateio_to_instrument_id(product, str(raw_symbol))
+        if instrument_id not in self._depth_streams:
+            return
+        instrument = self._instrument(instrument_id)
+        if instrument is None:
+            return
+
+        # Spot names the sequence `lastUpdateId`; the contract products name it
+        # `id`. The platform performs no gap or staleness check of its own on
+        # depth — unlike deltas there is no buffering and no validation path —
+        # so a reordered push would silently roll a managed book backwards.
+        sequence = to_int(result.get("id") or result.get("lastUpdateId"))
+        if sequence:
+            last_sequence = self._depth_sequences.get(instrument_id, 0)
+            if last_sequence and sequence <= last_sequence:
+                self._published["order_book_depths_out_of_order"] += 1
+                return
+            self._depth_sequences[instrument_id] = sequence
+
+        ts_init = self._clock.timestamp_ns()
+        ts_event = timestamp_to_nanos(result.get("t")) or ts_init
+
+        bids = self._depth_side(instrument, result.get("bids"), OrderSide.BUY)
+        asks = self._depth_side(instrument, result.get("asks"), OrderSide.SELL)
+        depth = OrderBookDepth10(
+            instrument_id=instrument_id,
+            bids=bids,
+            asks=asks,
+            # Gate.io publishes aggregated price levels with no per-level order
+            # count on any product; the type documents zeros as the value for
+            # "data not available".
+            bid_counts=[0] * DEPTH10_LEVELS,
+            ask_counts=[0] * DEPTH10_LEVELS,
+            # One `*.order_book` message is one complete book event, which is
+            # exactly what F_LAST states. F_SNAPSHOT would be a misstatement: it
+            # means the message came from a replay or snapshot server, and this
+            # is a live push.
+            flags=RecordFlag.F_LAST,
+            sequence=sequence,
+            ts_event=ts_event,
+            ts_init=ts_init,
+        )
+        self._handle_data(depth)
+        self._published["order_book_depths"] += 1
+
+    def _depth_side(
+        self,
+        instrument: Instrument,
+        levels: Any,
+        side: OrderSide,
+    ) -> list[BookOrder]:
+        """Build one padded side of an ``OrderBookDepth10``.
+
+        Sorting is the adapter's obligation, not the type's: ``OrderBookDepth10``
+        accepts whatever order it is given and ``to_quote_tick`` blindly reads
+        ``bids[0]``, so an unsorted payload would publish a wrong best price and,
+        with ``emit_quotes_from_book_depths`` enabled, have the engine cache it
+        as a quote.
+
+        Padding is also ours. The type requires both sides to be the *same*
+        length and Gate.io routinely sends asymmetric sides on thin contracts;
+        an unequal pair raises inside a handler whose caller logs and continues,
+        which would leave the subscription looking healthy while publishing
+        nothing at all. Padding both sides to ten uses the type's own
+        convention (it pads short sides with ``NULL_ORDER`` itself) and removes
+        the failure.
+        """
+        ordered = sorted(
+            parse_levels(levels),
+            key=lambda level: level[0],
+            reverse=side is OrderSide.BUY,
+        )
+        orders: list[BookOrder] = []
+        for price, size in ordered:
+            if len(orders) == DEPTH10_LEVELS:
+                break
+            quantity = venue_quantity(size, instrument.size_precision)
+            if quantity == 0:
+                # A level the instrument's size precision cannot represent. A
+                # zero-sized `BookOrder` is not rejected here the way a delta
+                # would be — `apply_depth` simply drops it — which is worse: it
+                # would occupy one of the ten slots and then vanish, silently
+                # shortening the published depth. The slot goes to the next
+                # level that survives instead.
+                self._published["book_levels_not_representable"] += 1
+                continue
+            orders.append(
+                BookOrder(
+                    side=side,
+                    price=instrument.make_price(price),
+                    size=quantity,
+                    order_id=0,
+                ),
+            )
+        # A fresh list per call: the constructor extends the list it is given
+        # (`bids.extend(...)`), so a list reused for a second depth object would
+        # carry the previous padding.
+        return orders + [NULL_ORDER] * (DEPTH10_LEVELS - len(orders))
+
     # -- trades ------------------------------------------------------------
 
     def _handle_trades(self, product: GateioProductType, result: Any) -> None:
@@ -1516,8 +2048,9 @@ class GateioDataClient(LiveMarketDataClient):
             if not isinstance(item, dict):
                 continue
             # ``futures.tickers`` names the contract ``contract``;
-            # ``options.contract_tickers`` names the same field ``name``.
-            raw_symbol = item.get("contract") or item.get("name")
+            # ``options.contract_tickers`` names the same field ``name``;
+            # ``spot.tickers`` names the pair ``currency_pair``.
+            raw_symbol = item.get("contract") or item.get("name") or item.get("currency_pair")
             if not raw_symbol:
                 continue
             instrument_id = gateio_to_instrument_id(product, str(raw_symbol))
@@ -1576,6 +2109,34 @@ class GateioDataClient(LiveMarketDataClient):
                 )
                 self._published["funding_rates"] += 1
 
+            if _TICKER in kinds:
+                # The venue fields the platform has no type for. Mark, index and
+                # funding are published above as the platform's own types and are
+                # deliberately absent from `GateioTicker`, so no consumer ever has
+                # two sources for one number.
+                #
+                # The wrapper is not decoration. `DataEngine._handle_data`
+                # dispatches on the concrete type and reaches a venue-native type
+                # only through `CustomData` (`data/engine.pyx:2570-2571`); handing
+                # it a bare `Data` subclass falls to
+                # `self._log.error(f"Cannot handle data: unrecognized type ...")`
+                # (`data/engine.pyx:2572-2573`), so every row would become an
+                # error line while the client kept reporting the subscription
+                # held. The metadata carries the instrument id because that is
+                # what makes the published topic match the `DataType` a
+                # subscriber asked for; `adapters/binance/data.py:1015-1020` is
+                # the in-tree shape being followed.
+                self._handle_data(
+                    CustomData(
+                        data_type=DataType(
+                            GateioTicker,
+                            metadata={"instrument_id": instrument_id},
+                        ),
+                        data=GateioTicker.from_payload(instrument_id, item, ts_event, ts_init),
+                    ),
+                )
+                self._published["tickers"] += 1
+
     @staticmethod
     def _funding_interval_mins(instrument: Instrument) -> int | None:
         """Return the funding interval in minutes from the contract definition."""
@@ -1621,7 +2182,441 @@ class GateioDataClient(LiveMarketDataClient):
         elapsed_intervals = (ts_event - anchor_ns) // interval_ns
         return anchor_ns + (elapsed_intervals + 1) * interval_ns
 
+    # -- instrument status -------------------------------------------------
+
+    def _cached_status(self, instrument_id: InstrumentId) -> tuple[MarketStatusAction, str] | None:
+        action = self._status_cache.get(instrument_id)
+        if action is None:
+            return None
+        return action, "last observed instrument listing"
+
+    def _emit_instrument_status(
+        self,
+        instrument_id: InstrumentId,
+        action: MarketStatusAction,
+        reason: str,
+    ) -> None:
+        """Publish one ``InstrumentStatus``.
+
+        ``ts_event`` is the clock, not a venue field. The listing payloads carry
+        ``create_time``, ``expire_time`` and ``expiration_time``, and none of
+        them is the time of the transition — ``create_time`` is the listing
+        instant and never moves, so using it would emit a stream of events whose
+        ``ts_event`` never advances. Both in-tree polled adapters stamp on
+        observation for the same reason.
+
+        ``is_quoting`` and ``is_short_sell_restricted`` stay ``None``: Gate.io
+        publishes neither, and the fields are tri-state precisely so an adapter
+        can decline to guess.
+        """
+        ts_now = self._clock.timestamp_ns()
+        self._handle_data(
+            InstrumentStatus(
+                instrument_id=instrument_id,
+                action=action,
+                ts_event=ts_now,
+                ts_init=ts_now,
+                reason=reason,
+                is_trading=action == MarketStatusAction.TRADING,
+            ),
+        )
+        self._published["instrument_status"] += 1
+        self._log.info(
+            f"{instrument_id} status {market_status_action_to_str(action)} ({reason})",
+            LogColor.BLUE,
+        )
+
+    async def _fetch_instrument_status(
+        self,
+        product: GateioProductType,
+        raw_symbol: str,
+    ) -> tuple[MarketStatusAction, str] | None:
+        """Read one instrument's listing row and map it to an action."""
+        try:
+            if product.is_spot:
+                payload = await self._spot_http.currency_pair(raw_symbol)
+            elif product.is_option:
+                payload = await self._options_http.contract(raw_symbol)
+            else:
+                payload = await self._futures_http[product].contract(raw_symbol)
+        except (GateioError, ValueError) as e:
+            self._log.warning(f"Cannot read the {product.value} listing for {raw_symbol}: {e}")
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return market_status_action(product, payload, self._clock.timestamp_ns() // _NANOS_PER_SEC)
+
+    async def _poll_instrument_statuses(self) -> None:
+        """Diff the current listings against the cache and emit what changed."""
+        if not self._instrument_status_subs:
+            return
+        statuses, scopes = await self._request_instrument_statuses()
+        if not scopes:
+            # Nothing was read, so nothing can be said. Diffing against an empty
+            # snapshot would report every subscribed instrument as delisted.
+            self._log.warning(
+                "No Gate.io instrument listing could be read; skipping the status diff",
+            )
+            return
+        diff_and_emit_statuses(
+            new_statuses=statuses,
+            cached_statuses=self._status_cache,
+            subscriptions=self._instrument_status_subs,
+            emit=self._emit_instrument_status,
+            removable=lambda instrument_id: self._status_scope(instrument_id) in scopes,
+        )
+
+    async def _request_instrument_statuses(
+        self,
+    ) -> tuple[dict[InstrumentId, tuple[MarketStatusAction, str]], set[str]]:
+        """Return the statuses read this round and the listings that were complete.
+
+        The second element is the set of *scopes* whose full listing came back:
+        one per product family, and one per option underlying, because
+        ``GET /options/contracts`` is queried one underlying at a time. Removal
+        detection is confined to those scopes — a request that failed must not
+        look like a mass delisting of everything it would have covered.
+        """
+        now_secs = self._clock.timestamp_ns() // _NANOS_PER_SEC
+        statuses: dict[InstrumentId, tuple[MarketStatusAction, str]] = {}
+        scopes: set[str] = set()
+
+        products = {
+            product
+            for product in (self._product_of(item) for item in self._instrument_status_subs)
+            if product is not None
+        }
+        for product in sorted(products, key=lambda item: item.value):
+            if product.is_option:
+                for underlying in sorted(self._subscribed_option_underlyings()):
+                    await self._collect_statuses(
+                        product,
+                        f"opt:{underlying}",
+                        lambda: self._options_http.contracts(underlying=underlying),  # noqa: B023
+                        "name",
+                        now_secs,
+                        statuses,
+                        scopes,
+                    )
+            elif product.is_spot:
+                await self._collect_statuses(
+                    product,
+                    product.value,
+                    self._spot_http.currency_pairs,
+                    "id",
+                    now_secs,
+                    statuses,
+                    scopes,
+                )
+            else:
+                await self._collect_statuses(
+                    product,
+                    product.value,
+                    self._futures_http[product].contracts,
+                    "name",
+                    now_secs,
+                    statuses,
+                    scopes,
+                )
+        return statuses, scopes
+
+    async def _collect_statuses(
+        self,
+        product: GateioProductType,
+        scope: str,
+        fetch: Any,
+        symbol_field: str,
+        now_secs: int,
+        statuses: dict[InstrumentId, tuple[MarketStatusAction, str]],
+        scopes: set[str],
+    ) -> None:
+        """Read one listing and fold it into ``statuses``, or warn and skip it.
+
+        Each listing is caught separately. A poll that let one product's failure
+        propagate would abandon the diff for every other product, and a poll that
+        treated the failure as an empty listing would fabricate a delisting for
+        every instrument that listing covers.
+        """
+        try:
+            rows = await fetch()
+        except (GateioError, ValueError) as e:
+            self._log.warning(f"Cannot read the {scope} instrument listing: {e}")
+            return
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            raw_symbol = row.get(symbol_field)
+            if not raw_symbol:
+                continue
+            try:
+                instrument_id = gateio_to_instrument_id(product, str(raw_symbol))
+            except ValueError:
+                continue
+            statuses[instrument_id] = market_status_action(product, row, now_secs)
+        scopes.add(scope)
+
+    def _product_of(self, instrument_id: InstrumentId) -> GateioProductType | None:
+        try:
+            return instrument_id_to_gateio(instrument_id)[0]
+        except ValueError:  # pragma: no cover - subscriptions are resolved first
+            return None
+
+    def _status_scope(self, instrument_id: InstrumentId) -> str:
+        """Return the listing scope an instrument's status would have come from."""
+        product = self._product_of(instrument_id)
+        if product is None:  # pragma: no cover - subscriptions are resolved first
+            return ""
+        if product.is_option:
+            underlying = self._option_underlying(instrument_id)
+            return f"opt:{underlying}" if underlying else ""
+        return product.value
+
+    def _subscribed_option_underlyings(self) -> set[str]:
+        underlyings = set()
+        for instrument_id in self._instrument_status_subs:
+            product = self._product_of(instrument_id)
+            if product is None or not product.is_option:
+                continue
+            underlying = self._option_underlying(instrument_id)
+            if underlying:
+                underlyings.add(underlying)
+        return underlyings
+
+    def _option_underlying(self, instrument_id: InstrumentId) -> str:
+        """Return the underlying of an option, from the contract definition.
+
+        Falls back to the symbol's own first segment: option names are
+        ``<UNDERLYING>-<YYYYMMDD>-<STRIKE>-<C|P>``, so the prefix is the
+        underlying even when no instrument definition is held yet.
+        """
+        instrument = self._instrument(instrument_id)
+        info = instrument.info if instrument is not None else None
+        underlying = (info or {}).get("underlying")
+        if underlying:
+            return str(underlying)
+        return instrument_id.symbol.value.split("-")[0]
+
+    # -- instrument close --------------------------------------------------
+
+    async def _watch_instrument_close(self, instrument_id: InstrumentId) -> None:
+        """Wait for expiry, then poll until the venue publishes a settlement.
+
+        Nothing is published if the settlement never appears. There is no null
+        ``close_price``, so "publish something" would mean publishing a number
+        nobody quoted; ``Price(0)`` is the most tempting and the most harmful,
+        because a backtest reading it books a total loss on the position.
+        """
+        instrument = self._instrument(instrument_id)
+        if instrument is None:
+            self._log.error(f"Cannot watch the instrument close: no instrument {instrument_id}")
+            return
+        expiration_ns = int(getattr(instrument, "expiration_ns", 0) or 0)
+        if expiration_ns <= 0:
+            self._log.error(
+                f"Cannot watch the instrument close for {instrument_id}: the contract states "
+                f"no expiry",
+            )
+            return
+
+        delay_secs = (expiration_ns - self._clock.timestamp_ns()) / _NANOS_PER_SEC
+        if delay_secs > 0:
+            self._log.info(
+                f"Watching {instrument_id} for settlement in {delay_secs / 3600:.1f}h",
+                LogColor.BLUE,
+            )
+            await asyncio.sleep(delay_secs)
+
+        deadline_ns = self._clock.timestamp_ns() + int(
+            INSTRUMENT_CLOSE_TIMEOUT_SECS * _NANOS_PER_SEC,
+        )
+        while True:
+            try:
+                close = await self._fetch_instrument_close(instrument_id, instrument)
+            except _SettlementConflict:
+                return
+            except (GateioError, ValueError) as e:
+                self._log.warning(f"Cannot read the settlement for {instrument_id}: {e}")
+                close = None
+            if close is not None:
+                if instrument_id in self._instrument_close_emitted:
+                    return
+                self._instrument_close_emitted.add(instrument_id)
+                self._handle_data(close)
+                self._published["instrument_closes"] += 1
+                return
+            if self._clock.timestamp_ns() >= deadline_ns:
+                self._log.error(
+                    f"Gate.io published no settlement for {instrument_id} within "
+                    f"{INSTRUMENT_CLOSE_TIMEOUT_SECS / 60:.0f} minutes of expiry; no "
+                    f"instrument close will be published for it",
+                )
+                return
+            await asyncio.sleep(INSTRUMENT_CLOSE_POLL_SECS)
+
+    async def _fetch_instrument_close(
+        self,
+        instrument_id: InstrumentId,
+        instrument: Instrument,
+    ) -> InstrumentClose | None:
+        """Return the settled close, ``None`` if the venue has not settled it yet."""
+        resolved = self._resolve(instrument_id)
+        if resolved is None:  # pragma: no cover - resolved at subscribe time
+            return None
+        product, raw_symbol = resolved
+        if product.is_option:
+            return await self._option_close(instrument_id, instrument, raw_symbol)
+        return await self._delivery_close(instrument_id, instrument, raw_symbol)
+
+    async def _delivery_close(
+        self,
+        instrument_id: InstrumentId,
+        instrument: Instrument,
+        raw_symbol: str,
+    ) -> InstrumentClose | None:
+        """Read a delivery contract's settlement price from two public sources.
+
+        ``GET /delivery/{settle}/contracts/{name}`` and
+        ``GET /delivery/{settle}/tickers`` both publish ``settle_price`` for the
+        same contract and both stay ``"0"`` until it settles. Reading only one
+        would make a single stale or wrong field the whole answer, and the field
+        drives an expiry event that cancels orders and closes positions in a
+        backtest.
+        """
+        api = self._futures_http[GateioProductType.FUT]
+        contract = await api.contract(raw_symbol)
+        settle = venue_price((contract or {}).get("settle_price"))
+        if settle is None or settle == 0:
+            return None
+        rows = await api.tickers(contract=raw_symbol)
+        row = next((item for item in rows or [] if isinstance(item, dict)), {})
+        confirm = venue_price(row.get("settle_price"))
+        if confirm is None or confirm == 0:
+            # The ticker has not caught up with the contract yet; try again
+            # rather than treating the difference as a contradiction.
+            return None
+        if settle.as_decimal() != confirm.as_decimal():
+            self._log.error(
+                f"Refusing to publish an instrument close for {instrument_id}: "
+                f"the contract reports settle_price={settle} and the ticker reports "
+                f"settle_price={confirm}",
+            )
+            raise _SettlementConflict
+        return self._instrument_close(instrument_id, instrument, settle)
+
+    async def _option_close(
+        self,
+        instrument_id: InstrumentId,
+        instrument: Instrument,
+        raw_symbol: str,
+    ) -> InstrumentClose | None:
+        """Read an option's settled value from ``GET /options/settlements``.
+
+        The row's ``settle_price`` is **not** the option's close price: it is
+        Gate.io's averaged price of the *underlying* at expiry, while the option
+        is quoted in USDT per unit of that underlying. Publishing it would put a
+        number orders of magnitude too large into ``close_price`` for anything
+        but a deep in-the-money contract. The option's own value is ``profit``,
+        the per-contract cash intrinsic value, divided back out by the contract
+        multiplier — cross-checked here against the intrinsic value implied by
+        the settlement price and the strike.
+        """
+        expiry_secs = int(getattr(instrument, "expiration_ns", 0) or 0) // _NANOS_PER_SEC
+        underlying = self._option_underlying(instrument_id)
+        rows = await self._options_http.settlements(
+            underlying,
+            frm=max(expiry_secs - OPTION_SETTLEMENT_WINDOW_SECS, 0),
+            to=expiry_secs + OPTION_SETTLEMENT_WINDOW_SECS,
+        )
+        row = next(
+            (
+                item
+                for item in rows or []
+                if isinstance(item, dict) and str(item.get("contract")) == raw_symbol
+            ),
+            None,
+        )
+        if row is None:
+            return None
+
+        # The contract terms come from the instrument's own first-class fields,
+        # not from the venue payload kept in `info`. `CryptoOption` models the
+        # multiplier, the strike and the call/put kind
+        # (`model/instruments/crypto_option.pyx:216-217, :188`), and reading
+        # `info` instead makes an instrument whose payload did not survive a
+        # cache round-trip settle as a put with a zero strike — `bool(None)` is
+        # False and no exception is raised anywhere on that path.
+        multiplier = instrument.multiplier.as_decimal()
+        if multiplier <= 0:
+            self._log.error(
+                f"Refusing to publish an instrument close for {instrument_id}: the contract "
+                f"states no usable multiplier ({instrument.multiplier})",
+            )
+            raise _SettlementConflict
+        value = to_decimal(row.get("profit")) / multiplier
+
+        settle_price = to_decimal(row.get("settle_price"))
+        # The settlement row's own strike is preferred because it is what the
+        # venue applied to this settlement; the instrument's strike is the
+        # fallback when the row omits it.
+        strike = to_decimal(row.get("strike_price")) or instrument.strike_price.as_decimal()
+        is_call = instrument.option_kind == OptionKind.CALL
+        intrinsic = settle_price - strike if is_call else strike - settle_price
+        intrinsic = max(intrinsic, Decimal(0))
+        if abs(value - intrinsic) > instrument.price_increment.as_decimal():
+            self._log.error(
+                f"Refusing to publish an instrument close for {instrument_id}: the settlement "
+                f"row's profit implies {value} per unit of {underlying} while its settle_price "
+                f"and strike imply {intrinsic}",
+            )
+            raise _SettlementConflict
+
+        close_price = venue_price(value)
+        if close_price is None:  # pragma: no cover - `value` is always a finite Decimal
+            return None
+        return self._instrument_close(instrument_id, instrument, close_price)
+
+    def _instrument_close(
+        self,
+        instrument_id: InstrumentId,
+        instrument: Instrument,
+        close_price: Price,
+    ) -> InstrumentClose:
+        """Build the close event, stamped at the contract's stated expiry.
+
+        ``close_type`` is always ``CONTRACT_EXPIRED``. ``END_OF_SESSION`` exists
+        in the enum and nothing prevents its use, but Gate.io has no sessions —
+        every close this adapter publishes is an expiry.
+        """
+        return InstrumentClose(
+            instrument_id=instrument_id,
+            close_price=close_price,
+            close_type=InstrumentCloseType.CONTRACT_EXPIRED,
+            ts_event=int(getattr(instrument, "expiration_ns", 0) or 0),
+            ts_init=self._clock.timestamp_ns(),
+        )
+
     # -- requests ----------------------------------------------------------
+
+    async def _request(self, request: RequestData) -> None:
+        """Refuse a request for a venue-native data type, because none has a history.
+
+        The one venue-native type this client publishes is
+        :class:`GateioTicker`, and Gate.io serves it as a live channel only:
+        ``GET /*/tickers`` returns the current row, not a series. There is
+        therefore nothing to answer a windowed request with, and building an
+        answer out of the current row would invent history — the same reason
+        ``_request_quote_ticks`` refuses.
+
+        The refusal is a log line rather than the base class's
+        ``NotImplementedError`` so that the message names the venue fact instead
+        of showing a traceback. Neither completes the request: the platform's
+        request group is closed by a response alone, so a caller awaiting the
+        callback waits either way.
+        """
+        self._log.error(
+            f"Cannot request {request.data_type}: Gate.io publishes no history for any "
+            f"venue-native data type. Subscribe for the live stream instead",
+        )
 
     async def _request_instrument(self, request: RequestInstrument) -> None:
         instrument = self._instrument(request.instrument_id)
@@ -1682,6 +2677,30 @@ class GateioDataClient(LiveMarketDataClient):
             request.start,
             request.end,
             request.params,
+        )
+
+    async def _request_quote_ticks(self, request: RequestQuoteTicks) -> None:
+        """Refuse a historical-quote request, because Gate.io publishes no such history.
+
+        Implemented only to refuse. Gate.io serves quotes as a live stream
+        (``*.book_ticker``) and nowhere else: no product has a bid/ask history
+        endpoint, and ``GET /*/tickers`` is a single current row rather than a
+        series. Answering from that row would satisfy a "quotes received with
+        valid timestamps, bid/ask prices and sizes" check while inventing
+        history — the same fabrication version 0.2.0 removed.
+
+        Inheriting the base class's ``NotImplementedError`` would also refuse,
+        but as a task traceback instead of a sentence. Neither form produces a
+        response: the platform opens a request group for every historical
+        request and only a response closes it, so a caller awaiting the
+        historical-data callback waits regardless. That is a property of the
+        request pipeline shared with every in-tree adapter that cannot serve a
+        request type, and it is why this is logged at error rather than warning.
+        """
+        self._log.error(
+            f"Cannot request historical quotes for {request.instrument_id}: not published by "
+            f"Gate.io on any product. Subscribe to quotes for the live best bid/offer, or "
+            f"request an order book snapshot",
         )
 
     async def _request_trade_ticks(self, request: RequestTradeTicks) -> None:
@@ -1973,7 +2992,11 @@ __all__ = [
     "BAR_CLOSE_GRACE_SECS",
     "BOOK_INTERVALS_MS",
     "BOOK_LEVELS",
+    "DEPTH10_LEVELS",
+    "INSTRUMENT_CLOSE_POLL_SECS",
+    "INSTRUMENT_CLOSE_TIMEOUT_SECS",
     "GateioDataClient",
+    "GateioTicker",
     "bar_type_to_interval",
     "timestamp_to_nanos",
     "venue_price",
