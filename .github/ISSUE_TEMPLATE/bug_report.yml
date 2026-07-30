@@ -16,7 +16,7 @@ body:
     attributes:
       label: Adapter version
       description: Output of `python -c "import nautilus_gateio; print(nautilus_gateio.__version__)"`
-      placeholder: "0.1.0"
+      placeholder: "0.2.0a1"
     validations:
       required: true
   - type: input
@@ -49,8 +49,7 @@ body:
       options:
         - Mainnet market data (public endpoints)
         - Testnet trading
-        - Mainnet trading (live orders enabled)
-        - Paper simulator (no exchange)
+        - Mainnet trading
         - Other / not sure
     validations:
       required: true

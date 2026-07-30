@@ -20,31 +20,31 @@ Requirements: Python >= 3.12, < 3.15, and the `nautilus_trader` range pinned in
 
 ## What is covered
 
-| Area | What the tests assert |
-|---|---|
-| Symbology | Instrument id to Gate.io symbol and back, per product, including the `-PERP` rule and every malformed-input error path |
-| Enums and status mapping | Order side, time in force, and the `status`/`finish_as`/filled-amount combinations that determine a Nautilus `OrderStatus` |
-| Signing | HMAC-SHA512 REST and WebSocket signature vectors, client order id generation and sanitisation against the venue's charset and length limits |
-| Errors | Typed hierarchy, label-to-error mapping, retry classification, and the capability-gating translation into `WalletNotProvisionedError` |
-| REST transport | Header construction, query encoding, error translation, pacing, retry safety (mutating requests are never replayed), ambiguity reporting |
-| REST namespaces | Path and parameter construction per product, including the `/futures` versus `/delivery` split and the endpoints that refuse to exist on a delivery namespace |
-| WebSocket transport | Subscribe and unsubscribe acknowledgement handling, replay after reconnect, backoff schedule, heartbeat and receive-timeout recycling |
-| Order books | The full synchronisation algorithm: buffering, straddle detection, stale-snapshot rejection, gap detection and resync, zero-size deletions, both payload shapes |
-| Instruments | Payload to instrument per product, precision guards, contract multipliers, fee conventions, and the rejection of unrepresentable price scales |
-| Instrument provider | Multi-product loading, filtering of untradable and expired instruments, per-product degradation on an unprovisioned wallet |
-| Data client | Subscription and request paths, closed-bar filtering, tick construction, mark/index/funding fan-out and reference counting |
-| Execution client | Order translation per product and order type, **every rejection path**, cancellation, amendment, trigger-order id handling, fill application and deduplication, balance aggregation, all four report generators |
-| Configuration | Defaults (including the mainnet default), URL derivation, product/environment validation, credential resolution order |
-| Documentation and packaging | The documented configuration defaults match the code, documented imports resolve, no removed-feature vocabulary survives in the docs, and CI verifies the built wheel |
+| Area                        | What the tests assert                                                                                                                                                                                           |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Symbology                   | Instrument id to Gate.io symbol and back, per product, including the `-PERP` rule and every malformed-input error path                                                                                          |
+| Enums and status mapping    | Order side, time in force, and the `status`/`finish_as`/filled-amount combinations that determine a Nautilus `OrderStatus`                                                                                      |
+| Signing                     | HMAC-SHA512 REST and WebSocket signature vectors, client order id generation and sanitization against the venue's charset and length limits                                                                     |
+| Errors                      | Typed hierarchy, label-to-error mapping, retry classification, and the capability-gating translation into `WalletNotProvisionedError`                                                                           |
+| REST transport              | Header construction, query encoding, error translation, pacing, retry safety (mutating requests are never replayed), ambiguity reporting                                                                        |
+| REST namespaces             | Path and parameter construction per product, including the `/futures` versus `/delivery` split and the endpoints that refuse to exist on a delivery namespace                                                   |
+| WebSocket transport         | Subscribe and unsubscribe acknowledgement handling, replay after reconnect, backoff schedule, heartbeat and receive-timeout recycling                                                                           |
+| Order books                 | The full synchronization algorithm: buffering, straddle detection, stale-snapshot rejection, gap detection and resync, zero-size deletions, both payload shapes                                                 |
+| Instruments                 | Payload to instrument per product, precision guards, contract multipliers, fee conventions, and the rejection of unrepresentable price scales                                                                   |
+| Instrument provider         | Multi-product loading, filtering of untradable and expired instruments, per-product degradation on an unprovisioned wallet                                                                                      |
+| Data client                 | Subscription and request paths, closed-bar filtering, tick construction, mark/index/funding fan-out and reference counting                                                                                      |
+| Execution client            | Order translation per product and order type, **every rejection path**, cancellation, amendment, trigger-order id handling, fill application and deduplication, balance aggregation, all four report generators |
+| Configuration               | Defaults (including the mainnet default), URL derivation, product/environment validation, credential resolution order                                                                                           |
+| Documentation and packaging | The documented configuration defaults match the code, documented imports resolve, no removed-feature vocabulary survives in the docs, and CI verifies the built wheel                                           |
 
 ## Integration tests
 
-Tests that talk to the real exchange are marked `@pytest.mark.integration` and
-are **deselected by default**. Run them explicitly:
-
-```bash
-pytest -m integration
-```
+The suite is offline in full: no network, no credentials. The `integration`
+marker is registered and deselected by default (`addopts = "-m 'not
+integration'"`), and no test carries it yet, so `pytest -m integration` collects
+nothing today. Live behavior is recorded by hand in
+[validation.md](validation.md) rather than asserted by the suite. The rules below
+are what a credentialed test must satisfy when the first one is written.
 
 An integration test must skip itself cleanly — not fail — when credentials or
 the network are unavailable, so a CI run without secrets stays green.

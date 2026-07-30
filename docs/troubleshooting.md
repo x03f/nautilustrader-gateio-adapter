@@ -77,12 +77,17 @@ requests whose replay is provably safe. If you still see it:
 
 The symbol form is wrong. Use the canonical instrument ids:
 
-| Product | Correct form |
-|---|---|
-| Spot | `BTC_USDT.GATE_IO` |
-| Perpetual | `BTC_USDT-PERP.GATE_IO` |
-| Delivery | `BTC_USDT_20260807.GATE_IO` |
-| Option | `BTC_USDT-20260729-70000-C.GATE_IO` |
+| Product   | Correct form                                         |
+|-----------|------------------------------------------------------|
+| Spot      | `BTC_USDT.GATE_IO`                                   |
+| Perpetual | `BTC_USDT-PERP.GATE_IO`                              |
+| Delivery  | `BTC_USDT_YYYYMMDD.GATE_IO`                          |
+| Option    | `BTC_USDT-YYYYMMDD-STRIKE-C.GATE_IO`, `-P` for a put |
+
+Dated contracts are listed a few weeks at a time, so an id copied from a page
+usually names an expired contract, and `load_ids` on an expired id fails
+silently. [`examples/01_public_rest.py`](../examples/01_public_rest.py) prints
+what the venue lists today.
 
 Common mistakes: the venue string is `GATE_IO`, **not** `GATEIO` (it changed in
 0.2.0); Gate.io pairs use an underscore (`BTC_USDT`, not `BTCUSDT`); and a
@@ -106,12 +111,21 @@ other component:
 ```python
 from nautilus_trader.config import LoggingConfig
 
+# On the console:
+LoggingConfig(log_level="DEBUG", log_component_levels={"GateioWebSocketClient": "DEBUG"})
+
+# Or quieter on the console and complete in a file:
 LoggingConfig(
     log_level="INFO",
     log_level_file="DEBUG",
+    log_directory="logs",  # without this the file lands in the working directory
     log_component_levels={"GateioWebSocketClient": "DEBUG"},
 )
 ```
+
+`log_component_levels` raises a component within a sink; it cannot lift output
+past the sink's own level, so `log_level="INFO"` keeps the transport's DEBUG
+lines off the console whatever the component map says.
 
 At `DEBUG` the transport reports each connection, each heartbeat failure and
 each acknowledgement it could not match. Two things to know when reading it:
@@ -120,7 +134,7 @@ each acknowledgement it could not match. Two things to know when reading it:
 initialized discards its messages, which is what happens when the transport is
 used standalone outside a `TradingNode`.
 
-## The order book keeps resynchronising
+## The order book keeps resynchronizing
 
 A gap in the incremental stream forces a REST re-snapshot. Occasional gaps are
 normal; a constant stream of them usually means the snapshot depth and the

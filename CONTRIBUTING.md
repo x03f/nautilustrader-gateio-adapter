@@ -7,10 +7,11 @@ with Gate.io.
 
 ## What helps most right now
 
-`0.2.0a1` is an alpha with an extensive offline test suite and **no recorded
-validation against the live venue**. A passing suite is evidence about the code,
-not about the exchange, so the most valuable contribution is evidence from the
-exchange:
+`0.2.0a1` carries a bounded mainnet record: spot, one USDT perpetual, one option
+contract, and nothing beyond it. Inverse perpetuals, delivery futures and every
+margin ledger have never had an order sent. A passing suite is evidence about the
+code rather than about the exchange, so the most valuable contribution is
+evidence from the exchange:
 
 * **Validation results.** If you exercise a path against the real venue, a pull
   request adding a row to [docs/validation.md](docs/validation.md) — date,
@@ -18,7 +19,7 @@ exchange:
   project further than most code changes. Products with no testnet endpoint
   (inverse perpetuals, delivery futures, options) are the least covered.
 * **Divergences between the documentation and reality.** A page that describes
-  an intention rather than the behaviour is a defect; report it as one.
+  an intention rather than the behavior is a defect; report it as one.
 * **Reproducible bugs**, with the smallest snippet that shows them.
 
 The README feature matrix states what is unsupported, and
@@ -73,7 +74,7 @@ Use `ruff format nautilus_gateio tests examples` to apply the formatting.
 
 ## Pull requests
 
-* **Test the behaviour you change.** A bug fix needs a regression test that
+* **Test the behavior you change.** A bug fix needs a regression test that
   fails without the fix.
 * **Update the documentation in the same pull request.** If a capability
   changes, the README feature matrix and the relevant page under `docs/` change
@@ -91,13 +92,9 @@ Use `ruff format nautilus_gateio tests examples` to apply the formatting.
 * **Open an issue first for a larger design change**, so the discussion happens
   before the work.
 
-On architecture: NautilusTrader prefers a Rust core with a thin PyO3 layer for
-the adapters it ships in-tree. This package is Python throughout — a deliberate
-choice for an external package, explained in
-[docs/architecture.md](docs/architecture.md), which does not exempt it from any
-behavioural requirement. A Rust migration is a possible future project and is
-not being promised, so a partial Rust rewrite is not a change to open
-unannounced.
+On architecture: this package is Python throughout, and the reasoning is in
+[docs/architecture.md](docs/architecture.md#the-deliberate-python-only-architecture).
+A partial rewrite along other lines is not a change to open unannounced.
 
 ## Reporting an issue
 
@@ -125,6 +122,6 @@ Security problems do not go in an issue: report them privately, as described in
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE). Contributions are accepted under the same licence;
-there is no contributor licence agreement, and you keep the copyright in what
+MIT — see [LICENSE](LICENSE). Contributions are accepted under the same license;
+there is no contributor license agreement, and you keep the copyright in what
 you write.

@@ -2,15 +2,16 @@
 
 ## Supported versions
 
-| Version | Status |
-|---|---|
-| `0.2.0a1` | Current alpha. Security fixes are published against this line |
-| `0.1.x` | Superseded. No fixes; preserved unchanged on the `legacy/v0.1.0` branch for reference |
+| Version   | Status                                                                                |
+|-----------|---------------------------------------------------------------------------------------|
+| `0.2.0a1` | Current alpha. Security fixes are published against this line                         |
+| `0.1.x`   | Superseded. No fixes; preserved unchanged on the `legacy/v0.1.0` branch for reference |
 
-This is alpha software, and no validation against the live venue has been
-recorded — see [docs/validation.md](docs/validation.md). The absence of a
-published advisory is therefore not evidence of safety: the offline test suite
-is extensive, but it is evidence about the code, not about the exchange.
+This is alpha software. Live validation reaches the market-data paths, spot
+execution, one USDT perpetual and one option contract, and no further; see
+[docs/validation.md](docs/validation.md). The absence of a published advisory is
+not evidence of safety: the offline test suite is extensive, and it is evidence
+about the code rather than about the exchange.
 
 ## Reporting a vulnerability
 
@@ -120,21 +121,21 @@ given run touches follows the `products` and the spot account mode you
 configure: the margin and unified endpoints are reached only in the
 corresponding modes. One call is unconditional — at start-up the execution
 client reads `/wallet/fee`, falling back to `/spot/fee`, to obtain the numeric
-account id that Gate.io's private derivative channels require, so even a
-spot-only key needs account read access.
+account id that Gate.io's private derivative channels require. A spot-only key
+that cannot read the account leaves the client running, with two warnings; a
+client configured with any derivative product refuses to start.
 
 **Use separate keys per environment, and set the testnet variables
 explicitly.** On `environment="testnet"` the testnet variables take precedence
 but fall back to the mainnet ones when unset, so a testnet run with only
 `GATE_API_KEY` in the environment will sign with your mainnet key against the
 testnet host. The reverse cannot happen: a mainnet run never reads the testnet
-variables. Both behaviours are pinned by tests in `tests/test_config.py`.
+variables. Both behaviors are pinned by tests in `tests/test_config.py`.
 
-**Supply credentials through the environment, never through source.** Hardcoded
-keys reach version control, backups and screen shares. The repository's
-`.gitignore` covers the usual credential file shapes — `.env`, `credentials`
-and `secrets` files in the common formats, `*.pem`, `*.key`, `*.p12` — which is
-a safety net, not a substitute for care.
+**Supply credentials through the environment, never through source.** The
+repository's `.gitignore` covers the usual credential file shapes: `.env`,
+`credentials` and `secrets` files in the common formats, `*.pem`, `*.key`,
+`*.p12`.
 
 **Restrict the key to the addresses that will use it.** An IP allowlist at the
 venue turns a leaked key into a much smaller problem. It does nothing if the
@@ -143,8 +144,8 @@ deployment rather than one key everywhere.
 
 **Rehearse before committing funds.** Gate.io publishes testnet endpoints for
 spot and USDT perpetuals only; inverse perpetuals, delivery futures and options
-have no testnet, so the first real run for those products is on mainnet. Start
-with sizes you are willing to lose.
+have no testnet, so the first real run for those products is on mainnet, and no
+testnet run is recorded in [docs/validation.md](docs/validation.md) either.
 
 **Know that `environment` defaults to `"mainnet"` on both clients, and that
 there is no local order kill switch.** A misconfigured node holding valid

@@ -6,7 +6,7 @@ interpretable together with the host it arrived on. This script opens a spot
 connection and a perpetual connection, subscribes each to the real best
 bid/offer stream and the public trade stream, and prints what arrives.
 
-Nothing here is synthesised: quotes come from ``*.book_ticker`` and trades from
+Nothing here is synthesized: quotes come from ``*.book_ticker`` and trades from
 ``*.trades``, exactly as the venue publishes them.
 
 Credentials: NOT required.

@@ -100,8 +100,6 @@ def main() -> None:
 
     try:
         node.run()
-    except KeyboardInterrupt:
-        print("interrupt received - shutting down", flush=True)
     finally:
         node.dispose()
 

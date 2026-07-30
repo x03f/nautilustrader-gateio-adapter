@@ -27,8 +27,11 @@ body:
         - Execution / order types
         - Instrument provider
         - Reconciliation
-        - Futures (experimental)
-        - Paper simulator
+        - Spot
+        - Perpetual / inverse futures
+        - Delivery futures
+        - Options
+        - Accounts and margin
         - HTTP / WebSocket infrastructure (signing, rate limiting, retries)
         - Configuration
         - Documentation

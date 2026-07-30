@@ -7,7 +7,7 @@ USDT-settled options.
 
 This page describes what happens to an order after it is submitted, and what
 happens when the connection, the process or the venue's own bookkeeping gets in
-the way. Two behaviours have sections of their own — [conditional order
+the way. Two behaviors have sections of their own — [conditional order
 identity](#conditional-order-identity) and [the fill-before-order
 race](#the-fill-before-order-race) — because they are where an otherwise
 reasonable implementation silently loses fills.
@@ -15,17 +15,16 @@ reasonable implementation silently loses fills.
 ## Maturity
 
 This is an external community adapter for NautilusTrader 1.230.0, implemented in
-pure Python. It is not an official NautilusTrader integration, and it is not
-affiliated with Gate.io or Nautech Systems. It deliberately deviates from the
-preferred in-tree Rust/PyO3 adapter architecture; a Rust migration is a possible
-future project, not a plan.
+pure Python ([why](architecture.md#the-deliberate-python-only-architecture)). It
+is not an official NautilusTrader integration, and it is not affiliated with
+Gate.io or Nautech Systems.
 
 **Live validation of the execution path covers spot, one USDT perpetual and one
-option contract.** Gate.io has accepted, filled, amended and cancelled real spot
+option contract.** Gate.io has accepted, filled, amended and canceled real spot
 orders placed through this client and closed the resulting position; on a USDT
 perpetual it has filled market orders into a short and into a long, accepted the
 reduce-only order that closed one, refused a reduce-only order sent with no
-position, and taken conditional orders on both sides that were armed, cancelled
+position, and taken conditional orders on both sides that were armed, canceled
 and re-armed at moving triggers; on an option it has taken a resting limit buy,
 filled an aggressive one, and accepted a limit sell covered by the resulting
 long. The runs and their checks are recorded in
@@ -50,13 +49,13 @@ it does not prove Gate.io agrees with it.
 
 Capabilities on this page carry one of these labels:
 
-| Label | Meaning |
-|---|---|
-| implemented and mock-tested | Implemented, and exercised by the offline execution tests |
+| Label                                   | Meaning                                                                                                                    |
+|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------|
+| implemented and mock-tested             | Implemented, and exercised by the offline execution tests                                                                  |
 | implemented, mainnet validation pending | Implemented, but not exercised by the execution tests — only the layer below it (an HTTP namespace or a parser) is covered |
-| experimental | Implemented; the behaviour or the interface may still change |
-| unsupported | Not available. The client says so explicitly instead of approximating |
-| not applicable | The concept does not exist on that product, or not in this layer |
+| experimental                            | Implemented; the behavior or the interface may still change                                                                |
+| unsupported                             | Not available. The client says so explicitly instead of approximating                                                      |
+| not applicable                          | The concept does not exist on that product, or not in this layer                                                           |
 
 Both labels are statements about the repository, not about the exchange: a row
 marked *implemented and mock-tested* is still unproven on the venue unless
@@ -75,15 +74,15 @@ refused before a connection is opened. There is no local order kill switch; see
 One execution client is one Nautilus account, and every configured product is
 routed through it.
 
-| Aspect | Behaviour |
-|---|---|
-| Account id | `GATE_IO-master` |
-| Account type | `CASH` when spot is the only product **and** `spot_account_mode=SPOT`; `MARGIN` in every other combination |
-| OMS type | `NETTING` |
-| Hedge (dual) position mode | unsupported — detected at connect and refused with an explanatory error |
-| Balances | Aggregated per currency across the wallets of the enabled products |
-| Margins | Scoped the way the venue holds the collateral: a cross-margined position (Gate.io `leverage="0"`) is reported account-wide, keyed by its settlement currency; an isolated position is reported per instrument. The options wallet reports one account-wide figure. Published only for a `MARGIN` account |
-| `Strategy.query_account()` | Re-reads every enabled product's wallet over REST and publishes a fresh `AccountState`. Implemented and mock-tested |
+| Aspect                     | Behavior                                                                                                                                                                                                                                                                                                 |
+|----------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Account id                 | `GATE_IO-master`                                                                                                                                                                                                                                                                                         |
+| Account type               | `CASH` when spot is the only product **and** `spot_account_mode=SPOT`; `MARGIN` in every other combination                                                                                                                                                                                               |
+| OMS type                   | `NETTING`                                                                                                                                                                                                                                                                                                |
+| Hedge (dual) position mode | unsupported — detected at connect and refused with an explanatory error                                                                                                                                                                                                                                  |
+| Balances                   | Aggregated per currency across the wallets of the enabled products                                                                                                                                                                                                                                       |
+| Margins                    | Scoped the way the venue holds the collateral: a cross-margined position (Gate.io `leverage="0"`) is reported account-wide, keyed by its settlement currency; an isolated position is reported per instrument. The options wallet reports one account-wide figure. Published only for a `MARGIN` account |
+| `Strategy.query_account()` | Re-reads every enabled product's wallet over REST and publishes a fresh `AccountState`. Implemented and mock-tested                                                                                                                                                                                      |
 
 `query_account` never answers from the last state it published. When a wallet
 could not be read, the client logs an error naming the products whose figures in
@@ -124,12 +123,12 @@ model itself.
 The **private WebSocket is the primary event source**, one connection per
 product:
 
-| Channel | Drives |
-|---|---|
-| `{spot,futures,options}.orders` | the order lifecycle |
-| `{spot,futures,options}.usertrades` | fills |
-| `{spot,futures,options}.balances` | account state |
-| `{futures,options}.positions` | parsed and logged at debug level, never published as reports |
+| Channel                             | Drives                                                       |
+|-------------------------------------|--------------------------------------------------------------|
+| `{spot,futures,options}.orders`     | the order lifecycle                                          |
+| `{spot,futures,options}.usertrades` | fills                                                        |
+| `{spot,futures,options}.balances`   | account state                                                |
+| `{futures,options}.positions`       | parsed and logged at debug level, never published as reports |
 
 Position updates are deliberately not forwarded. REST is the single
 reconciliation source for positions, and publishing the stream as well would let
@@ -181,15 +180,15 @@ venue trade id that de-duplication depends on.
 
 ### Order translation
 
-| Nautilus order | Gate.io encoding |
-|---|---|
-| MARKET, spot SELL | `type=market`, `amount` = base quantity, `time_in_force` `ioc` (`fok` honoured) |
-| MARKET, spot BUY with `quote_quantity=True` | `type=market`, `amount` = quote amount |
-| MARKET, spot BUY with a base quantity | aggressive IOC `limit` priced by the pair's published `slippage` cap |
-| MARKET, futures and delivery | `price="0"` with `tif=ioc` (`fok` honoured) |
-| MARKET, options | `price="0"` with `tif=ioc`; `fok` is rejected |
-| LIMIT | `price`, `tif` `gtc`/`ioc`/`fok`; post-only GTC maps to `poc` |
-| STOP_MARKET, STOP_LIMIT, MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED | the product's price-triggered ("auto order") endpoint |
+| Nautilus order                                               | Gate.io encoding                                                               |
+|--------------------------------------------------------------|--------------------------------------------------------------------------------|
+| MARKET, spot SELL                                            | `type=market`, `amount` = base quantity, `time_in_force` `ioc` (`fok` honored) |
+| MARKET, spot BUY with `quote_quantity=True`                  | `type=market`, `amount` = quote amount                                         |
+| MARKET, spot BUY with a base quantity                        | aggressive IOC `limit` priced by the pair's published `slippage` cap           |
+| MARKET, futures and delivery                                 | `price="0"` with `tif=ioc` (`fok` honored)                                     |
+| MARKET, options                                              | `price="0"` with `tif=ioc`; `fok` is rejected                                  |
+| LIMIT                                                        | `price`, `tif` `gtc`/`ioc`/`fok`; post-only GTC maps to `poc`                  |
+| STOP_MARKET, STOP_LIMIT, MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED | the product's price-triggered ("auto order") endpoint                          |
 
 Supported order types are exactly:
 
@@ -205,7 +204,7 @@ network call, with the reason on the `OrderDenied` event.
 Time in force: GTC, IOC and FOK, plus post-only through `poc`. Post-only is
 Gate.io's `poc` time in force — a maker-only order that *rests* — so it composes
 with GTC and is refused, not substituted, when it is combined with IOC or FOK.
-Flags honoured: `reduce_only` (derivatives only), `display_qty` (iceberg, regular
+Flags honored: `reduce_only` (derivatives only), `display_qty` (iceberg, regular
 orders only, and never zero — see below), `quote_quantity` (spot market buy
 only). Sizes on futures, delivery and options are **contract counts**, sent as a
 signed integer — positive for a buy, negative for a sell.
@@ -243,8 +242,9 @@ things depending on what the list carries.
 
 **A list with no contingency** is submitted in full. Orders are grouped by
 product, and a group goes out as one batch request where Gate.io has one and the
-group fits inside the venue's caps (`POST /spot/batch_orders`, at most 10 orders
-across at most 4 pairs; `POST /futures/{settle}/batch_orders`, at most 10). Every
+group fits inside the venue's caps (`POST /spot/batch_orders`, at most 4 pairs
+and at most 10 orders on any one of them, checked independently;
+`POST /futures/{settle}/batch_orders`, at most 10). Every
 other group — delivery futures, options, an oversized group — is submitted one
 order at a time. Nothing about a transport shape makes an order invalid, so a
 group the batch endpoint cannot take is sent singly rather than denied; and an
@@ -279,28 +279,28 @@ brackets against this venue use order emulation, which the same page describes.
 Every case Gate.io cannot express is rejected with a stated reason instead of
 being changed into something the venue does accept:
 
-| Situation | Result |
-|---|---|
-| GTD, DAY, AT_THE_OPEN or AT_THE_CLOSE on a limit order | rejected, naming the supported set (GTC, IOC, FOK, and post-only via `poc`) |
-| On any market order, a time in force other than GTC, DAY, IOC or FOK — and on options, FOK as well | rejected; spot goes through the same mapping as the other three products, so AT_THE_OPEN and AT_THE_CLOSE are refused there too |
-| `reduce_only` on a spot order | rejected — reduce-only is a derivatives concept and dropping it changes the order |
-| `quote_quantity=True` anywhere but a spot market buy | rejected |
-| `quote_quantity=True` on a spot market **sell** | rejected — Gate.io market sells take a base amount |
-| post-only on a market order | rejected |
-| post-only combined with IOC or FOK | rejected — `poc` is a resting maker-only order, so the immediacy could not survive the substitution |
-| FOK on an options order | rejected — the venue offers `gtc`, `ioc` and `poc` there |
-| Fractional contract quantity on a derivative | rejected — contracts are whole |
-| `display_qty=0` (a fully hidden order) | rejected — Gate.io reads `iceberg=0` as a normal, fully displayed order and does not support hiding the whole amount |
-| A fractional `display_qty` on a derivative | rejected — the iceberg quantity is a contract count, and truncating it to zero would display the whole order |
-| A price or trigger price off the instrument's tick grid | rejected — the venue accepts on-tick prices only, and moving the price to the nearest tick would submit a different order |
-| Price-triggered order on options | unsupported — the venue has no such endpoint for options |
-| Price-triggered spot order under `CROSS_MARGIN` | rejected — the venue's spot price-trigger endpoint has no cross-margin ledger |
-| post-only or `display_qty` on a price-triggered order | rejected — the fired order accepts neither, and dropping the flag would submit a materially different order |
-| Trigger type other than LAST_PRICE, MARK_PRICE or INDEX_PRICE on futures or delivery | rejected |
-| Trigger type other than DEFAULT or LAST_PRICE on **spot** | rejected — the spot trigger object is `{price, rule, expiration}`, with no price-type field, and spot has no mark or index price to name |
-| A conditional order whose trigger price contradicts its order type | rejected — see the comparison rule below |
-| A base-denominated spot market buy with no reference price available | rejected, suggesting `quote_quantity=True` |
-| Amending the trigger price of a working order | rejected — the venue cannot do it |
+| Situation                                                                                          | Result                                                                                                                                   |
+|----------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| GTD, DAY, AT_THE_OPEN or AT_THE_CLOSE on a limit order                                             | rejected, naming the supported set (GTC, IOC, FOK, and post-only via `poc`)                                                              |
+| On any market order, a time in force other than GTC, DAY, IOC or FOK — and on options, FOK as well | rejected; spot goes through the same mapping as the other three products, so AT_THE_OPEN and AT_THE_CLOSE are refused there too          |
+| `reduce_only` on a spot order                                                                      | rejected — reduce-only is a derivatives concept and dropping it changes the order                                                        |
+| `quote_quantity=True` anywhere but a spot market buy                                               | rejected                                                                                                                                 |
+| `quote_quantity=True` on a spot market **sell**                                                    | rejected — Gate.io market sells take a base amount                                                                                       |
+| post-only on a market order                                                                        | rejected                                                                                                                                 |
+| post-only combined with IOC or FOK                                                                 | rejected — `poc` is a resting maker-only order, so the immediacy could not survive the substitution                                      |
+| FOK on an options order                                                                            | rejected — the venue offers `gtc`, `ioc` and `poc` there                                                                                 |
+| Fractional contract quantity on a derivative                                                       | rejected — contracts are whole                                                                                                           |
+| `display_qty=0` (a fully hidden order)                                                             | rejected — Gate.io reads `iceberg=0` as a normal, fully displayed order and does not support hiding the whole amount                     |
+| A fractional `display_qty` on a derivative                                                         | rejected — the iceberg quantity is a contract count, and truncating it to zero would display the whole order                             |
+| A price or trigger price off the instrument's tick grid                                            | rejected — the venue accepts on-tick prices only, and moving the price to the nearest tick would submit a different order                |
+| Price-triggered order on options                                                                   | unsupported — the venue has no such endpoint for options                                                                                 |
+| Price-triggered spot order under `CROSS_MARGIN`                                                    | rejected — the venue's spot price-trigger endpoint has no cross-margin ledger                                                            |
+| post-only or `display_qty` on a price-triggered order                                              | rejected — the fired order accepts neither, and dropping the flag would submit a materially different order                              |
+| Trigger type other than LAST_PRICE, MARK_PRICE or INDEX_PRICE on futures or delivery               | rejected                                                                                                                                 |
+| Trigger type other than DEFAULT or LAST_PRICE on **spot**                                          | rejected — the spot trigger object is `{price, rule, expiration}`, with no price-type field, and spot has no mark or index price to name |
+| A conditional order whose trigger price contradicts its order type                                 | rejected — see the comparison rule below                                                                                                 |
+| A base-denominated spot market buy with no reference price available                               | rejected, suggesting `quote_quantity=True`                                                                                               |
+| Amending the trigger price of a working order                                                      | rejected — the venue cannot do it                                                                                                        |
 
 One exception to the rule, stated here rather than buried, and it is by design:
 
@@ -342,16 +342,16 @@ order type decides the rule on its own and the venue makes the final call.
 `ModifyOrder` maps to Gate.io's amend endpoints, with explicit rejections where
 the venue has no equivalent:
 
-| Case | Result | Status |
-|---|---|---|
-| Spot | `PATCH /spot/orders/{id}` with the new amount and/or price | implemented and mock-tested |
-| Perpetual, inverse | `PUT /futures/{settle}/orders/{id}` with the signed size and/or price | implemented and mock-tested |
-| Delivery | rejected — the venue cannot amend delivery orders | unsupported |
-| Options | rejected — the venue cannot amend options orders | unsupported |
-| An armed price-triggered order | rejected — cancel and resubmit | unsupported |
-| A new trigger price | rejected — the venue cannot amend a working order's trigger | unsupported |
-| Neither quantity nor price given | rejected | not applicable |
-| Contract quantity change while the order is not in the cache | rejected — the side determines the sign of `size`, and guessing it could flip a short into a long | not applicable |
+| Case                                                         | Result                                                                                            | Status                      |
+|--------------------------------------------------------------|---------------------------------------------------------------------------------------------------|-----------------------------|
+| Spot                                                         | `PATCH /spot/orders/{id}` with the new amount and/or price                                        | implemented and mock-tested |
+| Perpetual, inverse                                           | `PUT /futures/{settle}/orders/{id}` with the signed size and/or price                             | implemented and mock-tested |
+| Delivery                                                     | rejected — the venue cannot amend delivery orders                                                 | unsupported                 |
+| Options                                                      | rejected — the venue cannot amend options orders                                                  | unsupported                 |
+| An armed price-triggered order                               | rejected — cancel and resubmit                                                                    | unsupported                 |
+| A new trigger price                                          | rejected — the venue cannot amend a working order's trigger                                       | unsupported                 |
+| Neither quantity nor price given                             | rejected                                                                                          | not applicable              |
+| Contract quantity change while the order is not in the cache | rejected — the side determines the sign of `size`, and guessing it could flip a short into a long | not applicable              |
 
 A fired conditional order is amendable like any other order on the products that
 support amendment: the amend addresses the fired id, not the armed one.
@@ -360,7 +360,7 @@ support amendment: the amend addresses the fired id, not the armed one.
 
 * `cancel_order` — cancels one order by venue order id, taking the price-trigger
   id space into account: an order still armed is disarmed by its armed id, an
-  order that has fired is cancelled by its fired id.
+  order that has fired is canceled by its fired id.
 * `cancel_all_orders` — cancels per product and instrument, including armed
   price-triggered orders. Neither price-order endpoint accepts a side filter, so
   a **side-scoped** command disarms the matching price orders one at a time, by
@@ -379,7 +379,7 @@ Those are matched back to this client's armed orders and closed explicitly,
 rather than being pushed through the order-payload path where they would not be
 understood.
 
-**Cancelling an order the venue no longer holds is not a refusal.** Gate.io
+**Canceling an order the venue no longer holds is not a refusal.** Gate.io
 answers such a cancel with `ORDER_NOT_FOUND`, `ORDER_CLOSED`, `ORDER_CANCELLED`
 or `ORDER_FINISHED`, and its own error tables class these as benign idempotent
 races on cancel. This client's transport replays `DELETE` on a transient
@@ -412,18 +412,18 @@ The platform enforces the ordering: its state table reaches `DENIED` from
 `INITIALIZED` and `RELEASED` only, so a refusal announced after `OrderSubmitted`
 could not be expressed as a denial at all.
 
-| Outcome | Nautilus event |
-|---|---|
-| Unknown instrument, unconfigured product, unsupported order type | `OrderDenied`, before any network call |
-| Any instruction Gate.io cannot express (the [refusal table](products.md#what-is-refused-rather-than-translated)) | `OrderDenied` — decided while the request is built, so nothing is sent |
-| Any other failure while building the request | `OrderDenied`, naming the failure |
-| Venue **refusal** on submission (a 4xx answer) | `OrderRejected`, carrying the venue's label and message |
-| Post-only order that would have taken liquidity | `OrderRejected` with `due_post_only=True` |
-| Submission whose outcome the venue never confirmed | nothing — see [Unknown outcomes](#unknown-outcomes) |
-| `finish_as=expired` | `OrderExpired`, unless the quantities say the order completed |
-| `finish_as=cancelled`, `reduce_only`, `reduce_out`, `position_closed` | `OrderCanceled` |
-| Unfilled remainder of an `ioc`, `fok` or self-trade-prevention order | `OrderCanceled` (`OrderFilled` if it in fact filled completely) |
-| `finish_as=liquidated` or `auto_deleveraged` | `OrderCanceled` — Gate.io defines both as cancellations, and what the position did is carried by the fills on the trade channel |
+| Outcome                                                                                                          | Nautilus event                                                                                                                  |
+|------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| Unknown instrument, unconfigured product, unsupported order type                                                 | `OrderDenied`, before any network call                                                                                          |
+| Any instruction Gate.io cannot express (the [refusal table](products.md#what-is-refused-rather-than-translated)) | `OrderDenied` — decided while the request is built, so nothing is sent                                                          |
+| Any other failure while building the request                                                                     | `OrderDenied`, naming the failure                                                                                               |
+| Venue **refusal** on submission (a 4xx answer)                                                                   | `OrderRejected`, carrying the venue's label and message                                                                         |
+| Post-only order that would have taken liquidity                                                                  | `OrderRejected` with `due_post_only=True`                                                                                       |
+| Submission whose outcome the venue never confirmed                                                               | nothing — see [Unknown outcomes](#unknown-outcomes)                                                                             |
+| `finish_as=expired`                                                                                              | `OrderExpired`, unless the quantities say the order completed                                                                   |
+| `finish_as=cancelled`, `reduce_only`, `reduce_out`, `position_closed`                                            | `OrderCanceled`                                                                                                                 |
+| Unfilled remainder of an `ioc`, `fok` or self-trade-prevention order                                             | `OrderCanceled` (`OrderFilled` if it in fact filled completely)                                                                 |
+| `finish_as=liquidated` or `auto_deleveraged`                                                                     | `OrderCanceled` — Gate.io defines both as cancellations, and what the position did is carried by the fills on the trade channel |
 
 Those last rows share one rule: **the quantities decide whether an order
 completed; the reason only explains a non-completion.** A terminal message whose
@@ -463,13 +463,13 @@ generated here: `AccountState`, `OrderDenied`, `OrderSubmitted`,
 The rest of the event model belongs to other components, and this client
 deliberately produces none of it:
 
-| Event | Produced by |
-|---|---|
-| `OrderInitialized` | `OrderFactory`, when the strategy creates the order |
-| `OrderEmulated`, `OrderReleased` | `OrderEmulator` |
-| `OrderPendingUpdate`, `OrderPendingCancel` | `Strategy`, before the command reaches this client |
-| `PositionOpened`, `PositionChanged`, `PositionClosed` | `ExecutionEngine`, derived from fills |
-| `PositionAdjusted` | `Position.apply_adjustment`, inside the model |
+| Event                                                 | Produced by                                         |
+|-------------------------------------------------------|-----------------------------------------------------|
+| `OrderInitialized`                                    | `OrderFactory`, when the strategy creates the order |
+| `OrderEmulated`, `OrderReleased`                      | `OrderEmulator`                                     |
+| `OrderPendingUpdate`, `OrderPendingCancel`            | `Strategy`, before the command reaches this client  |
+| `PositionOpened`, `PositionChanged`, `PositionClosed` | `ExecutionEngine`, derived from fills               |
+| `PositionAdjusted`                                    | `Position.apply_adjustment`, inside the model       |
 
 Gate.io pushes position updates on a private channel; they are parsed and logged
 but never published, because REST reconciliation is the single source for
@@ -493,15 +493,15 @@ NautilusTrader therefore allows `OrderRejected`, `OrderCancelRejected` and
 check, open-order poll or reconciliation to resolve. This client emits no event
 at all in that case.
 
-| Failure | Classified as | Why |
-|---|---|---|
-| A 4xx answer from Gate.io (including 429) | definitive | the venue answered, and the answer is a refusal |
-| A failure before any byte was sent (`NETWORK_ERROR`) | definitive | the venue cannot have seen the request |
-| The adapter's own pre-flight refusal | definitive | nothing was sent |
-| `GateioRequestAmbiguousError` — sent and unanswered, replayed or not | ambiguous | the venue may have applied it |
-| A 5xx answer | ambiguous | Gate.io can raise it before or after applying the request |
-| A whole-batch failure with no per-order results | ambiguous | it says nothing about the individual cancels |
-| Anything the client could not read after the request went out | ambiguous | including a price order the venue armed without returning its id |
+| Failure                                                              | Classified as | Why                                                              |
+|----------------------------------------------------------------------|---------------|------------------------------------------------------------------|
+| A 4xx answer from Gate.io (including 429)                            | definitive    | the venue answered, and the answer is a refusal                  |
+| A failure before any byte was sent (`NETWORK_ERROR`)                 | definitive    | the venue cannot have seen the request                           |
+| The adapter's own pre-flight refusal                                 | definitive    | nothing was sent                                                 |
+| `GateioRequestAmbiguousError` — sent and unanswered, replayed or not | ambiguous     | the venue may have applied it                                    |
+| A 5xx answer                                                         | ambiguous     | Gate.io can raise it before or after applying the request        |
+| A whole-batch failure with no per-order results                      | ambiguous     | it says nothing about the individual cancels                     |
+| Anything the client could not read after the request went out        | ambiguous     | including a price order the venue armed without returning its id |
 
 The distinction is not caution, it is recoverability. `OrderRejected` is
 terminal, so an order Gate.io is actually holding could never be represented
@@ -516,7 +516,7 @@ What the engine then does with a `PENDING_CANCEL` or `PENDING_UPDATE` order it
 cannot confirm is the engine's decision, and the platform's own sources differ:
 live.md's in-flight timeout table leaves both unresolved, while the installed
 1.230.0 generates `OrderCanceled` for both once `inflight_check_retries` is
-spent. The installed behaviour is what runs. Either way that decision is taken
+spent. The installed behavior is what runs. Either way that decision is taken
 after querying the venue, which is more than this client knows when the request
 fails.
 
@@ -540,8 +540,8 @@ filled before its answer was lost is found as well.
 ## Fills
 
 * The Nautilus `TradeId` is the **venue trade id** from `*.usertrades` /
-  `my_trades`. Trade ids are never synthesised, because NautilusTrader's own
-  duplicate-fill guard is keyed on them: a synthesised id would make the same
+  `my_trades`. Trade ids are never synthesized, because NautilusTrader's own
+  duplicate-fill guard is keyed on them: a synthesized id would make the same
   fill applicable twice across the WebSocket and REST paths.
 * Applied trade ids are additionally remembered per order inside the client, so
   a replayed `usertrades` message cannot fill twice even before the framework
@@ -603,10 +603,10 @@ The venue arms one under one id and, when the trigger fires, creates a
 every cancel and every fill names the new id. Both identities stay meaningful
 for the whole life of the order:
 
-| Identity | What it is for |
-|---|---|
+| Identity     | What it is for                                                                                                                                                    |
+|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **armed id** | The only handle that can disarm the order, and the only key the venue's price-order listings answer to — which is what makes the link rebuildable after a restart |
-| **fired id** | The id every subsequent order update, cancel and fill carries |
+| **fired id** | The id every subsequent order update, cancel and fill carries                                                                                                     |
 
 Discarding either one loses the order. The client therefore keeps both, in a
 `GateioTriggerLink`, indexed in each direction:
@@ -658,10 +658,10 @@ suite for the transition is `TestTriggerVenueOrderIdRebase` in
 A restart loses the in-memory map, so it is rebuilt from the venue rather than
 assumed. What the venue offers differs by product, and spot is the hard case:
 
-| Product | Client id on the price order | Fired id on the price order |
-|---|---|---|
-| Perpetual, inverse, delivery | `initial.text` echoes the `t-` client id | `trade_id` (absent or `0` until it fires) |
-| Spot | none at all — `put.text` is an order-source marker such as `api` | `fired_order_id` |
+| Product                      | Client id on the price order                                     | Fired id on the price order               |
+|------------------------------|------------------------------------------------------------------|-------------------------------------------|
+| Perpetual, inverse, delivery | `initial.text` echoes the `t-` client id                         | `trade_id` (absent or `0` until it fires) |
+| Spot                         | none at all — `put.text` is an order-source marker such as `api` | `fired_order_id`                          |
 
 On spot the fired order carries no client id either, so `fired_order_id` on the
 armed price order is the *only* link between the Nautilus order and the order
@@ -798,10 +798,10 @@ aggregation are worth stating:
   in unified mode a poll that could not read the unified ledger publishes
   nothing at all rather than a sum it knows is inflated — on the first poll that
   surfaces as a connect failure, which is the honest outcome.
-* `total` is the **wallet balance**, never the margin balance: unrealised PnL is
+* `total` is the **wallet balance**, never the margin balance: unrealized PnL is
   deliberately left out of it. NautilusTrader computes equity for a margin
   account as `balances_total + Σ unrealized_pnl(open positions)`, so an adapter
-  that folds the venue's unrealised PnL into `total` makes the platform count it
+  that folds the venue's unrealized PnL into `total` makes the platform count it
   twice. This also makes the REST poll and the `futures.balances` stream, which
   carries the wallet balance alone, state the same number.
 * Margin ledgers subtract borrowed principal and accrued interest from the total.
@@ -827,7 +827,7 @@ made would let the engine close a still-open position through an execution nobod
 performed.
 
 **Funding** is *not applicable* as an execution event: the client emits no
-funding cash-flow event. Realised funding is reflected in the futures wallet
+funding cash-flow event. Realized funding is reflected in the futures wallet
 balance, and therefore in the next `AccountState` from the balance stream or the
 account poll. Funding *rates* are market data, not execution — see
 [market-data.md](market-data.md).
@@ -841,12 +841,12 @@ test suite.
 
 All four report generators are implemented against REST:
 
-| Method | Source |
-|---|---|
-| `generate_order_status_reports` | open plus recently finished orders across every enabled product, paginated, including armed price-triggered orders |
-| `generate_order_status_report` | single lookup by venue order id or client order id, on every product, following the armed or fired id as appropriate |
-| `generate_fill_reports` | `my_trades` per product over the lookback window, narrowed to one order when the command names a venue order id, sorted by `(ts_event, trade_id)` because reconciliation applies fills in list order |
-| `generate_position_status_reports` | futures, delivery and options positions (netting) |
+| Method                             | Source                                                                                                                                                                                               |
+|------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `generate_order_status_reports`    | open plus recently finished orders across every enabled product, paginated, including armed price-triggered orders                                                                                   |
+| `generate_order_status_report`     | single lookup by venue order id or client order id, on every product, following the armed or fired id as appropriate                                                                                 |
+| `generate_fill_reports`            | `my_trades` per product over the lookback window, narrowed to one order when the command names a venue order id, sorted by `(ts_event, trade_id)` because reconciliation applies fills in list order |
+| `generate_position_status_reports` | futures, delivery and options positions (netting)                                                                                                                                                    |
 
 ### Startup
 
@@ -862,7 +862,7 @@ the client uses its own default of **24 hours**.
 
 Restarting the node while orders rest on the venue is a supported path, but the
 venue remains the source of truth: an order the local cache never saw is adopted
-from the report, not invented. Whether NautilusTrader adopts an unrecognised
+from the report, not invented. Whether NautilusTrader adopts an unrecognized
 order at all is the engine's decision, governed by `external_order_claims` on the
 strategy and `filter_unclaimed_external_orders` on the execution engine — this
 client's job is to report it accurately, which includes reporting it with no
@@ -1018,7 +1018,7 @@ What was built, and one repair that was tried and taken back out:
   fail-safe trade. Those two proofs — the strictly-later venue stamp, and
   agreement with the post-booking book — are the only ways an armed memory
   clears, for every entry alike: the net delta of the bookings plays no
-  part, because a zero-net outage round trip (ordinary strategy behaviour)
+  part, because a zero-net outage round trip (ordinary strategy behavior)
   still cannot be contained in an answer that disagrees with the
   post-booking book — the eighth round's reader popped the memory at delta
   zero before any comparison, and that was `REC-07`'s second door (R8-F2).
@@ -1093,7 +1093,7 @@ What was built, and one repair that was tried and taken back out:
   it lost trades**, on either route. Gate.io publishes no base-denominated
   quantity for an unfinished market buy, so the listing's `filled_amount` is a
   running partial; a report built from it restated the order to that figure and
-  the matches that followed were refused as overfills (twelve of 338 randomised
+  the matches that followed were refused as overfills (twelve of 338 randomized
   reconnect cases). An unfinished cash buy now yields no order status report at
   all: its executions are recovered from the trade listing, and the order's own
   statement is taken from a re-read once the venue has finished it. An order
@@ -1141,7 +1141,7 @@ of none, because a ledger that does not exist holds no trades.
 
 ### Duplicate suppression
 
-Everything above depends on the same fill being recognised as the same fill,
+Everything above depends on the same fill being recognized as the same fill,
 whichever path delivers it. That works because the `TradeId` is always the venue
 trade id:
 
@@ -1234,7 +1234,6 @@ execution tests.
   cannot be fetched either, the loss is logged as an error rather than passing
   silently.
 * Only the paths listed in [validation.md](validation.md) have been exercised
-  against Gate.io itself — spot, one USDT perpetual and one option contract.
-  Every margin ledger, every other product and every path not named there has
-  not. Start on the testnet, then start small, and record what you find in
-  [validation.md](validation.md).
+  against Gate.io itself: spot, one USDT perpetual and one option contract. Every
+  margin ledger, every other product and every path not named there has not.
+  Recording what you find there is the most useful thing you can send back.
