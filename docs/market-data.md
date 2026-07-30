@@ -447,19 +447,19 @@ candlesticks, and `bar_type_to_interval` raises `ValueError` naming the supporte
 set for a specification with no Gate.io equivalent. On a subscription the client
 catches that and logs it as an error; it never substitutes a different interval.
 
-| Bar specification | Gate.io interval | Subscription  | Request |
-|-------------------|------------------|---------------|---------|
-| `1-SECOND`        | `1s`             | not available | yes     |
-| `10-SECOND`       | `10s`            | yes           | yes     |
-| `1-MINUTE`        | `1m`             | yes           | yes     |
-| `5-MINUTE`        | `5m`             | yes           | yes     |
-| `15-MINUTE`       | `15m`            | yes           | yes     |
-| `30-MINUTE`       | `30m`            | yes           | yes     |
-| `1-HOUR`          | `1h`             | yes           | yes     |
-| `4-HOUR`          | `4h`             | yes           | yes     |
-| `8-HOUR`          | `8h`             | yes           | yes     |
-| `1-DAY`           | `1d`             | yes           | yes     |
-| `7-DAY`           | `7d`             | yes           | yes     |
+| Bar specification | Gate.io interval | Subscription | Request |
+|-------------------|------------------|--------------|---------|
+| `1-SECOND`        | `1s`             | -            | ✓       |
+| `10-SECOND`       | `10s`            | ✓            | ✓       |
+| `1-MINUTE`        | `1m`             | ✓            | ✓       |
+| `5-MINUTE`        | `5m`             | ✓            | ✓       |
+| `15-MINUTE`       | `15m`            | ✓            | ✓       |
+| `30-MINUTE`       | `30m`            | ✓            | ✓       |
+| `1-HOUR`          | `1h`             | ✓            | ✓       |
+| `4-HOUR`          | `4h`             | ✓            | ✓       |
+| `8-HOUR`          | `8h`             | ✓            | ✓       |
+| `1-DAY`           | `1d`             | ✓            | ✓       |
+| `7-DAY`           | `7d`             | ✓            | ✓       |
 
 The candlestick WebSocket channels do not carry the one-second interval, so
 `1-SECOND` is available through `request_bars` only; a subscription for it is

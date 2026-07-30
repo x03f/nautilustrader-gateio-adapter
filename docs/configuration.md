@@ -65,13 +65,16 @@ options, so configuring `INVERSE`, `FUT` or `OPT` together with
 `environment="testnet"` raises `ValueError` from the client constructor, before
 any network activity.
 
-| Product                           | Mainnet | Testnet     |
-|-----------------------------------|---------|-------------|
-| Spot                              | yes     | yes         |
-| USDT-margined perpetual (`PERP`)  | yes     | yes         |
-| BTC-settled perpetual (`INVERSE`) | yes     | no endpoint |
-| Delivery futures (`FUT`)          | yes     | no endpoint |
-| Options (`OPT`)                   | yes     | no endpoint |
+| Product                           | Mainnet | Testnet |
+|-----------------------------------|---------|---------|
+| Spot                              | ✓       | ✓       |
+| USDT-margined perpetual (`PERP`)  | ✓       | ✓       |
+| BTC-settled perpetual (`INVERSE`) | ✓       | -       |
+| Delivery futures (`FUT`)          | ✓       | -       |
+| Options (`OPT`)                   | ✓       | -       |
+
+A hyphen in the testnet column means Gate.io publishes no testnet endpoint for
+that product at all.
 
 That check runs on the product set, not on the URLs, so it also applies when
 `base_url_ws` is set. The override itself is honored — an explicit URL is the
