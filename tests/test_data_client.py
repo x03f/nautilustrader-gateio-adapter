@@ -24,16 +24,22 @@ from nautilus_trader.data.messages import RequestOrderBookSnapshot
 from nautilus_trader.model.data import (
     Bar,
     BarType,
+    CustomData,
     FundingRateUpdate,
     IndexPriceUpdate,
+    InstrumentClose,
+    InstrumentStatus,
     MarkPriceUpdate,
+    OptionGreeks,
     OrderBookDelta,
     OrderBookDeltas,
+    OrderBookDepth10,
     QuoteTick,
     TradeTick,
 )
 from nautilus_trader.model.enums import BookAction, BookType, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
+from nautilus_trader.model.instruments import Instrument
 
 from nautilus_gateio import data as data_module
 from nautilus_gateio.books import GateioOrderBook
@@ -130,13 +136,62 @@ def build_instruments() -> list[Any]:
     return [spot, perp, option]
 
 
+#: The concrete types ``DataEngine._handle_data`` dispatches on
+#: (``data/engine.pyx:2541-2571``). Everything else reaches its ``else`` branch
+#: and is logged as ``Cannot handle data: unrecognized type`` and dropped
+#: (``:2572-2573``), which is a failure only an error line records. A
+#: venue-native type therefore has to arrive wrapped in ``CustomData``.
+ENGINE_DISPATCHED_TYPES: tuple[type, ...] = (
+    OrderBookDelta,
+    OrderBookDeltas,
+    OrderBookDepth10,
+    QuoteTick,
+    TradeTick,
+    MarkPriceUpdate,
+    IndexPriceUpdate,
+    FundingRateUpdate,
+    Bar,
+    Instrument,
+    InstrumentStatus,
+    InstrumentClose,
+    OptionGreeks,
+    CustomData,
+)
+
+#: Types published through a `Harness` that `DataEngine._handle_data` would not
+#: dispatch. Written by the seam, read and cleared after every test by the
+#: `_no_undispatchable_publish` fixture in `tests/conftest.py`.
+UNDISPATCHABLE_PUBLISHES: list[str] = []
+
+
 class Harness:
     """A constructed data client plus everything the tests published through it."""
 
     def __init__(self, client: GateioDataClient) -> None:
         self.client = client
         self.published: list[Any] = []
-        client._handle_data = self.published.append  # type: ignore[method-assign]
+        client._handle_data = self._record  # type: ignore[method-assign]
+
+    def _record(self, data: Any) -> None:
+        """Record one published object, and note one the engine could not dispatch.
+
+        This seam is what hid a real defect: replacing ``_handle_data`` with
+        ``list.append`` meant an object the engine drops looked published to
+        every assertion in the suite, and a venue-native type published outside
+        ``CustomData`` passed 1968 tests while reaching no subscriber. The check
+        lives on the seam rather than in one test, so every data test in the
+        package carries it.
+
+        It records rather than raises because most publishes happen inside
+        ``_handle_ws_message``, which catches per-message exceptions so one bad
+        payload never kills the stream — an assertion here would be swallowed
+        exactly like the defect it is looking for. ``_no_undispatchable_publish``
+        in ``tests/conftest.py`` reads the record after the test, where nothing
+        can swallow it.
+        """
+        if not isinstance(data, ENGINE_DISPATCHED_TYPES):
+            UNDISPATCHABLE_PUBLISHES.append(type(data).__name__)
+        self.published.append(data)
 
     def deltas(self) -> list[OrderBookDeltas]:
         return [item for item in self.published if isinstance(item, OrderBookDeltas)]

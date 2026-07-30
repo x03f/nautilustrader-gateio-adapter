@@ -639,7 +639,10 @@ async def test_a_request_for_the_venue_ticker_is_refused_without_raising(
         ),
     )
 
-    lines = log_capture.wait_for("Cannot request")
+    # Waited on by a fragment unique to this refusal: the quote refusal in this
+    # same file also begins "Cannot request", and under the full suite its line
+    # can land after the mark and end the wait before this one has been written.
+    lines = log_capture.wait_for("no history for any venue-native data type")
     assert any("[ERROR]" in line and "GateioTicker" in line for line in lines), lines
     assert tickers(harness) == []
 

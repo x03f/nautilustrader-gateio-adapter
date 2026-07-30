@@ -56,6 +56,33 @@ def _clear_factory_caches() -> Iterator[None]:
     factories.get_cached_gateio_instrument_provider.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_undispatchable_publish() -> Iterator[None]:
+    """Fail any test whose client published a type the data engine cannot dispatch.
+
+    ``DataEngine._handle_data`` dispatches on the concrete type and drops
+    anything it does not recognise with a single error line, so a venue-native
+    type published outside ``CustomData`` reaches no subscriber while every
+    assertion in this suite still sees it — that is how one shipped through a
+    green suite. The data tests replace ``_handle_data`` with a recorder that
+    notes such an object (``tests/test_data_client.py``), and the reading happens
+    here, after the test: most publishes run inside the client's WebSocket
+    message handler, which catches per-message exceptions, so an assertion at the
+    publish site would be swallowed exactly like the defect it looks for.
+    """
+    from tests.test_data_client import UNDISPATCHABLE_PUBLISHES
+
+    UNDISPATCHABLE_PUBLISHES.clear()
+    yield
+    offenders = list(UNDISPATCHABLE_PUBLISHES)
+    UNDISPATCHABLE_PUBLISHES.clear()
+    assert not offenders, (
+        f"published {offenders}, which `DataEngine._handle_data` would log as an "
+        f"unrecognised type and drop; a venue-native type has to be published inside "
+        f"`CustomData`"
+    )
+
+
 class NetworkAccessError(AssertionError):
     """Raised when a test tries to open a network connection."""
 
