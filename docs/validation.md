@@ -63,14 +63,6 @@ attempted the venue was already reporting that position flat.
 | `MARGIN` — `spot_account_mode=UNIFIED` | as spot; the streams do not depend on the ledger | **offline-harness** | Nothing. Requires a unified account on the venue |
 | `MARGIN` — any configuration including a derivative product | see the product table | **mainnet-confirmed**, for the USDT perpetual and option runs | The client reported a `MARGIN` account to the platform in every derivative run, and the venue took the perpetual orders and the option orders recorded below |
 
-<!-- VALIDATION RESULTS PLACEHOLDER
-     Fill this section in as validation runs complete. One row per exercised
-     path, with the date, the environment, the instrument, and what was
-     observed. Only after a row appears here may the corresponding README
-     matrix entry be promoted to Stable. Never record an account id, an order
-     id, a balance or a key.
--->
-
 ### Mainnet validation results
 
 Every row is a recorded run against Gate.io mainnet, on the smallest size the
