@@ -54,7 +54,7 @@ Cross margin and the unified endpoints require the account to be upgraded out of
 classic mode, which only the account owner can do. The adapter never changes an
 account's mode. Note also the venue's own minimum balances for the richer
 unified modes: `multi_currency` needs more than 500 USDT and `portfolio` more
-than 1000 USDT — see [products.md](products.md#unified-account-modes-and-their-venue-side-minimum-balances).
+than 1000 USDT — see [products.md](products.md#account-modes-spot-margin-cross-margin-unified).
 
 ## `FORBIDDEN`
 

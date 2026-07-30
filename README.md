@@ -34,15 +34,27 @@ instrument ids and the execution environment default all changed.
   rejection the venue did not make.
 * **Real reconciliation.** All four NautilusTrader report generators are
   implemented against REST, so a restart with resting orders and open positions
-  is a supported path. The four recovery defects previously stated here are
-  closed — the unapplied-fill sweep now runs on the restart route as well as
-  the reconnect route, a position row this client cannot parse fails the query
-  instead of reporting flat, a failed fill query is raised to the engine, and
-  an unfinished quote-denominated spot market buy no longer restates the order
-  to a partial figure. [execution.md](docs/execution.md) states each mechanism,
-  the residual risks, and the repair that was tried first and withdrawn. A node
-  that had never seen the account has read an open perpetual position back out
-  of the venue and traded it flat; the rest is offline-proven only.
+  is a supported path. Nine recovery defects have been found and closed over
+  the rework, the last two by live runs rather than by review: the
+  unapplied-fill sweep now runs on the restart route as well as the reconnect
+  route, a position row this client cannot parse fails the query instead of
+  reporting flat, a failed fill query is raised to the engine, a stale position
+  answer can no longer erase a position the venue still holds, and a trade
+  whose order the engine declined to adopt no longer crashes startup
+  reconciliation. [execution.md](docs/execution.md) states each mechanism, the
+  residual risks, and the repair that was tried first and withdrawn;
+  [review-matrix.md](docs/review-matrix.md) carries all nine. A node that had
+  never seen the account has read an open perpetual position back out of the
+  venue and traded it flat; the rest is offline-proven only.
+* **A cash buy ends `CANCELED`, not `FILLED`.** Gate.io denominates a spot
+  market buy in the quote currency and states the base quantity it bought only
+  when the order finishes, and NautilusTrader offers no way to move an order to
+  `FILLED` against a quantity restated after its fills. The order is therefore
+  closed on the venue's own figure with `OrderCanceled`, which preserves the
+  filled quantity — **read the outcome from `filled_qty` and the resulting
+  position, never from the terminal status.** The alternative was an estimated
+  quantity that could leave the order open for ever or make the engine discard
+  a fill; see [execution.md](docs/execution.md#fills).
 * **Usable standalone.** The async REST transport with its typed per-product
   namespaces, and the self-healing WebSocket clients, work without a Nautilus
   node.
@@ -157,7 +169,7 @@ mainnet, but a single recorded run is not evidence of stability — see
 | MARKET_IF_TOUCHED / LIMIT_IF_TOUCHED | yes | yes | yes | yes | no | Implemented — mock-tested | spot (LIMIT_IF_TOUCHED, buy side only) and USDT perpetual (MARKET_IF_TOUCHED, both sides), armed and cancelled; nothing triggered |
 | Reduce-only | n/a | yes | yes | yes | yes | Implemented — mock-tested | USDT perpetual (closed a short, and refused by the venue with no position open) |
 | Iceberg (`display_qty`, non-zero) | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (accepted carrying its display quantity) |
-| Quote-denominated quantity | market buy | no | no | no | no | Implemented — mock-tested | spot (filled, reported back in base units) |
+| Quote-denominated quantity | market buy | no | no | no | no | Implemented — mock-tested | spot (the venue filled it and reported the quantity in base units; the order itself closes `CANCELED` on the venue's own base total, never `FILLED`) |
 | Cancel / cancel-all / batch cancel | yes | yes | yes | yes | yes | Implemented — mock-tested | spot (single cancel, repeated cancel, cancel-replace and cancel-all, each clearing what was resting); options (a resting buy and a resting sell cancelled); the batch endpoint has no live run, and two shutdowns left behind an order submitted after the sweep |
 | Modify (amend) | yes | yes | yes | no | no | Partial (delivery and options reject explicitly) | spot (price amendment acknowledged) |
 | Private WebSocket lifecycle | yes | yes | yes | yes | yes | Implemented — mock-tested | — |

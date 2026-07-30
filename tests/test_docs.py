@@ -441,10 +441,39 @@ class TestFeatureMatrix:
                 f"mainnet result: {stable_rows}"
             )
 
-    def test_validation_placeholder_exists(self) -> None:
+    def test_the_validation_page_records_runs(self) -> None:
+        """The results section must carry rows, and the README must point at it.
+
+        This replaces a scaffolding guard that asserted an authoring comment was
+        still present in the page. That comment told whoever filled the section
+        in what to write; once the runs were recorded it was a stale instruction
+        sitting in a published document, and the guard was keeping it there. What
+        matters now is the opposite property — that the section is not empty.
+        """
         validation = (DOCS / "validation.md").read_text(encoding="utf-8")
-        assert "VALIDATION RESULTS PLACEHOLDER" in validation
+        results = validation.split("### Mainnet validation results", 1)[1].split("\n###", 1)[0]
+        rows = [
+            line
+            for line in results.splitlines()
+            if line.startswith("|") and not set(line) <= set("|- ")
+        ]
+        # A header row and a separator alone are not results.
+        assert len(rows) > 1, "docs/validation.md records no mainnet run"
         assert "Mainnet validation results" in README.read_text(encoding="utf-8")
+
+    def test_the_validation_page_states_no_venue_identifier(self) -> None:
+        """No account id, order id, trade id or balance, on the page that is most
+        tempted to carry one.
+
+        Every row here is written from a real run against a real account, which
+        is exactly where such a value would leak in. The rule is stated in the
+        page's own reporting section; this holds it to it.
+        """
+        validation = (DOCS / "validation.md").read_text(encoding="utf-8")
+        # Instrument ids and dates are fine; a bare run of seven or more digits
+        # is not something this page has any reason to state.
+        suspects = re.findall(r"(?<![\w.-])\d{7,}(?![\w.-])", validation)
+        assert not suspects, f"docs/validation.md may carry a venue identifier: {suspects}"
 
 
 class TestDocumentationLinks:
