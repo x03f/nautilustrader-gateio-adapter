@@ -192,7 +192,8 @@ reading.
 | `MARKET_TO_LIMIT` | denied | denied | denied | denied | Unsupported |
 | `TRAILING_STOP_MARKET` | denied | denied | denied | denied | Not implemented — see below |
 | `TRAILING_STOP_LIMIT` | denied | denied | denied | denied | Not implemented — see below |
-| Order lists (bracket, OCO, OTO) | — | — | — | — | Not implemented — see below |
+| Order lists, no contingency | batched through `POST /spot/batch_orders` | batched through `POST /futures/{settle}/batch_orders` | submitted one at a time | submitted one at a time | Implemented and mock-tested |
+| Order lists with a contingency (bracket, OCO, OTO) | denied | denied | denied | denied | Unsupported — see below |
 
 "Denied" and "rejected" are different events, and the difference is the whole
 point: `OrderDenied` says *Nautilus* refused the order, `OrderRejected` says
@@ -219,11 +220,20 @@ can do about each:
   2026-02-02; this adapter does not call them yet, so both trailing types are
   denied for now. `TRAILING_STOP_LIMIT` would additionally have nowhere to put
   its limit price, since the venue's trailing request carries no sub-order price.
-* **Order lists are a gap in this adapter too, in two independent ways.** No
-  `_submit_order_list` is implemented, so the inherited coroutine raises
-  `NotImplementedError`; and Gate.io has carried attached take-profit /
-  stop-loss on spot and futures orders since mid-2026, which is the shape a
-  Nautilus bracket has.
+* **A contingent order list is refused, and the reason is identity, not
+  linkage.** `submit_order_list` sends a list of plain orders to the venue: on
+  spot and the two perpetual products as one batch request, elsewhere one order
+  at a time. A list whose legs carry `linked_order_ids` or a contingency type —
+  every bracket, OCO and OTO — is denied in full, every leg, with the reason on
+  each. Gate.io does carry attached take-profit / stop-loss on spot and futures
+  orders, which is the shape a Nautilus bracket has, but neither request model
+  accepts a client-supplied identifier for the attached leg: the three Nautilus
+  orders would reach the venue as one order with one id. Announcing two legs that
+  can never acquire a venue order id is worse than refusing them — the live
+  execution engine turns a submitted order the venue cannot identify into
+  `OrderRejected(reason='UNKNOWN')` once the in-flight retries are spent, telling
+  the strategy its stop-loss was rejected while Gate.io holds it live against the
+  position.
 
 None of that means contingent orders are unavailable to a strategy today — see
 [order emulation](#order-emulation) below, which is how you get them without
@@ -260,8 +270,9 @@ Brackets and the contingency types work the same way. `OrderFactory.bracket()`
 builds an order list, and `Strategy.submit_order_list` routes the whole list to
 the emulator as soon as any leg carries an `emulation_trigger`; the emulator
 submits the non-emulated legs individually as plain orders and enforces the
-OTO / OCO / OUO links itself. That is why the missing `_submit_order_list` above
-does not stop a bracket strategy from running against this venue.
+OTO / OCO / OUO links itself. That is why the contingency refusal above does not
+stop a bracket strategy from running against this venue: with an
+`emulation_trigger` the list never reaches this client as a contingent list.
 
 Four things to know before relying on it, each of which surprises someone:
 
@@ -521,6 +532,7 @@ mock-tested*.
 | `TradeTick` | yes | yes | yes | yes | yes | `<prefix>.trades` | Implemented and mock-tested |
 | `QuoteTick` (real best bid/offer) | yes | yes | yes | yes | yes | `<prefix>.book_ticker` | Implemented and mock-tested |
 | `OrderBookDeltas` (`L2_MBP`) | yes | yes | yes | yes | yes | REST snapshot + `<prefix>.order_book_update` | Implemented and mock-tested |
+| `OrderBookDepth10` | yes | yes | yes | yes | yes | `<prefix>.order_book`, the venue's periodic snapshot channel | Implemented and mock-tested |
 | Order book snapshot request | yes | yes | yes | yes | yes | REST `order_book`, depth clamped per product | Implemented and mock-tested |
 | `Bar` (closed bars only) | yes | yes | yes | yes | yes | `<prefix>.candlesticks`; options use `options.contract_candlesticks` | Implemented and mock-tested |
 | Historical bars and trades | yes | yes | yes | yes | yes | Paginated REST, 1000 rows per call | Implemented, mainnet validation pending |
@@ -529,6 +541,10 @@ mock-tested*.
 | `FundingRateUpdate` | Not applicable | yes | yes | Not applicable | Not applicable | `futures.tickers` | Implemented, mainnet validation pending |
 | Historical `FundingRateUpdate` | Not applicable | yes | yes | Not applicable | Not applicable | REST `/futures/{settle}/funding_rate` | Implemented, mainnet validation pending |
 | Instrument updates | yes | yes | yes | yes | yes | Periodic REST reload; Gate.io has no instrument channel | Implemented and mock-tested (loading and filtering); implemented, mainnet validation pending (the reload timer) |
+| `InstrumentStatus` | yes | yes | yes | yes | yes | Polled instrument listings; Gate.io has no status channel | Implemented and mock-tested |
+| `InstrumentClose` | Not applicable | Not applicable | Not applicable | yes | yes | REST settlement after expiry; the three continuous products never settle | Implemented and mock-tested |
+| `GateioTicker` (venue ticker row) | yes | yes | yes | yes | yes | `<prefix>.tickers`, published as adapter-specific custom data | Implemented and mock-tested |
+| Historical `QuoteTick` | Unsupported on every product | | | | | Gate.io publishes no quote history; the request is refused | Unsupported |
 | Book types other than `L2_MBP` | Unsupported on every product | | | | | | Unsupported |
 | Options underlying, ticker and greeks streams | Not applicable | Not applicable | Not applicable | Not applicable | raw subscription only | `GateioPublicWebSocket.client`, not routed into the data engine | Experimental |
 

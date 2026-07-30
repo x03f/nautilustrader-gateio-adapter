@@ -54,6 +54,17 @@ Sizes on futures, delivery and options are **contract counts**: the Nautilus
 ``Quantity`` is the number of contracts and is sent as a signed integer, positive
 for a buy and negative for a sell.
 
+Order lists
+-----------
+An order list with no contingency is a set of independent orders: it is grouped
+by product and sent through the venue's batch endpoint where one exists and the
+group fits it, and one order at a time otherwise. A **contingent** list — a
+bracket, or anything carrying ``linked_order_ids`` — is refused in full, because
+Gate.io's attached take-profit / stop-loss returns no order id for the attached
+leg and NautilusTrader needs three addressable orders. Contingent orders reach
+this venue through the platform's own ``OrderEmulator`` instead; see
+:meth:`GateioExecutionClient._submit_order_list`.
+
 Client order ids
 ----------------
 Gate.io's ``text`` field carries the client order id. It must start with ``t-``,
@@ -113,7 +124,9 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
     ModifyOrder,
+    QueryAccount,
     SubmitOrder,
+    SubmitOrderList,
 )
 from nautilus_trader.execution.reports import (
     ExecutionMassStatus,
@@ -124,6 +137,7 @@ from nautilus_trader.execution.reports import (
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import (
     AccountType,
+    ContingencyType,
     OmsType,
     OrderSide,
     OrderStatus,
@@ -386,6 +400,25 @@ DEFAULT_LOOKBACK_SECS: Final[int] = 24 * 60 * 60
 
 #: Largest number of orders Gate.io cancels in one spot batch request.
 SPOT_CANCEL_BATCH_SIZE: Final[int] = 20
+
+#: Caps on ``POST /spot/batch_orders``: at most four currency pairs, and at most
+#: ten orders on any one of them (`http/spot.py`, :meth:`create_batch_orders`).
+SPOT_BATCH_MAX_PAIRS: Final[int] = 4
+SPOT_BATCH_MAX_ORDERS_PER_PAIR: Final[int] = 10
+
+#: Cap on ``POST /futures/{settle}/batch_orders`` (`http/futures.py`).
+FUTURES_BATCH_MAX_ORDERS: Final[int] = 10
+
+#: Products whose REST namespace has a batch-order endpoint at all.
+#:
+#: Delivery futures and options have none: ``GateioFuturesHttpAPI`` raises
+#: ``ValueError`` for delivery (`http/futures.py`, ``_require_perpetual``) and
+#: ``GateioOptionsHttpAPI`` has no such method. An order list on those products
+#: is submitted one order at a time, which loses nothing — an order list with no
+#: contingency is a set of independent orders (see :meth:`_submit_order_list`).
+BATCHABLE_PRODUCTS: Final[frozenset[GateioProductType]] = frozenset(
+    {GateioProductType.SPOT, GateioProductType.PERP, GateioProductType.INVERSE},
+)
 
 #: Page size used when listing orders and fills.
 REPORT_PAGE_LIMIT: Final[int] = 100
@@ -2447,19 +2480,136 @@ class GateioExecutionClient(LiveExecutionClient):
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         order: Order = command.order
+        prepared = await self._prepare_submission(order)
+        if prepared is None:
+            return
+        product, request = prepared
+        await self._announce_and_send(order, product, request)
+
+    async def _submit_order_list(self, command: SubmitOrderList) -> None:
+        """Submit an order list, batching the parts Gate.io can batch.
+
+        **A contingent list is refused, every leg of it.** Gate.io does carry
+        attached take-profit / stop-loss (spot ``stop_profit``/``stop_loss``,
+        futures ``tpsl_tp_trigger_price``/``tpsl_sl_trigger_price``), and it is
+        tempting to map a Nautilus bracket onto it. Neither shape carries a
+        client-supplied identifier for the attached leg — that is the whole field
+        list of both request models, not a gap in the reading — so the entry, the
+        stop-loss and the take-profit would reach the venue as **one** order with
+        one id. Nautilus needs three addressable orders: the acceptance spec's
+        own criterion for a bracket is "three orders created and accepted".
+        Announcing ``OrderSubmitted`` for two legs that can never acquire a venue
+        order id does not merely leave them untidy, it destroys them —
+        ``LiveExecutionEngine._resolve_inflight_order`` turns a ``SUBMITTED``
+        order that the venue cannot identify into an ``OrderRejected`` with
+        reason ``UNKNOWN`` once ``inflight_check_retries`` is spent, so within
+        seconds the strategy is told its stop-loss was rejected while Gate.io is
+        holding it live against the position. That is a silent, money-losing
+        divergence behind a request body that looks perfectly correct, which is
+        why the refusal is here and not a TODO. (OKX can do the mapping because
+        OKX accepts ``attach_algo_cl_ord_id``; that one field is the whole
+        difference.)
+
+        The refusal is deliberately gated on ``linked_order_ids`` and
+        ``contingency_type`` rather than on ``OrderList.is_bracket()``:
+        ``is_bracket()`` requires both children to be ``OUO``
+        (``model/orders/list.pyx``), so a list built with
+        ``OrderFactory.bracket(contingency_type=ContingencyType.OCO)`` is not a
+        bracket by that test and would slip through into the batch path, where
+        both exits go live and neither is ever cancelled.
+
+        Contingent orders remain available against this venue through the
+        platform's own emulator: give any leg an ``emulation_trigger`` and
+        ``Strategy.submit_order_list`` routes the whole list to ``OrderEmulator``
+        (``trading/strategy.pyx``; ``execution/messages.pyx`` computes
+        ``has_emulated_order`` at construction), which holds the contingent legs
+        locally and sends this client only the plain orders it releases. This
+        coroutine never sees such a list.
+
+        **A list with no contingency is a set of independent orders**, and every
+        one of them is submitted. The batch endpoints are used where the venue
+        has one and the group fits it; everything else goes out one order at a
+        time down the same path :meth:`_submit_order` uses. Falling back rather
+        than denying is deliberate: nothing about a group being too large, or
+        about delivery futures having no batch endpoint, makes an *order*
+        invalid, and denying an order this client can submit perfectly well would
+        be inventing a venue restriction. Chunking an oversized group across
+        several batch requests is the option not taken — a half-applied chunk is
+        a second ambiguity class this client would then have to model, while N
+        single submissions have exactly the ambiguity profile ``_submit_order``
+        already handles.
+
+        Doing nothing is not an option, which is what makes this method a
+        correctness fix rather than a feature. The inherited coroutine raises
+        ``NotImplementedError`` (``live/execution_client.py``), ``create_task``'s
+        done-callback logs the traceback and drops it, and the orders the
+        execution engine already cached stay at ``INITIALIZED`` forever:
+        ``INITIALIZED`` is neither in-flight nor open, so neither
+        ``_check_inflight_orders`` nor ``_handle_missing_orders_at_venue`` will
+        ever look at them. No event, no terminal state, no reconciliation.
+        """
+        orders: list[Order] = list(command.order_list.orders)
+        if not orders:
+            self._log.warning("Order list is empty, nothing to submit")
+            return
+
+        if any(
+            order.linked_order_ids or order.contingency_type != ContingencyType.NO_CONTINGENCY
+            for order in orders
+        ):
+            reason = (
+                "UNSUPPORTED_CONTINGENT_ORDER_LIST: Gate.io attaches take-profit and stop-loss "
+                "to the parent order and returns no order id for either leg, so the legs of a "
+                "contingent list cannot be addressed, amended or cancelled individually. "
+                "Resubmit with an `emulation_trigger` on the contingent legs and NautilusTrader "
+                "will hold them locally"
+            )
+            for order in orders:
+                if order.is_closed:
+                    continue
+                self._deny(order, reason)
+            return
+
+        prepared: list[tuple[Order, GateioProductType, GateioOrderRequest]] = []
+        for order in orders:
+            # Every order is validated and built before *any* of them is sent, so
+            # a refusal this client makes is still an `OrderDenied` decided
+            # before a submission is announced, exactly as on the single path.
+            submission = await self._prepare_submission(order)
+            if submission is not None:
+                prepared.append((order, submission[0], submission[1]))
+
+        for product, group, as_batch in self._plan_order_list(prepared):
+            if as_batch:
+                await self._send_batch(product, group)
+                continue
+            order, request = group[0]
+            await self._announce_and_send(order, product, request)
+
+    async def _prepare_submission(
+        self,
+        order: Order,
+    ) -> tuple[GateioProductType, GateioOrderRequest] | None:
+        """Validate one order and build its Gate.io request, or refuse it here.
+
+        Returns ``None`` when nothing will be sent for this order, in which case
+        the outcome has already been published: an ``OrderDenied`` for anything
+        this client refuses, or a warning for an order that is already closed and
+        therefore needs no event at all.
+        """
         if order.is_closed:
             self._log.warning(f"Order {order.client_order_id!r} is already closed, skipping")
-            return
+            return None
 
         instrument = self._instrument(order.instrument_id)
         if instrument is None:
             self._deny(order, f"instrument {order.instrument_id} not found")
-            return
+            return None
 
         resolved = self._resolve(order.instrument_id)
         if resolved is None:
             self._deny(order, f"{order.instrument_id} is not a configured Gate.io product")
-            return
+            return None
         product, raw_symbol = resolved
 
         if order.order_type not in SUPPORTED_ORDER_TYPES:
@@ -2467,7 +2617,7 @@ class GateioExecutionClient(LiveExecutionClient):
                 order,
                 f"{order_type_to_str(order.order_type)} orders are not supported by Gate.io",
             )
-            return
+            return None
 
         # Everything this client refuses on its own is decided here, before any
         # event claims a request reached Gate.io. `OrderDenied` is the event the
@@ -2485,7 +2635,7 @@ class GateioExecutionClient(LiveExecutionClient):
             request = await self._prepare_order(order, instrument, product, raw_symbol)
         except (UnsupportedOrderError, OrderValidationError, ValueError) as e:
             self._deny(order, str(e))
-            return
+            return None
         except Exception as e:  # noqa: BLE001 - a denial is the only honest outcome here
             # Nothing has been sent, so there is no in-flight order for the
             # engine to resolve and `_outcome_unresolved` would strand this one
@@ -2494,8 +2644,17 @@ class GateioExecutionClient(LiveExecutionClient):
             # (live/execution_engine.py `_check_inflight_orders`). Denying is
             # both terminal and true — the order never left this client.
             self._deny(order, f"the Gate.io request could not be built: {e}")
-            return
+            return None
 
+        return product, request
+
+    async def _announce_and_send(
+        self,
+        order: Order,
+        product: GateioProductType,
+        request: GateioOrderRequest,
+    ) -> None:
+        """Announce one submission and send it, resolving whatever comes back."""
         self.generate_order_submitted(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -2520,6 +2679,240 @@ class GateioExecutionClient(LiveExecutionClient):
             # while it is being parsed. Rejecting on that is unrecoverable, not
             # merely pessimistic; see `_outcome_unresolved`.
             self._outcome_unresolved("Submission", order.client_order_id, f"submit failed: {e}")
+
+    def _plan_order_list(
+        self,
+        prepared: list[tuple[Order, GateioProductType, GateioOrderRequest]],
+    ) -> list[tuple[GateioProductType, list[tuple[Order, GateioOrderRequest]], bool]]:
+        """Decide which requests Gate.io will actually receive for a prepared list.
+
+        Returns the sends in the caller's own order, each flagged as a batch or a
+        single. A group of one is always sent as a single: the single-order
+        endpoint answers with the order object itself, which is a stronger answer
+        than a one-element batch result, and it keeps the trivial case off the
+        batch parsing entirely.
+
+        Price-triggered orders never join a batch. They address a different
+        endpoint (``/*/price_orders``), and their reply is an armed-order id that
+        :meth:`_send_trigger_order` has to register in the trigger link table —
+        a batch result carries none of that.
+        """
+        groups: list[list[tuple[Order, GateioOrderRequest]]] = []
+        products: list[GateioProductType] = []
+        slot_by_product: dict[GateioProductType, int] = {}
+
+        for order, product, request in prepared:
+            if request.is_trigger or product not in BATCHABLE_PRODUCTS:
+                products.append(product)
+                groups.append([(order, request)])
+                continue
+            slot = slot_by_product.get(product)
+            if slot is None:
+                slot = len(groups)
+                slot_by_product[product] = slot
+                products.append(product)
+                groups.append([])
+            groups[slot].append((order, request))
+
+        plan: list[tuple[GateioProductType, list[tuple[Order, GateioOrderRequest]], bool]] = []
+        for product, group in zip(products, groups, strict=True):
+            if len(group) > 1 and self._batch_fits(product, group):
+                plan.append((product, group, True))
+                continue
+            plan.extend((product, [item], False) for item in group)
+        return plan
+
+    @staticmethod
+    def _batch_fits(
+        product: GateioProductType,
+        group: list[tuple[Order, GateioOrderRequest]],
+    ) -> bool:
+        """Return whether one batch request can carry the whole group."""
+        if not product.is_spot:
+            return len(group) <= FUTURES_BATCH_MAX_ORDERS
+
+        # Spot counts two limits, and the per-pair one is not the total: four
+        # pairs of ten orders is a legal request, eleven orders on one pair is
+        # not. The `account` limit ("all items must share one value") is met by
+        # construction — `_build_spot_order` writes `self.spot_account`, which is
+        # one configured value for the whole client.
+        per_pair: dict[str, int] = {}
+        for _, request in group:
+            pair = str(request.body.get("currency_pair"))
+            per_pair[pair] = per_pair.get(pair, 0) + 1
+        return (
+            len(per_pair) <= SPOT_BATCH_MAX_PAIRS
+            and max(per_pair.values()) <= SPOT_BATCH_MAX_ORDERS_PER_PAIR
+        )
+
+    async def _send_batch(
+        self,
+        product: GateioProductType,
+        group: list[tuple[Order, GateioOrderRequest]],
+    ) -> None:
+        """Send one batch-order request and resolve every order it carried."""
+        bodies = [request.body for _, request in group]
+        for order, _ in group:
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=self._clock.timestamp_ns(),
+            )
+
+        try:
+            if product.is_spot:
+                results = await self._spot_http.create_batch_orders(bodies)
+            else:
+                results = await self._futures_api(product).create_batch_orders(bodies)
+        except GateioError as e:
+            # A whole-request failure carries no per-order result, so it speaks
+            # for every order in the batch or for none of them. A refusal the
+            # venue answered with proves nothing was placed; anything else leaves
+            # the whole group in flight for the engine to resolve. Both batch
+            # endpoints are `expiring=True` and are never replayed by the
+            # transport, and that must stay true: a replay of a partially applied
+            # batch doubles the orders that did succeed.
+            reason = f"{e.label or 'ERROR'}: {e.message}"
+            ambiguous = is_ambiguous_outcome(e)
+            for order, _ in group:
+                if ambiguous:
+                    self._outcome_unresolved("Submission", order.client_order_id, reason)
+                else:
+                    self._reject(order, reason, due_post_only=e.label in POST_ONLY_LABELS)
+            return
+        except Exception as e:  # noqa: BLE001 - never leave an order in limbo
+            for order, _ in group:
+                self._outcome_unresolved(
+                    "Submission",
+                    order.client_order_id,
+                    f"batch submit failed: {e}",
+                )
+            return
+
+        self._apply_batch_results(product, group, results)
+
+    def _apply_batch_results(
+        self,
+        product: GateioProductType,
+        group: list[tuple[Order, GateioOrderRequest]],
+        results: Any,
+    ) -> None:
+        """Fan a batch response back out over the orders that were sent.
+
+        HTTP 200 does not mean the orders were accepted: both endpoints report
+        per-item success in the body (``succeeded`` with ``label``/``message`` on
+        spot, ``label``/``detail`` on futures), so a caller that reads only the
+        status code publishes acceptances Gate.io never gave.
+
+        Attribution goes by ``text`` first and by position second. Gate.io
+        documents the results as index-aligned with the request, but ``text`` is
+        the client order id *this client chose and sent*, so matching on it makes
+        a misalignment harmless instead of catastrophic — under index-only
+        matching one shifted row rejects an order the venue accepted and reports
+        an accepted order as live. A row naming an order outside this batch, and
+        any order the response never mentioned, are left in flight rather than
+        guessed at.
+        """
+        rows = list(results) if isinstance(results, list) else []
+        order_by_text: dict[str, Order] = {}
+        for order, request in group:
+            text = request.body.get("text")
+            if isinstance(text, str) and text:
+                order_by_text[text] = order
+
+        aligned = len(rows) == len(group)
+        if not aligned:
+            # Position is no longer evidence of anything; only `text` is.
+            self._log.error(
+                f"Gate.io answered a batch of {len(group)} {product.value} orders with "
+                f"{len(rows)} result(s); only results carrying a `text` can be attributed",
+            )
+
+        answered: set[ClientOrderId] = set()
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                self._log.error(f"Discarding an unreadable batch result at index {index}: {row!r}")
+                continue
+            order = self._batch_result_order(row, index, group, order_by_text, aligned)
+            if order is None:
+                continue
+            answered.add(order.client_order_id)
+            self._resolve_batch_result(product, order, row)
+
+        for order, _ in group:
+            if order.client_order_id not in answered:
+                self._outcome_unresolved(
+                    "Submission",
+                    order.client_order_id,
+                    "the batch response carried no result for it",
+                )
+
+    def _batch_result_order(
+        self,
+        row: dict[str, Any],
+        index: int,
+        group: list[tuple[Order, GateioOrderRequest]],
+        order_by_text: dict[str, Order],
+        aligned: bool,
+    ) -> Order | None:
+        """Return the order one batch result speaks for, or ``None`` if unknowable."""
+        text = row.get("text")
+        if isinstance(text, str) and text:
+            matched = order_by_text.get(text)
+            if matched is not None:
+                return matched
+            self._log.error(
+                f"A batch result names {text!r}, which was not sent in this batch; it cannot be "
+                f"attributed to any of these orders",
+            )
+            return None
+        if not aligned or index >= len(group):
+            self._log.error(
+                f"A batch result at index {index} carries no `text` and the response is not "
+                f"index-aligned, so it cannot be attributed to an order",
+            )
+            return None
+        return group[index][0]
+
+    def _resolve_batch_result(
+        self,
+        product: GateioProductType,
+        order: Order,
+        row: dict[str, Any],
+    ) -> None:
+        """Publish the outcome one batch result states for one order.
+
+        A successful row is the venue's order object and goes through
+        :meth:`_handle_order_payload`, the same handler the single-order ack and
+        the private order stream use, so the three cannot drift.
+
+        ``succeeded`` is read strictly. A missing field is *not* a failure: the
+        only rows that mean "refused" are those the venue marked ``false`` or
+        gave a failure ``label``. Reading an absent flag as a refusal would emit
+        ``OrderRejected`` — a terminal event — for an order Gate.io is holding
+        live, which no later event can undo.
+        """
+        succeeded = row.get("succeeded")
+        label = row.get("label")
+        if succeeded is False or (succeeded is not True and label):
+            detail = row.get("message") or row.get("detail") or ""
+            self._reject(
+                order,
+                f"{label or 'BATCH_ORDER_FAILED'}: {detail}",
+                due_post_only=label in POST_ONLY_LABELS,
+            )
+            return
+
+        if row.get("id_string") or row.get("id"):
+            self._handle_order_payload(product, row)
+            return
+
+        self._outcome_unresolved(
+            "Submission",
+            order.client_order_id,
+            "the batch result states neither an order id nor a failure",
+        )
 
     async def _prepare_order(
         self,
@@ -4791,8 +5184,57 @@ class GateioExecutionClient(LiveExecutionClient):
 
     # -- account state -----------------------------------------------------
 
-    async def _update_account_state(self) -> None:
+    async def _query_account(self, command: QueryAccount) -> None:
+        """Answer a ``QueryAccount`` command with a fresh reading of every wallet.
+
+        The platform leaves this coroutine to the adapter entirely.
+        ``LiveExecutionClient`` overrides the public ``query_account`` and calls
+        ``self._query_account(command)`` from it, but — unlike ``_query_order``,
+        which it implements generically on top of ``generate_order_status_report``
+        — it defines no ``_query_account`` and does not list one among the
+        coroutines to implement. Without this method the attribute lookup fails,
+        so a ``QueryAccount`` raises ``AttributeError`` *synchronously* inside
+        ``query_account``, before any task exists, and propagates out through
+        ``ExecutionEngine._handle_query_account``, which does not guard it. The
+        state this replaces is not "the command is ignored"; it is an exception
+        escaping the execution engine's command path.
+
+        ``command.account_id`` is not used to route. This client owns exactly one
+        Gate.io account, and the engine has already resolved the client by the
+        account's issuer (``ExecutionEngine._find_client_for_command``), so there
+        is nothing left to select. ``command.params`` is not read either: Bybit
+        overloads it with venue margin actions, and this venue has no equivalent
+        to hang off it.
+
+        The error line is the whole difference between this and a bare
+        ``await self._update_account_state()``. A wallet the sweep could not read
+        keeps its previous figures, and the state is then published with
+        ``reported=True`` — "the balances are reported directly from the
+        exchange". The background poll can live with that, and
+        :meth:`_update_account_state` explains at length why publishing the stale
+        figure beats dropping a product's margins. A user command cannot: the
+        caller asked *now* and will read the next ``AccountState`` as the answer,
+        and a restatement of last week's numbers is indistinguishable from
+        "nothing changed". So the publication is unchanged and the caller is told
+        what it is looking at.
+        """
+        unread = await self._update_account_state()
+        if unread:
+            self._log.error(
+                f"The account state just published for {command.account_id!r} is incomplete: the "
+                f"{', '.join(sorted(product.value for product in unread))} wallet(s) could not be "
+                f"read, so their balances and margins restate what those wallets last reported "
+                f"rather than a fresh reading",
+            )
+
+    async def _update_account_state(self) -> frozenset[GateioProductType]:
         """Refresh balances and margins from REST across every enabled product.
+
+        Returns the products whose wallet could **not** be read, which is empty
+        on a complete sweep. The figures of an unread product still stand in the
+        published state (see below), so a caller that has to distinguish "nothing
+        changed" from "nothing was read" — :meth:`_query_account` does — cannot
+        get that from the event and gets it from here.
 
         A poll that could not read every wallet is a *partial* answer, and the
         two things this method feeds treat a partial answer very differently.
@@ -4813,6 +5255,7 @@ class GateioExecutionClient(LiveExecutionClient):
         """
         margins: dict[GateioProductType, dict[InstrumentId | Currency, MarginBalance]] = {}
         unified: dict[str, tuple[Decimal, Decimal]] | None = None
+        unread: set[GateioProductType] = set()
 
         for product in self._products:
             wallet: dict[str, tuple[Decimal, Decimal]] = {}
@@ -4824,11 +5267,25 @@ class GateioExecutionClient(LiveExecutionClient):
                     await self._collect_options_balances(wallet, product_margins)
                 else:
                     await self._collect_futures_balances(product, wallet, product_margins)
+            except WalletQueryRefusedError as e:
+                # Caught before its base class on purpose. Gate.io rejected the
+                # *question* (a permission or account-mode label), so nothing at
+                # all is known about this ledger — it may hold any balance and
+                # any margin. That is an unread wallet, and the wallet that
+                # merely does not exist below is not.
+                self._log.warning(f"Skipping the {product.value} wallet: {e}")
+                unread.add(product)
+                continue
             except WalletNotProvisionedError as e:
+                # `USER_NOT_FOUND`: the venue created no such wallet yet, which
+                # is a complete answer of "it holds nothing". Counting it as
+                # unread would make every single-product account report an
+                # incomplete sweep on every query.
                 self._log.warning(f"Skipping the {product.value} wallet: {e}")
                 continue
             except GateioError as e:
                 self._log.error(f"Cannot read the {product.value} wallet: {e}")
+                unread.add(product)
                 continue
             self._wallet_balances[product] = wallet
             margins[product] = product_margins
@@ -4848,7 +5305,9 @@ class GateioExecutionClient(LiveExecutionClient):
                 "the per-product wallets echo the same funds, so their sum would overstate the "
                 "account by a factor of the number of enabled products",
             )
-            return
+            # Nothing at all was published, so nothing at all was read as far as
+            # any caller of this method is concerned.
+            return frozenset(self._products)
 
         self._margins_by_product.update(margins)
         balances = self._rebuild_aggregate_balances()
@@ -4866,6 +5325,7 @@ class GateioExecutionClient(LiveExecutionClient):
 
         self._balances = balances
         self._publish_account_state(reported=True)
+        return frozenset(unread)
 
     async def _collect_spot_balances(
         self,

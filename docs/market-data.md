@@ -54,8 +54,11 @@ to serve this path through the adapter.
 | Mark price, index price, funding rate | implemented and mock-tested | USDT perpetual |
 | Historical funding rates over REST | implemented; the offline suite covers the HTTP layer only | USDT perpetual |
 | Book resynchronisation after a reconnect | implemented, mainnet validation pending | — |
-| `OrderBookDepth10` subscriptions | unsupported | not applicable |
-| The periodic `*.order_book` snapshot channel | unsupported by the data client | not applicable |
+| `OrderBookDepth10` from the periodic `*.order_book` snapshot channel | implemented and mock-tested | — |
+| Instrument status, polled from the instrument listings | implemented and mock-tested | — |
+| Instrument close for delivery futures and options | implemented and mock-tested | — |
+| `GateioTicker` custom data (the venue's whole ticker row) | implemented and mock-tested | — |
+| Historical quotes | unsupported; Gate.io publishes no quote history on any product | not applicable |
 
 Nothing here is described as stable. A dash means no recorded run credits that
 path to the venue: the instrument reload timer and the post-reconnect book
@@ -121,24 +124,26 @@ Which instruments exist per product, and what a `Quantity` means on each, is in
 | `subscribe_trade_ticks` | `{spot,futures,options}.trades` | all |
 | `subscribe_quote_ticks` | `{spot,futures,options}.book_ticker` | all |
 | `subscribe_order_book_deltas` | REST snapshot plus `*.order_book_update`, sequence-validated | all |
+| `subscribe_order_book_depth` | `*.order_book`, the venue's periodic snapshot channel | all |
 | `subscribe_bars` | `*.candlesticks`, closed bars only | all |
 | `subscribe_mark_prices` | `futures.tickers` / `options.contract_tickers`, `mark_price` field | perpetual, inverse, delivery, options |
 | `subscribe_index_prices` | `futures.tickers` / `options.contract_tickers`, `index_price` field | perpetual, inverse, delivery, options |
 | `subscribe_funding_rates` | `futures.tickers`, `funding_rate` field | perpetual, inverse |
+| `subscribe_data` (`GateioTicker`) | `futures.tickers` / `options.contract_tickers` / `spot.tickers`, the whole row | all |
+| `subscribe_instrument_status` | REST instrument listings, polled on the reload cadence | all |
+| `subscribe_instrument_close` | REST settlement, polled after expiry | delivery, options |
 | `subscribe_instruments` / `subscribe_instrument` | REST, refreshed by the reload task | all |
 
-`subscribe_order_book_depth` (`OrderBookDepth10`) is not implemented, and the
-failure is **not** clean. `LiveMarketDataClient.subscribe_order_book_depth`
-records the subscription *before* it starts the task that raises
-`NotImplementedError`, so a caller gets both: one exception in the log, and a
-subscription the client then reports as held for the rest of its life.
-`subscribed_order_book_depth()` lists the instrument, and because
-`DataEngine._handle_subscribe_order_book` skips any instrument already in that
-list, the subscription is never retried and no second message is ever logged.
-Read the log line, not the subscription list. (Verified against the installed
-NautilusTrader 1.230.0; the same ordering applies to every unimplemented
-`subscribe_*` hook on that class, including `subscribe_option_greeks` and
-`subscribe_instrument_status`.)
+A hook this client does not implement fails in a way worth knowing about, and
+`subscribe_option_greeks` is now the one that demonstrates it.
+`LiveMarketDataClient` records the subscription *before* it starts the task that
+raises `NotImplementedError`, so a caller gets both: one exception in the log,
+and a subscription the client then reports as held for the rest of its life. The
+data engine skips anything already in that list, so the subscription is never
+retried and no second message is ever logged. Read the log line, not the
+subscription list. (Verified against the installed NautilusTrader 1.230.0.) It is
+also why every refusal in this client is a log line and a return rather than a
+raise.
 
 ## Requests
 
@@ -150,6 +155,14 @@ NautilusTrader 1.230.0; the same ordering applies to every unimplemented
 | `request_order_book_snapshot` | REST `*/order_book` | Depth clamped to a value the product accepts; published as one `F_SNAPSHOT` batch |
 | `request_instrument` | Instrument provider | Loads that one instrument from the venue if it is not already cached |
 | `request_instruments` | Instrument provider | Answers with the provider's current contents; loads nothing |
+| `request_quote_ticks` | none | Refused at error level, naming the venue and the alternatives. Gate.io publishes no quote history on any product: `GET /*/tickers` is one current row, not a series, and answering from it would invent history |
+
+**A refused request never completes.** The platform opens a request group for
+every historical request and only a response closes it, so a caller awaiting the
+callback for `request_quote_ticks` waits either way; what the refusal changes is
+that the log carries a sentence naming the venue fact rather than a traceback.
+This is the same shape Binance and Polymarket use for the histories their venues
+do not publish.
 
 **Caveat on venue-wide instrument requests.** The plural form is a read of the
 provider, not a fetch. A client configured with
@@ -385,12 +398,43 @@ Worked examples, all logged when they adjust anything:
 
 ### What the platform builds on top
 
-Deltas are the only book data this adapter publishes. Subscribing with
-`managed=True` lets NautilusTrader maintain the `OrderBook` from them, and a
-non-zero snapshot interval on the subscription makes the data engine publish
-periodic book snapshots from that managed book. Gate.io's own periodic
-`*.order_book` channel is therefore not wired into the data client; the typed
-helper for it exists on `GateioPublicWebSocket` for direct use.
+Subscribing with `managed=True` lets NautilusTrader maintain the `OrderBook`
+from the deltas, and a non-zero snapshot interval on the subscription makes the
+data engine publish periodic book snapshots from that managed book.
+
+### Depth (`OrderBookDepth10`)
+
+`subscribe_order_book_depth` reads Gate.io's *other* book channel: the periodic
+`*.order_book` snapshot, which carries a complete book of the subscribed depth in
+every message. It is a different venue channel from the incremental stream, so it
+needs no REST seed, no sequence algorithm and no rebuild after a reconnect, and
+holding both costs two venue subscriptions.
+
+* Ten levels per side, which is what `OrderBookDepth10` holds and what Gate.io
+  serves on all five products. Both sides are sorted by the adapter and padded to
+  ten with the platform's `NULL_ORDER`, because the type requires the two sides
+  to be the same length and Gate.io routinely sends asymmetric sides on thin
+  contracts.
+* `bid_counts` and `ask_counts` are zeros: Gate.io publishes aggregated price
+  levels with no per-level order count, and the type documents zero as "not
+  available".
+* `flags` is `F_LAST` — one message is one complete book event. `F_SNAPSHOT`
+  would be a misstatement; it means the message came from a replay or snapshot
+  server, and this is a live push.
+* `sequence` is the venue's own (`id` on the contract products, `lastUpdateId` on
+  spot). A push that is not newer than the last one is dropped and counted in
+  `order_book_depths_out_of_order`; the watermark is forgotten on a reconnect,
+  because the venue restarts the sequence on a new connection.
+* The push interval may be chosen per subscription through
+  `params={"interval": "100ms"}`; an interval the product does not serve is
+  adjusted to the nearest one it does, with a log line.
+* A level whose size truncates to zero at the instrument's `size_precision` is
+  skipped and its slot given to the next level that survives.
+
+Both book subscriptions on one instrument give NautilusTrader's single cached
+`OrderBook` two writers — `apply_depth` replaces the book, so a depth message
+discards every delta level below the tenth. The adapter cannot fix that (the
+engine owns the cached book), so it warns and leaves the choice to the caller.
 
 ## Bars
 
@@ -509,6 +553,94 @@ fields from `GET /options/tickers`. They are reachable through the transport and
 the REST namespaces but are not yet mapped onto the platform's `OptionGreeks`
 type, so `subscribe_option_greeks` is unimplemented — see the note under
 [Subscriptions](#subscriptions) for what an unimplemented subscribe hook does.
+
+## The venue ticker row (`GateioTicker`)
+
+The three types above are what NautilusTrader models. The rest of the ticker row —
+24-hour statistics, the delivery basis, the implied volatilities and greeks, the
+*indicative* next funding rate, the open interest — has no platform type, and
+this client publishes it as an adapter-specific data type, which is what the
+in-tree adapters do with the same problem (`BinanceTicker`, `BetfairTicker`).
+
+```python
+from nautilus_trader.model.data import DataType
+
+from nautilus_gateio import GATEIO_CLIENT_ID, GateioTicker
+
+self.subscribe_data(
+    DataType(GateioTicker, metadata={"instrument_id": instrument_id}),
+    client_id=GATEIO_CLIENT_ID,
+)
+```
+
+Use the metadata form shown above. The platform addresses a custom data type
+that carries metadata by that metadata, so a subscription taken out with a bare
+`DataType(GateioTicker)` and a separate `instrument_id` argument listens on a
+different topic from the one the rows are published on.
+
+* Every field is the venue's own string, kept under the venue's own name. One row
+  mixes an order-tick price, a contract count, a base-currency turnover and a
+  dimensionless implied volatility, and quantising them all onto one precision
+  would change values.
+* Mark price, index price and funding rate are deliberately **absent** from the
+  type: they are published from the same message as the platform's own types, and
+  carrying them twice would give a strategy two sources for one number.
+* A field the venue did not send for this product is the empty string. The
+  platform's Arrow schema builder for custom data accepts no optional field, so
+  "absent" has to be a value of the field's own type.
+* Ticker subscribers share the one venue channel with mark, index and funding
+  subscribers, and the reference count means cancelling one does not stop the
+  others.
+* The type registers itself with the platform's msgpack and Arrow serializers on
+  import, so it can be persisted to a catalog or sent over an external message
+  bus. If a node uses an external message bus and should not publish it, name it
+  in `MessageBusConfig.types_filter`.
+
+## Instrument status and instrument close
+
+Gate.io publishes no instrument-status channel on any product, so
+`subscribe_instrument_status` is served by polling the same instrument listings
+the reload task already reads (`update_instruments_interval_mins`, 60 minutes by
+default). The in-tree adapters for venues without such a channel (Bybit, Kraken,
+dYdX) do the same.
+
+* Subscribing reports the current status at once, then only on change. Without
+  the immediate reading a strategy subscribing to a healthy instrument would
+  learn nothing until it stopped being healthy.
+* `InstrumentStatus.reason` names the venue field that decided the action,
+  verbatim: `in_delisting=true`, `status=delisted`, `trade_status=untradable`,
+  `expire_time=... elapsed`, `is_active=false`.
+* Only three actions are ever emitted: `TRADING`, `PRE_OPEN` (a spot pair whose
+  payload states a `buy_start` or `sell_start` still ahead) and
+  `NOT_AVAILABLE_FOR_TRADING`. `HALT`, `PAUSE`, `CROSS`, `PRE_CLOSE` and the rest
+  would be inventions of venue intent, and Gate.io's listings do not distinguish
+  them.
+* `is_quoting` and `is_short_sell_restricted` stay `None`: the fields are
+  tri-state precisely so an adapter can decline to guess, and Gate.io publishes
+  neither.
+* An instrument that disappears from a listing that was *read* is reported
+  `NOT_AVAILABLE_FOR_TRADING`; one that disappears because the request failed is
+  not, since a single failed listing would otherwise look like a mass delisting.
+* **The honest limit:** a halt shorter than the poll interval is invisible. There
+  is no channel to see it on.
+
+`subscribe_instrument_close` watches for the settlement of a dated contract.
+`InstrumentClose.close_price` is not optional and has no null form, so it is
+served only where a real settlement price exists: delivery futures and options.
+On spot, perpetual and inverse perpetual markets the subscription is refused with
+that reason — they trade continuously and never settle.
+
+* `close_type` is always `CONTRACT_EXPIRED`. `END_OF_SESSION` is never emitted:
+  Gate.io has no sessions, so naming one would be a fabrication.
+* A delivery close is published only when the contract's `settle_price` and the
+  ticker's agree. Two sources that disagree publish nothing.
+* An option's close is its own value — the settlement row's `profit` divided by
+  the contract multiplier — cross-checked against the intrinsic value implied by
+  the row's settle price and strike. The row's `settle_price` is the *underlying's*
+  averaged price, and publishing that as the option's close would be wrong by
+  orders of magnitude.
+* The watcher polls for a bounded time after expiry and then gives up rather than
+  polling forever for a settlement the venue never publishes.
 
 ## Reconnection and resubscription
 

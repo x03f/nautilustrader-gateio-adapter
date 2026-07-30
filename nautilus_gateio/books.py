@@ -101,8 +101,20 @@ def _to_decimal(value: Any) -> Decimal | None:
         return None
 
 
-def _parse_levels(levels: Iterable[Any] | None) -> list[tuple[Decimal, Decimal]]:
-    """Normalise either supported level container form into ``(price, size)`` pairs."""
+def parse_levels(levels: Iterable[Any] | None) -> list[tuple[Decimal, Decimal]]:
+    """Normalise either supported level container form into ``(price, size)`` pairs.
+
+    Gate.io publishes book levels in two dialects — spot sends
+    ``[["price", "amount"], ...]`` while futures, delivery and options send
+    ``[{"p": price, "s": size}, ...]`` — on the incremental stream, the periodic
+    snapshot channel and the REST snapshot alike. Public because the data
+    client's ``OrderBookDepth10`` path needs the same normalisation without the
+    rest of this module: that channel is self-synchronising, so routing it
+    through :meth:`GateioOrderBook.apply_snapshot` would drag in sequence,
+    buffering and staleness machinery it has no use for, and would raise on spot
+    besides, since the spot snapshot names its sequence ``lastUpdateId`` rather
+    than ``id`` or ``u``.
+    """
     parsed: list[tuple[Decimal, Decimal]] = []
     if not levels:
         return parsed
@@ -347,10 +359,10 @@ class GateioOrderBook:
             )
 
         self._bids = {
-            price: size for price, size in _parse_levels(payload.get("bids")) if size > _ZERO
+            price: size for price, size in parse_levels(payload.get("bids")) if size > _ZERO
         }
         self._asks = {
-            price: size for price, size in _parse_levels(payload.get("asks")) if size > _ZERO
+            price: size for price, size in parse_levels(payload.get("asks")) if size > _ZERO
         }
         self._last_update_id = snapshot_id
         self._last_update_ms = _normalise_ms(payload.get("update") or payload.get("current"))
@@ -465,8 +477,8 @@ class GateioOrderBook:
             self._snapshots_stale += 1
             return []
 
-        bids = {price: size for price, size in _parse_levels(result.get("b")) if size > _ZERO}
-        asks = {price: size for price, size in _parse_levels(result.get("a")) if size > _ZERO}
+        bids = {price: size for price, size in parse_levels(result.get("b")) if size > _ZERO}
+        asks = {price: size for price, size in parse_levels(result.get("a")) if size > _ZERO}
 
         changes: list[BookChange] = []
         for side, new, old in ((BID, bids, self._bids), (ASK, asks, self._asks)):
@@ -528,7 +540,7 @@ class GateioOrderBook:
     def _apply_levels(self, side: str, levels: Iterable[Any] | None) -> list[BookChange]:
         book = self._bids if side == BID else self._asks
         changes: list[BookChange] = []
-        for price, size in _parse_levels(levels):
+        for price, size in parse_levels(levels):
             if size <= _ZERO:
                 if book.pop(price, None) is not None:
                     changes.append((side, price, _ZERO))

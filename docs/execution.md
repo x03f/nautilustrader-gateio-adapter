@@ -83,6 +83,13 @@ routed through it.
 | Hedge (dual) position mode | unsupported — detected at connect and refused with an explanatory error |
 | Balances | Aggregated per currency across the wallets of the enabled products |
 | Margins | Scoped the way the venue holds the collateral: a cross-margined position (Gate.io `leverage="0"`) is reported account-wide, keyed by its settlement currency; an isolated position is reported per instrument. The options wallet reports one account-wide figure. Published only for a `MARGIN` account |
+| `Strategy.query_account()` | Re-reads every enabled product's wallet over REST and publishes a fresh `AccountState`. Implemented and mock-tested |
+
+`query_account` never answers from the last state it published. When a wallet
+could not be read, the client logs an error naming the products whose figures in
+that state are a restatement rather than a fresh reading, and still publishes:
+`MarginAccount.apply` replaces rather than merges the margin stores, so dropping
+an unread product's figures would delete its margins.
 
 Routing an order is a two-step lookup. The instrument id determines the product
 (see [symbology.md](symbology.md)), and the product determines both the REST
@@ -228,6 +235,44 @@ One translation is worth singling out because it is not literal:
   The price is the only thing substituted. The order's own time in force rides
   along, so a `MARKET`/`FOK` buy goes out as a `fok` limit and stays
   all-or-nothing instead of being downgraded to immediate-or-cancel.
+
+### Order lists
+
+`submit_order_list` is implemented and mock-tested, and it does two different
+things depending on what the list carries.
+
+**A list with no contingency** is submitted in full. Orders are grouped by
+product, and a group goes out as one batch request where Gate.io has one and the
+group fits inside the venue's caps (`POST /spot/batch_orders`, at most 10 orders
+across at most 4 pairs; `POST /futures/{settle}/batch_orders`, at most 10). Every
+other group — delivery futures, options, an oversized group — is submitted one
+order at a time. Nothing about a transport shape makes an order invalid, so a
+group the batch endpoint cannot take is sent singly rather than denied; and an
+oversized batch is not split into chunks, because a half-applied chunk would be a
+second class of ambiguity to model when N single submissions have exactly the
+ambiguity profile a single submission already has.
+
+Every leg is announced (`OrderSubmitted`) before the request leaves, and each leg
+goes through the same validation and refusal boundary as a single submission — a
+leg this client refuses is denied on its own and the others still go.
+
+The batch response is read per item, and attribution follows the client order id
+in the row's `text` field rather than the row's position; the documented index
+alignment is the fallback for a row that carries no id. A row naming an order
+outside the batch is not applied to anything, and an order the response never
+mentioned is left in flight for the platform's in-flight check rather than
+guessed at. A whole-request failure rejects every order in the group only when
+the venue's answer is a proven refusal; anything ambiguous (including a 5xx)
+leaves every leg `SUBMITTED`, and neither endpoint is ever replayed.
+
+**A list with a contingency** — any leg carrying `linked_order_ids` or a
+contingency type — is denied in full, every leg, with the reason on each. The
+gate is the linkage on the legs rather than `OrderList.is_bracket()`, which
+requires both children to be OUO and would let an OCO bracket through. The reason
+is stated in [products.md](products.md#order-types-by-product): Gate.io's
+attached take-profit / stop-loss carries no client-supplied id for the attached
+leg, so the legs could never be identified afterwards. Strategies that want
+brackets against this venue use order emulation, which the same page describes.
 
 ### Nothing is silently altered
 

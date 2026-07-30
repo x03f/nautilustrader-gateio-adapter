@@ -71,3 +71,79 @@ def block_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket.socket, "connect_ex", _blocked)
     monkeypatch.setattr(socket, "create_connection", _blocked)
     monkeypatch.setattr(socket, "getaddrinfo", _blocked)
+
+
+class _LogCapture:
+    """Reads back what a client logged, through the platform's own subsystem.
+
+    Some behaviour the platform prescribes *is* a log line and nothing else:
+    "cancel, modify, cancel-all, and batch-cancel commands that fail local
+    checks log warnings and do not produce rejection events" (concepts/live.md),
+    and an ambiguous venue outcome is "logged" while the order is left in flight.
+    A test that cannot read the line cannot tell the fixed behaviour from the
+    bug, so the line is read where the platform writes it. ``Component._log`` is
+    a Cython attribute and not writable, and ``init_logging`` is the documented
+    way in — file output is its only machine-readable sink.
+    """
+
+    def __init__(self, path: Any) -> None:
+        self._path = path
+        self._mark = 0
+
+    def _lines(self) -> list[str]:
+        from nautilus_trader.common.component import flush_logger
+
+        flush_logger()
+        if not self._path.exists():
+            return []
+        return self._path.read_text(encoding="utf-8").splitlines()
+
+    def mark(self) -> None:
+        self._mark = len(self._lines())
+
+    def since(self) -> list[str]:
+        return self._lines()[self._mark :]
+
+    def wait_for(self, fragment: str, timeout: float = 5.0) -> list[str]:
+        """Return the new lines once one of them carries ``fragment``.
+
+        The logging subsystem writes from its own thread, so a flush asks for the
+        write rather than completing it; under a full suite the line lands a
+        moment after the call returns.
+        """
+        import time
+
+        deadline = time.monotonic() + timeout
+        while True:
+            lines = self.since()
+            if any(fragment in line for line in lines) or time.monotonic() >= deadline:
+                return lines
+            time.sleep(0.02)
+
+
+@pytest.fixture(scope="session")
+def log_capture(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_LogCapture]:
+    """Initialize the platform logger once per session and read its file sink.
+
+    This lives in ``conftest`` rather than beside the tests that use it because
+    ``init_logging`` can only be called once per process. A fixture defined in a
+    test module is a separate fixture definition per module even when the same
+    function object is imported, so a second module asking for it would find the
+    subsystem already initialized and skip — silently disabling exactly the
+    assertions that read a log line.
+    """
+    from nautilus_trader.common.component import init_logging, is_logging_initialized
+    from nautilus_trader.common.enums import LogLevel
+
+    if is_logging_initialized():
+        pytest.skip("the logging subsystem was initialized elsewhere; its sink is unknown")
+
+    directory = tmp_path_factory.mktemp("logs")
+    guard = init_logging(
+        level_stdout=LogLevel.OFF,
+        level_file=LogLevel.DEBUG,
+        directory=str(directory),
+        file_name="capture",
+    )
+    yield _LogCapture(directory / "capture.log")
+    del guard
