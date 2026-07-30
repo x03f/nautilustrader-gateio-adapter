@@ -41,28 +41,28 @@ recorded live run exists, with the run itself written down in
 [validation.md](validation.md). A dash means the venue has never been observed
 to serve this path through the adapter.
 
-| Capability | Status | Mainnet |
-|---|---|---|
-| Instrument loading through the provider | implemented and mock-tested | spot, perpetual, delivery, options |
-| Instrument reload task inside the data client | implemented, mainnet validation pending | — |
-| Trade ticks | implemented and mock-tested | spot |
-| Quote ticks from `book_ticker` | implemented and mock-tested | spot |
-| Order book deltas, sequence validation and gap resync | implemented and mock-tested | spot (deltas, interval snapshots and the managed book) |
-| Order book snapshot on request | implemented and mock-tested | spot |
-| Bars from the candlestick streams | implemented and mock-tested | spot |
-| Historical bars and trades over REST | implemented; the offline suite covers the HTTP layer only | spot |
-| Mark price, index price, funding rate | implemented and mock-tested | USDT perpetual |
-| Historical funding rates over REST | implemented; the offline suite covers the HTTP layer only | USDT perpetual |
-| Book resynchronisation after a reconnect | implemented, mainnet validation pending | — |
-| `OrderBookDepth10` from the periodic `*.order_book` snapshot channel | implemented and mock-tested | — |
-| Instrument status, polled from the instrument listings | implemented and mock-tested | — |
-| Instrument close for delivery futures and options | implemented and mock-tested | — |
-| `GateioTicker` custom data (the venue's whole ticker row) | implemented and mock-tested | — |
-| Historical quotes | unsupported; Gate.io publishes no quote history on any product | not applicable |
+| Capability                                                           | Status                                                         | Mainnet                                                |
+|----------------------------------------------------------------------|----------------------------------------------------------------|--------------------------------------------------------|
+| Instrument loading through the provider                              | implemented and mock-tested                                    | spot, perpetual, delivery, options                     |
+| Instrument reload task inside the data client                        | implemented, mainnet validation pending                        | —                                                      |
+| Trade ticks                                                          | implemented and mock-tested                                    | spot                                                   |
+| Quote ticks from `book_ticker`                                       | implemented and mock-tested                                    | spot                                                   |
+| Order book deltas, sequence validation and gap resync                | implemented and mock-tested                                    | spot (deltas, interval snapshots and the managed book) |
+| Order book snapshot on request                                       | implemented and mock-tested                                    | spot                                                   |
+| Bars from the candlestick streams                                    | implemented and mock-tested                                    | spot                                                   |
+| Historical bars and trades over REST                                 | implemented; the offline suite covers the HTTP layer only      | spot                                                   |
+| Mark price, index price, funding rate                                | implemented and mock-tested                                    | USDT perpetual                                         |
+| Historical funding rates over REST                                   | implemented; the offline suite covers the HTTP layer only      | USDT perpetual                                         |
+| Book resynchronization after a reconnect                             | implemented, mainnet validation pending                        | —                                                      |
+| `OrderBookDepth10` from the periodic `*.order_book` snapshot channel | implemented and mock-tested                                    | —                                                      |
+| Instrument status, polled from the instrument listings               | implemented and mock-tested                                    | —                                                      |
+| Instrument close for delivery futures and options                    | implemented and mock-tested                                    | —                                                      |
+| `GateioTicker` custom data (the venue's whole ticker row)            | implemented and mock-tested                                    | —                                                      |
+| Historical quotes                                                    | unsupported; Gate.io publishes no quote history on any product | not applicable                                         |
 
 Nothing here is described as stable. A dash means no recorded run credits that
 path to the venue: the instrument reload timer and the post-reconnect book
-resynchronisation were never observed live, and the delivery and options streams
+resynchronization were never observed live, and the delivery and options streams
 were subscribed in a run that counts arrivals per data type rather than per
 instrument, so nothing is attributed to them individually. The detail is in
 [validation.md](validation.md).
@@ -71,7 +71,7 @@ instrument, so nothing is attributed to them individually. The detail is in
 
 `_connect()` runs in a fixed order, and the order is the point:
 
-1. initialise the instrument provider over REST;
+1. initialize the instrument provider over REST;
 2. publish every loaded currency and instrument into the cache and the data
    engine;
 3. open one public WebSocket per configured product;
@@ -119,20 +119,20 @@ Which instruments exist per product, and what a `Quantity` means on each, is in
 
 ## Subscriptions
 
-| Nautilus subscription | Gate.io source | Products |
-|---|---|---|
-| `subscribe_trade_ticks` | `{spot,futures,options}.trades` | all |
-| `subscribe_quote_ticks` | `{spot,futures,options}.book_ticker` | all |
-| `subscribe_order_book_deltas` | REST snapshot plus `*.order_book_update`, sequence-validated | all |
-| `subscribe_order_book_depth` | `*.order_book`, the venue's periodic snapshot channel | all |
-| `subscribe_bars` | `*.candlesticks`, closed bars only | all |
-| `subscribe_mark_prices` | `futures.tickers` / `options.contract_tickers`, `mark_price` field | perpetual, inverse, delivery, options |
-| `subscribe_index_prices` | `futures.tickers` / `options.contract_tickers`, `index_price` field | perpetual, inverse, delivery, options |
-| `subscribe_funding_rates` | `futures.tickers`, `funding_rate` field | perpetual, inverse |
-| `subscribe_data` (`GateioTicker`) | `futures.tickers` / `options.contract_tickers` / `spot.tickers`, the whole row | all |
-| `subscribe_instrument_status` | REST instrument listings, polled on the reload cadence | all |
-| `subscribe_instrument_close` | REST settlement, polled after expiry | delivery, options |
-| `subscribe_instruments` / `subscribe_instrument` | REST, refreshed by the reload task | all |
+| Nautilus subscription                            | Gate.io source                                                                 | Products                              |
+|--------------------------------------------------|--------------------------------------------------------------------------------|---------------------------------------|
+| `subscribe_trade_ticks`                          | `{spot,futures,options}.trades`                                                | all                                   |
+| `subscribe_quote_ticks`                          | `{spot,futures,options}.book_ticker`                                           | all                                   |
+| `subscribe_order_book_deltas`                    | REST snapshot plus `*.order_book_update`, sequence-validated                   | all                                   |
+| `subscribe_order_book_depth`                     | `*.order_book`, the venue's periodic snapshot channel                          | all                                   |
+| `subscribe_bars`                                 | `*.candlesticks`, closed bars only                                             | all                                   |
+| `subscribe_mark_prices`                          | `futures.tickers` / `options.contract_tickers`, `mark_price` field             | perpetual, inverse, delivery, options |
+| `subscribe_index_prices`                         | `futures.tickers` / `options.contract_tickers`, `index_price` field            | perpetual, inverse, delivery, options |
+| `subscribe_funding_rates`                        | `futures.tickers`, `funding_rate` field                                        | perpetual, inverse                    |
+| `subscribe_data` (`GateioTicker`)                | `futures.tickers` / `options.contract_tickers` / `spot.tickers`, the whole row | all                                   |
+| `subscribe_instrument_status`                    | REST instrument listings, polled on the reload cadence                         | all                                   |
+| `subscribe_instrument_close`                     | REST settlement, polled after expiry                                           | delivery, options                     |
+| `subscribe_instruments` / `subscribe_instrument` | REST, refreshed by the reload task                                             | all                                   |
 
 A hook this client does not implement fails in a way worth knowing about, and
 `subscribe_option_greeks` is now the one that demonstrates it.
@@ -147,15 +147,15 @@ raise.
 
 ## Requests
 
-| Nautilus request | Gate.io source | Behaviour |
-|---|---|---|
-| `request_bars` | REST `*/candlesticks` | Paginated at 1000 rows per call; buckets that have not closed yet are dropped; rows are keyed by open time so overlapping pages collapse; a row the platform rejects is dropped and counted rather than failing the request; results sorted oldest-first and trimmed to `limit` |
-| `request_trade_ticks` | REST `*/trades` | At most 1000 rows, filtered client-side to the `start`/`end` window (see the caveat below) |
-| `request_funding_rates` | REST `/futures/{settle}/funding_rate` | Perpetual only; at most 1000 records, filtered client-side to the `start`/`end` window; sorted oldest-first |
-| `request_order_book_snapshot` | REST `*/order_book` | Depth clamped to a value the product accepts; published as one `F_SNAPSHOT` batch |
-| `request_instrument` | Instrument provider | Loads that one instrument from the venue if it is not already cached |
-| `request_instruments` | Instrument provider | Answers with the provider's current contents; loads nothing |
-| `request_quote_ticks` | none | Refused at error level, naming the venue and the alternatives. Gate.io publishes no quote history on any product: `GET /*/tickers` is one current row, not a series, and answering from it would invent history |
+| Nautilus request              | Gate.io source                        | Behavior                                                                                                                                                                                                                                                                        |
+|-------------------------------|---------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `request_bars`                | REST `*/candlesticks`                 | Paginated at 1000 rows per call; buckets that have not closed yet are dropped; rows are keyed by open time so overlapping pages collapse; a row the platform rejects is dropped and counted rather than failing the request; results sorted oldest-first and trimmed to `limit` |
+| `request_trade_ticks`         | REST `*/trades`                       | At most 1000 rows, filtered client-side to the `start`/`end` window (see the caveat below)                                                                                                                                                                                      |
+| `request_funding_rates`       | REST `/futures/{settle}/funding_rate` | Perpetual only; at most 1000 records, filtered client-side to the `start`/`end` window; sorted oldest-first                                                                                                                                                                     |
+| `request_order_book_snapshot` | REST `*/order_book`                   | Depth clamped to a value the product accepts; published as one `F_SNAPSHOT` batch                                                                                                                                                                                               |
+| `request_instrument`          | Instrument provider                   | Loads that one instrument from the venue if it is not already cached                                                                                                                                                                                                            |
+| `request_instruments`         | Instrument provider                   | Answers with the provider's current contents; loads nothing                                                                                                                                                                                                                     |
+| `request_quote_ticks`         | none                                  | Refused at error level, naming the venue and the alternatives. Gate.io publishes no quote history on any product: `GET /*/tickers` is one current row, not a series, and answering from it would invent history                                                                 |
 
 **A refused request never completes.** The platform opens a request group for
 every historical request and only a response closes it, so a caller awaiting the
@@ -235,7 +235,7 @@ Gate.io publishes depth as a REST snapshot plus an incremental WebSocket stream.
 The snapshot carries an `id`; every incremental notification carries the range of
 update ids it covers, `U` (first) to `u` (last).
 `nautilus_gateio.books.GateioOrderBook` implements the venue's documented
-synchronisation algorithm and is deliberately free of framework dependencies — it
+synchronization algorithm and is deliberately free of framework dependencies — it
 deals in `Decimal` prices and sizes, so it can be tested without a trading
 environment:
 
@@ -247,17 +247,17 @@ environment:
 5. if the snapshot predates the whole buffer, fetch a newer one — the unconsumed
    notifications are kept for that retry;
 6. if a later notification has `U > previous u + 1`, updates were lost:
-   `OrderBookSequenceError` is raised, the book is marked unsynchronised and must
+   `OrderBookSequenceError` is raised, the book is marked unsynchronized and must
    be rebuilt from a new snapshot;
 7. a snapshot that is not newer than the state the book already holds raises
    `SnapshotStaleError` and is discarded, so a slow REST response cannot roll a
-   book backwards that has meanwhile resynchronised itself.
+   book backwards that has meanwhile resynchronized itself.
 
 Level amounts are absolute, not deltas: a size of `0` deletes the level. A
 notification with empty `a`/`b` arrays still advances the update id and is not
 skipped — treating it as nothing to do would manufacture a gap on the next
 message. Gate.io may also push a `full: true` message on the incremental channel;
-that is itself a complete snapshot of the subscribed depth and resynchronises the
+that is itself a complete snapshot of the subscribed depth and resynchronizes the
 book without a REST call.
 
 A `full` push is placed in the stream on the same terms as a REST snapshot,
@@ -292,7 +292,7 @@ instrument against the configured level after a few minutes. Until that
 observation exists, treat depth far from the touch as indicative on a long-lived
 subscription.
 
-### Gap detection and resynchronisation
+### Gap detection and resynchronization
 
 When the live stream breaks sequence, the client:
 
@@ -305,15 +305,15 @@ When the live stream breaks sequence, the client:
 * republishes the rebuilt book as a snapshot batch once the snapshot and the
   buffered notifications have been merged.
 
-Seeding a book is retried, because an unsynchronised book buffers every further
+Seeding a book is retried, because an unsynchronized book buffers every further
 notification and would otherwise stay silent for the life of the process:
 
-| Condition | Handling |
-|---|---|
-| Snapshot older than the buffered notifications | Up to four attempts, 0.5 s apart, then a retry scheduled 5 s later; counted in `snapshot_retries`. Routine at subscription time — the venue's REST snapshot lags its own stream by roughly a second |
-| REST failure (network, 5xx, exhausted rate-limit retries) | Same retry path; counted in `snapshot_errors`. Never fatal to the subscription |
-| Snapshot missing its `id` (for example stripped by a proxy) | Same retry path |
-| Snapshot older than the live book | Discarded, counted in `snapshots_stale`; the book is already correct |
+| Condition                                                   | Handling                                                                                                                                                                                            |
+|-------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Snapshot older than the buffered notifications              | Up to four attempts, 0.5 s apart, then a retry scheduled 5 s later; counted in `snapshot_retries`. Routine at subscription time — the venue's REST snapshot lags its own stream by roughly a second |
+| REST failure (network, 5xx, exhausted rate-limit retries)   | Same retry path; counted in `snapshot_errors`. Never fatal to the subscription                                                                                                                      |
+| Snapshot missing its `id` (for example stripped by a proxy) | Same retry path                                                                                                                                                                                     |
+| Snapshot older than the live book                           | Discarded, counted in `snapshots_stale`; the book is already correct                                                                                                                                |
 
 A book is never abandoned. If a subscription produces nothing at all, the counters
 in `metrics()` distinguish "still trying to seed" from "seeded and quiet".
@@ -325,10 +325,10 @@ NautilusTrader groups a stream of `OrderBookDelta` records into batches using
 `F_LAST` the platform never releases the batch, and subscribers simply receive
 nothing. The client sets both flags explicitly.
 
-| Batch | Flags |
-|---|---|
+| Batch                                                                           | Flags                                                                      |
+|---------------------------------------------------------------------------------|----------------------------------------------------------------------------|
 | Snapshot (initial seed, resync, `full: true`, or `request_order_book_snapshot`) | `F_SNAPSHOT` on every delta; the final delta additionally carries `F_LAST` |
-| Incremental update | No flags on the deltas; the final delta carries `F_LAST` |
+| Incremental update                                                              | No flags on the deltas; the final delta carries `F_LAST`                   |
 
 A snapshot batch is a `CLEAR` followed by one `ADD` per level: bids first, best
 price first, then asks. Every delta in a batch carries the same `sequence` — the
@@ -352,12 +352,12 @@ Book limits differ per product. The table below is
 `nautilus_gateio/websocket/public.py`, which are the single source of truth: the
 data client imports them rather than restating the numbers.
 
-| Product | `order_book_update` intervals | Stream depth levels | Snapshot depths |
-|---|---|---|---|
-| Spot | 20 ms, 100 ms | 20 or 100, implied by the interval and not requestable | 5, 10, 20, 50, 100 |
-| Perpetual (linear and inverse) | 20 ms, 100 ms | 20, 50, 100 — but 20 ms serves 20 levels only | 1, 5, 10, 20, 50, 100 |
-| Delivery futures | 100 ms, 1000 ms | 5, 10, 20, 50, 100 | 1, 5, 10, 20, 50, 100 |
-| Options | 100 ms, 1000 ms | 5, 10, 20, 50 | 1, 5, 10, 20, 50 |
+| Product                        | `order_book_update` intervals | Stream depth levels                                    | Snapshot depths       |
+|--------------------------------|-------------------------------|--------------------------------------------------------|-----------------------|
+| Spot                           | 20 ms, 100 ms                 | 20 or 100, implied by the interval and not requestable | 5, 10, 20, 50, 100    |
+| Perpetual (linear and inverse) | 20 ms, 100 ms                 | 20, 50, 100 — but 20 ms serves 20 levels only          | 1, 5, 10, 20, 50, 100 |
+| Delivery futures               | 100 ms, 1000 ms               | 5, 10, 20, 50, 100                                     | 1, 5, 10, 20, 50, 100 |
+| Options                        | 100 ms, 1000 ms               | 5, 10, 20, 50                                          | 1, 5, 10, 20, 50      |
 
 Spot and the perpetuals do not accept a 1000 ms interval; it was withdrawn.
 Options top out at 50 levels everywhere, including on the REST snapshot endpoint.
@@ -388,13 +388,13 @@ effect: the interval decides.
 
 Worked examples, all logged when they adjust anything:
 
-| Configured interval / effective depth | Spot | Perpetual | Delivery | Options |
-|---|---|---|---|---|
-| 20 ms, 100 | 20 ms, 20 levels | 100 ms, 100 | 100 ms, 100 | 100 ms, 50 |
-| 100 ms, 100 | 100 ms, 100 | 100 ms, 100 | 100 ms, 100 | 100 ms, 50 |
-| 1000 ms, 100 | 100 ms, 100 | 100 ms, 100 | 1000 ms, 100 | 1000 ms, 50 |
-| 100 ms, 25 | 100 ms, 100 | 100 ms, 50 | 100 ms, 50 | 100 ms, 50 |
-| 100 ms, 10 | 100 ms, 100 | 100 ms, 20 | 100 ms, 10 | 100 ms, 10 |
+| Configured interval / effective depth | Spot             | Perpetual   | Delivery     | Options     |
+|---------------------------------------|------------------|-------------|--------------|-------------|
+| 20 ms, 100                            | 20 ms, 20 levels | 100 ms, 100 | 100 ms, 100  | 100 ms, 50  |
+| 100 ms, 100                           | 100 ms, 100      | 100 ms, 100 | 100 ms, 100  | 100 ms, 50  |
+| 1000 ms, 100                          | 100 ms, 100      | 100 ms, 100 | 1000 ms, 100 | 1000 ms, 50 |
+| 100 ms, 25                            | 100 ms, 100      | 100 ms, 50  | 100 ms, 50   | 100 ms, 50  |
+| 100 ms, 10                            | 100 ms, 100      | 100 ms, 20  | 100 ms, 10   | 100 ms, 10  |
 
 ### What the platform builds on top
 
@@ -426,8 +426,10 @@ holding both costs two venue subscriptions.
   `order_book_depths_out_of_order`; the watermark is forgotten on a reconnect,
   because the venue restarts the sequence on a new connection.
 * The push interval may be chosen per subscription through
-  `params={"interval": "100ms"}`; an interval the product does not serve is
-  adjusted to the nearest one it does, with a log line.
+  `params={"interval": ...}`. Only spot offers a choice — `"100ms"` or
+  `"1000ms"` — and every contract product accepts `"0"` alone, which is push on
+  change. An interval the product does not serve falls back to the product's
+  first accepted value, with a log line naming what it accepts.
 * A level whose size truncates to zero at the instrument's `size_precision` is
   skipped and its slot given to the next level that survives.
 
@@ -445,19 +447,19 @@ candlesticks, and `bar_type_to_interval` raises `ValueError` naming the supporte
 set for a specification with no Gate.io equivalent. On a subscription the client
 catches that and logs it as an error; it never substitutes a different interval.
 
-| Bar specification | Gate.io interval | Subscription | Request |
-|---|---|---|---|
-| `1-SECOND` | `1s` | not available | yes |
-| `10-SECOND` | `10s` | yes | yes |
-| `1-MINUTE` | `1m` | yes | yes |
-| `5-MINUTE` | `5m` | yes | yes |
-| `15-MINUTE` | `15m` | yes | yes |
-| `30-MINUTE` | `30m` | yes | yes |
-| `1-HOUR` | `1h` | yes | yes |
-| `4-HOUR` | `4h` | yes | yes |
-| `8-HOUR` | `8h` | yes | yes |
-| `1-DAY` | `1d` | yes | yes |
-| `7-DAY` | `7d` | yes | yes |
+| Bar specification | Gate.io interval | Subscription  | Request |
+|-------------------|------------------|---------------|---------|
+| `1-SECOND`        | `1s`             | not available | yes     |
+| `10-SECOND`       | `10s`            | yes           | yes     |
+| `1-MINUTE`        | `1m`             | yes           | yes     |
+| `5-MINUTE`        | `5m`             | yes           | yes     |
+| `15-MINUTE`       | `15m`            | yes           | yes     |
+| `30-MINUTE`       | `30m`            | yes           | yes     |
+| `1-HOUR`          | `1h`             | yes           | yes     |
+| `4-HOUR`          | `4h`             | yes           | yes     |
+| `8-HOUR`          | `8h`             | yes           | yes     |
+| `1-DAY`           | `1d`             | yes           | yes     |
+| `7-DAY`           | `7d`             | yes           | yes     |
 
 The candlestick WebSocket channels do not carry the one-second interval, so
 `1-SECOND` is available through `request_bars` only; a subscription for it is
@@ -510,7 +512,7 @@ Gate.io has no dedicated channel for any of them: they are fields of the ticker
 stream — `futures.tickers` on the three futures products, `options.contract_tickers`
 on options — so one venue subscription serves any combination. The client
 reference-counts the subscribers and unsubscribes from the venue channel only when
-the last one goes away, so cancelling mark prices does not silently stop funding
+the last one goes away, so canceling mark prices does not silently stop funding
 rates.
 
 **Products.** Mark and index prices exist for every derivative: the three futures
@@ -524,7 +526,7 @@ accepted and left silent. On spot all three are refused: the spot ticker is
 with, not rounded onto the instrument's order tick. Gate.io states two independent
 minimum units, `order_price_round` and `mark_price_round`, and they differ on real
 contracts: the BTC_USDT perpetual quotes orders in 0.1 and marks in 0.01, and the
-BTC_USDT options quote orders in 1 and mark in 0.1, where quantising would publish
+BTC_USDT options quote orders in 1 and mark in 0.1, where quantizing would publish
 a mark of 5797.7 as 5798. `mark_price_round` acts as a floor on the precision so
 the scale does not wobble when a value happens to end in a zero. A field the venue
 sends empty or unparseable produces no update at all rather than a zero.
@@ -580,7 +582,7 @@ different topic from the one the rows are published on.
 
 * Every field is the venue's own string, kept under the venue's own name. One row
   mixes an order-tick price, a contract count, a base-currency turnover and a
-  dimensionless implied volatility, and quantising them all onto one precision
+  dimensionless implied volatility, and quantizing them all onto one precision
   would change values.
 * Mark price, index price and funding rate are deliberately **absent** from the
   type: they are published from the same message as the platform's own types, and
@@ -589,7 +591,7 @@ different topic from the one the rows are published on.
   platform's Arrow schema builder for custom data accepts no optional field, so
   "absent" has to be a value of the field's own type.
 * Ticker subscribers share the one venue channel with mark, index and funding
-  subscribers, and the reference count means cancelling one does not stop the
+  subscribers, and the reference count means canceling one does not stop the
   others.
 * The type registers itself with the platform's msgpack and Arrow serializers on
   import, so it can be persisted to a catalog or sent over an external message
@@ -685,7 +687,7 @@ What is deduplicated, and what is not, is worth stating precisely:
 `messages`. Alongside them: `published` counted per data type (including the
 skip counters named above), `candles_dropped` per bar type, `book_gaps` per
 instrument, how many local books exist and how many of them are currently
-synchronised, and the underlying connection statistics for each socket.
+synchronized, and the underlying connection statistics for each socket.
 
 The distinction that matters when reading them: `gaps` counts sequence breaks in a
 live stream, each of which forces a resync and means data was genuinely lost.

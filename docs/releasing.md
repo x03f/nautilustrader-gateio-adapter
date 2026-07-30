@@ -33,7 +33,7 @@ python examples/03_instruments.py
 
 ## 3. Build from a clean tree
 
-**Always remove the previous build artefacts first.** `dist/` is not cleaned by
+**Always remove the previous build artifacts first.** `dist/` is not cleaned by
 the build backend, so stale wheels from an earlier version survive there — and a
 bare `dist/` upload glob would happily republish them.
 
@@ -87,7 +87,7 @@ git push origin v<version>
 ## 6. After the release
 
 * [ ] The GitHub release notes match the changelog section.
-* [ ] Install the published artefact in a fresh environment and run the
+* [ ] Install the published artifact in a fresh environment and run the
       credential-free examples once more.
 * [ ] Open a follow-up issue for anything the release notes had to describe as
       not yet validated.

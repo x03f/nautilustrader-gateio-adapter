@@ -6,10 +6,9 @@ string, the instrument ids, the package layout, the REST and WebSocket clients,
 the configuration fields and the execution model all changed. Upgrading is a
 port, not a version bump.
 
-`0.2.0a1` is an **alpha**. Every capability referred to below is implemented and
-covered by the offline test suite, and none of it has been validated against the
-live venue — the per-capability position is in [validation.md](validation.md).
-Re-testing your own strategy after the port is not optional.
+`0.2.0a1` is an **alpha**. What the venue has confirmed, and what it has never
+seen, is in [validation.md](validation.md) per capability. Re-test your own
+strategy after the port.
 
 Read this page in full first. Most of these changes fail loudly: an
 `ImportError`, a `TypeError` from a constructor, a `ValueError` raised before
@@ -25,17 +24,17 @@ configuration dictionary key quietly.
 Worth stating plainly, because the 0.2.0a1 feature list is much longer and it is
 easy to assume the old release did more than it did.
 
-| Area | 0.1.0 | 0.2.0a1 |
-|---|---|---|
-| Products in the Nautilus path | spot only | spot, USDT perpetual, BTC-settled (inverse) perpetual, USDT delivery, USDT-settled options |
-| Futures | a separate, experimental REST client, not wired into the execution path | first-class, through the same data and execution clients |
-| Market data published | closed bars, plus a fabricated quote per bar | trades, real best bid/offer quotes, sequence-validated book deltas, bars, mark and index prices, funding rates |
-| Order types | MARKET (emulated) and LIMIT; everything else rejected | MARKET, LIMIT, STOP_MARKET, STOP_LIMIT, MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED |
-| Time in force | the venue was always sent `gtc` for a LIMIT order | GTC, IOC, FOK, post-only (`poc`), with anything unsupported rejected rather than coerced |
-| Fill detection | REST polling, every 5 s by default | the private WebSocket, with REST polling as a backstop |
-| Order modification | logged a warning and did nothing | amends spot and perpetuals; delivery and options reject explicitly |
-| Start-up reconciliation | the four report generators returned empty results | all four implemented against REST |
-| Transport | synchronous REST, one WebSocket endpoint | `async` REST with a typed namespace per product, one WebSocket connection per product endpoint |
+| Area                          | 0.1.0                                                                   | 0.2.0a1                                                                                                        |
+|-------------------------------|-------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| Products in the Nautilus path | spot only                                                               | spot, USDT perpetual, BTC-settled (inverse) perpetual, USDT delivery, USDT-settled options                     |
+| Futures                       | a separate, experimental REST client, not wired into the execution path | first-class, through the same data and execution clients                                                       |
+| Market data published         | closed bars, plus a fabricated quote per bar                            | trades, real best bid/offer quotes, sequence-validated book deltas, bars, mark and index prices, funding rates |
+| Order types                   | MARKET (emulated) and LIMIT; everything else rejected                   | MARKET, LIMIT, STOP_MARKET, STOP_LIMIT, MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED                                    |
+| Time in force                 | the venue was always sent `gtc` for a LIMIT order                       | GTC, IOC, FOK, post-only (`poc`), with anything unsupported rejected rather than coerced                       |
+| Fill detection                | REST polling, every 5 s by default                                      | the private WebSocket, with REST polling as a backstop                                                         |
+| Order modification            | logged a warning and did nothing                                        | amends spot and perpetuals; delivery and options reject explicitly                                             |
+| Start-up reconciliation       | the four report generators returned empty results                       | all four implemented against REST                                                                              |
+| Transport                     | synchronous REST, one WebSocket endpoint                                | `async` REST with a typed namespace per product, one WebSocket connection per product endpoint                 |
 
 ## Where 0.1.0 has gone
 
@@ -63,22 +62,22 @@ The numbers are the sections below. The second column is what you will see if
 you miss the row — the silent ones deserve the most attention, whatever else
 they cost you to fix.
 
-| § | Change | Fails how |
-|---|---|---|
-| 1 | **Execution defaults to mainnet** (was testnet) | silently — orders reach the real venue |
-| 2 | **`environment` is matched exactly**: anything that is not `"testnet"` is mainnet | silently — a value 0.1.0 read as testnet now selects mainnet |
-| 3 | Perpetual instrument ids gain a `-PERP` suffix | silently — an un-suffixed id resolves to the spot pair |
-| 4 | Venue string `GATEIO` -> `GATE_IO` | loudly for instrument ids, silently for a config dictionary key |
-| 5 | Synthetic quotes removed | quotes stop arriving unless you subscribe to them |
-| 6 | The paper-fill simulator removed | `ImportError` |
-| 7 | The standalone `reconcile()` helper removed, and real reconciliation now runs | `ImportError`, then a behavioural change at the next start-up |
-| 8 | The `live_orders` kill switch removed | silently — there is no in-process order block any more |
-| 9 | Flat modules replaced by sub-packages; several top-level names withdrawn | `ImportError` |
-| 10 | The REST client is `async`, namespaced, and returns venue payloads unchanged | loudly on the missing `await`, silently on the payload shape |
-| 11 | Bars are timestamped at the interval **close** by default (was the open) | silently — a stored series shifts by one interval |
-| 12 | The WebSocket client takes an endpoint and a product | `TypeError` |
-| 13 | Configuration fields renamed and re-scoped | a 0.1.0 config will not construct |
-| 14 | The instrument provider signature, the account id and the account type changed | `TypeError`; stale persisted account state |
+| §  | Change                                                                            | Fails how                                                       |
+|----|-----------------------------------------------------------------------------------|-----------------------------------------------------------------|
+| 1  | **Execution defaults to mainnet** (was testnet)                                   | silently — orders reach the real venue                          |
+| 2  | **`environment` is matched exactly**: anything that is not `"testnet"` is mainnet | silently — a value 0.1.0 read as testnet now selects mainnet    |
+| 3  | Perpetual instrument ids gain a `-PERP` suffix                                    | silently — an un-suffixed id resolves to the spot pair          |
+| 4  | Venue string `GATEIO` -> `GATE_IO`                                                | loudly for instrument ids, silently for a config dictionary key |
+| 5  | Synthetic quotes removed                                                          | quotes stop arriving unless you subscribe to them               |
+| 6  | The paper-fill simulator removed                                                  | `ImportError`                                                   |
+| 7  | The standalone `reconcile()` helper removed, and real reconciliation now runs     | `ImportError`, then a behavioral change at the next start-up    |
+| 8  | The `live_orders` kill switch removed                                             | silently — there is no in-process order block any more          |
+| 9  | Flat modules replaced by sub-packages; several top-level names withdrawn          | `ImportError`                                                   |
+| 10 | The REST client is `async`, namespaced, and returns venue payloads unchanged      | loudly on the missing `await`, silently on the payload shape    |
+| 11 | Bars are timestamped at the interval **close** by default (was the open)          | silently — a stored series shifts by one interval               |
+| 12 | The WebSocket client takes an endpoint and a product                              | `TypeError`                                                     |
+| 13 | Configuration fields renamed and re-scoped                                        | a 0.1.0 config will not construct                               |
+| 14 | The instrument provider signature, the account id and the account type changed    | `TypeError`; stale persisted account state                      |
 
 ---
 
@@ -118,7 +117,7 @@ Gate.io has no testnet endpoint for OPT; testnet supports SPOT, PERP
 ```
 
 The data client also gained an `environment` field defaulting to `"mainnet"`.
-That is not a behavioural change: 0.1.0's data client had no environment at all
+That is not a behavioral change: 0.1.0's data client had no environment at all
 and always used the mainnet REST and WebSocket hosts.
 
 ## 2. `environment` is now matched exactly
@@ -126,18 +125,18 @@ and always used the mainnet REST and WebSocket hosts.
 Related to §1 and easier to miss. The two releases decide what an environment
 string means in opposite ways:
 
-| `environment` | 0.1.0 resolves to | 0.2.0a1 resolves to |
-|---|---|---|
-| `"mainnet"` | mainnet | mainnet |
-| `"testnet"` | testnet | testnet |
-| `"test"`, `"sandbox"`, `""`, a typo | **testnet** | **mainnet** |
+| `environment`                       | 0.1.0 resolves to | 0.2.0a1 resolves to |
+|-------------------------------------|-------------------|---------------------|
+| `"mainnet"`                         | mainnet           | mainnet             |
+| `"testnet"`                         | testnet           | testnet             |
+| `"test"`, `"sandbox"`, `""`, a typo | **testnet**       | **mainnet**         |
 
 0.1.0 treated anything that was not `"mainnet"` as the testnet; 0.2.0a1 treats
 only `"testnet"` (case-insensitively, surrounding whitespace stripped) as the
 testnet and everything else as mainnet. The direction was reversed deliberately,
-for the same reason as §1: under the old rule a value nobody recognised quietly
-selected a venue, and the safe-looking half of that behaviour hid the unsafe
-half. Under the new rule an unrecognised value selects the environment you have
+for the same reason as §1: under the old rule a value nobody recognized quietly
+selected a venue, and the safe-looking half of that behavior hid the unsafe
+half. Under the new rule an unrecognized value selects the environment you have
 to opt out of, which is the one you will notice.
 
 Neither release validates the string. If you build the environment value at
@@ -245,14 +244,14 @@ venue has nothing", i.e. fresh-start semantics.
 
 0.2.0a1 implements the real interface:
 
-| Method | Source |
-|---|---|
-| `generate_order_status_reports` | open plus recently finished orders, for every enabled product |
-| `generate_order_status_report` | a single lookup by venue or client order id |
-| `generate_fill_reports` | `my_trades` per product over the lookback window |
-| `generate_position_status_reports` | futures, delivery and options positions |
+| Method                             | Source                                                        |
+|------------------------------------|---------------------------------------------------------------|
+| `generate_order_status_reports`    | open plus recently finished orders, for every enabled product |
+| `generate_order_status_report`     | a single lookup by venue or client order id                   |
+| `generate_fill_reports`            | `my_trades` per product over the lookback window              |
+| `generate_position_status_reports` | futures, delivery and options positions                       |
 
-This is a behavioural change even for code that never called `reconcile()`.
+This is a behavioral change even for code that never called `reconcile()`.
 NautilusTrader enables reconciliation by default
 (`LiveExecEngineConfig.reconciliation` is `True`), so on the next start-up your
 node will be handed the orders, fills and positions that already exist on the
@@ -278,7 +277,7 @@ Replace it with controls that actually bind:
 
 1. **API key permissions** on the Gate.io side. Grant only what the strategy
    uses; never grant withdrawal permission to a trading key.
-2. **IP allow-listing** on the key.
+2. **IP allowlisting** on the key.
 3. `environment="testnet"` for rehearsal (spot and USDT perpetuals only).
 4. NautilusTrader sandbox or backtest execution for simulation.
 
@@ -311,24 +310,24 @@ Deep imports of the old flat modules must be updated — including
 
 Renamed public symbols:
 
-| 0.1.0 | 0.2.0a1 |
-|---|---|
-| `instrument_id_to_gate_pair` | `instrument_id_to_gateio` (returns `(product, symbol)`) |
-| `gate_pair_to_instrument_id` | `gateio_to_instrument_id(product, symbol)` |
-| `build_currency_pair` | `parse_spot_instrument`, plus one parser per product |
+| 0.1.0                                                      | 0.2.0a1                                                  |
+|------------------------------------------------------------|----------------------------------------------------------|
+| `instrument_id_to_gate_pair`                               | `instrument_id_to_gateio` (returns `(product, symbol)`)  |
+| `gate_pair_to_instrument_id`                               | `gateio_to_instrument_id(product, symbol)`               |
+| `build_currency_pair`                                      | `parse_spot_instrument`, plus one parser per product     |
 | `GateioFuturesPublicClient` / `GateioFuturesPrivateClient` | `GateioFuturesHttpAPI(client, settle=..., delivery=...)` |
-| `GATEIO_WS_MAINNET` | `GATEIO_WS_SPOT`, plus one constant per product endpoint |
+| `GATEIO_WS_MAINNET`                                        | `GATEIO_WS_SPOT`, plus one constant per product endpoint |
 
 Withdrawn from the public API entirely:
 
-| 0.1.0 name | Position in 0.2.0a1 |
-|---|---|
-| `PaperExecution`, `PaperFill`, `GateioPaperConfig` | removed (see §6) |
-| `reconcile` | removed (see §7) |
-| `LiveOrdersDisabledError` | removed (see §8) |
-| `StaticInstrumentProvider` | removed — use NautilusTrader's own static provider |
-| `RateLimiter` | no longer exported; it is an internal detail of the HTTP transport |
-| `validate_order` (in `schemas.py`) | removed — order validation happens in the execution client, which rejects with a stated reason |
+| 0.1.0 name                                         | Position in 0.2.0a1                                                                            |
+|----------------------------------------------------|------------------------------------------------------------------------------------------------|
+| `PaperExecution`, `PaperFill`, `GateioPaperConfig` | removed (see §6)                                                                               |
+| `reconcile`                                        | removed (see §7)                                                                               |
+| `LiveOrdersDisabledError`                          | removed (see §8)                                                                               |
+| `StaticInstrumentProvider`                         | removed — use NautilusTrader's own static provider                                             |
+| `RateLimiter`                                      | no longer exported; it is an internal detail of the HTTP transport                             |
+| `validate_order` (in `schemas.py`)                 | removed — order validation happens in the execution client, which rejects with a stated reason |
 
 `RateLimiter` is the one that catches people out: `from nautilus_gateio import
 RateLimiter` used to work and now raises `ImportError`. The class still exists
@@ -404,7 +403,7 @@ series you stored under 0.1.0 is offset by one interval against a series
 recorded now, and any strategy that compares a bar timestamp against another
 clock will be off by the bar period.
 
-Set `bars_timestamp_on_close=False` to keep the old behaviour, at the cost of
+Set `bars_timestamp_on_close=False` to keep the old behavior, at the cost of
 disagreeing with the rest of the platform.
 
 ## 12. The WebSocket client takes an endpoint and a product
@@ -441,26 +440,26 @@ ws = GateioPublicWebSocket(product=GateioProductType.PERP, handler=print)
 
 ### `GateioDataClientConfig`
 
-| 0.1.0 field | Position in 0.2.0a1 |
-|---|---|
-| `venue` | removed — the venue is `GATE_IO` (see §4) |
-| `base_url_http` | kept; now `None` by default and an override of the URL derived from `environment` |
-| `base_url_ws` | kept; now `None` by default, and an override for **every** configured product's endpoint |
-| `use_websocket` | removed — the WebSocket is the transport; REST serves requests and snapshots |
-| `poll_interval_secs` | removed — there is no bar-polling fallback |
-| `emit_synthetic_quotes` | removed (see §5) |
-| — | new: `api_key`, `api_secret`, `environment`, `products`, `options_underlyings`, `update_instruments_interval_mins`, `http_timeout_secs`, `max_retries`, `order_book_snapshot_limit`, `order_book_update_interval_ms`, `bars_timestamp_on_close` |
+| 0.1.0 field             | Position in 0.2.0a1                                                                                                                                                                                                                             |
+|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `venue`                 | removed — the venue is `GATE_IO` (see §4)                                                                                                                                                                                                       |
+| `base_url_http`         | kept; now `None` by default and an override of the URL derived from `environment`                                                                                                                                                               |
+| `base_url_ws`           | kept; now `None` by default, and an override for **every** configured product's endpoint                                                                                                                                                        |
+| `use_websocket`         | removed — the WebSocket is the transport; REST serves requests and snapshots                                                                                                                                                                    |
+| `poll_interval_secs`    | removed — there is no bar-polling fallback                                                                                                                                                                                                      |
+| `emit_synthetic_quotes` | removed (see §5)                                                                                                                                                                                                                                |
+| —                       | new: `api_key`, `api_secret`, `environment`, `products`, `options_underlyings`, `update_instruments_interval_mins`, `http_timeout_secs`, `max_retries`, `order_book_snapshot_limit`, `order_book_update_interval_ms`, `bars_timestamp_on_close` |
 
 ### `GateioExecClientConfig`
 
-| 0.1.0 field | Position in 0.2.0a1 |
-|---|---|
-| `environment` | kept — **default changed to `"mainnet"`** (see §1) |
-| `venue` | removed |
+| 0.1.0 field                                | Position in 0.2.0a1                                                                                                                      |
+|--------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| `environment`                              | kept — **default changed to `"mainnet"`** (see §1)                                                                                       |
+| `venue`                                    | removed                                                                                                                                  |
 | `account_poll_interval_secs` (default 5.0) | renamed `account_polling_interval_secs` (default 30.0); it is now a safety net behind the private WebSocket, not the primary fill source |
-| `client_order_id_tag` | kept |
-| `base_url_http` | kept |
-| — | new: `products`, `options_underlyings`, `base_url_ws`, `spot_account_mode`, `max_retries`, `http_timeout_secs` |
+| `client_order_id_tag`                      | kept                                                                                                                                     |
+| `base_url_http`                            | kept                                                                                                                                     |
+| —                                          | new: `products`, `options_underlyings`, `base_url_ws`, `spot_account_mode`, `max_retries`, `http_timeout_secs`                           |
 
 Both classes are frozen `msgspec` structs, so cross-field validation runs in the
 client constructors rather than in `__post_init__`. `validate_products`,
@@ -491,9 +490,9 @@ provider = GateioInstrumentProvider(
 The account the execution client reports against also changed, which matters if
 anything of yours persisted or keyed on it:
 
-| | 0.1.0 | 0.2.0a1 |
-|---|---|---|
-| `AccountId` | `GATEIO-SPOT` | `GATE_IO-master` |
+|               | 0.1.0         | 0.2.0a1                                                                                             |
+|---------------|---------------|-----------------------------------------------------------------------------------------------------|
+| `AccountId`   | `GATEIO-SPOT` | `GATE_IO-master`                                                                                    |
 | `AccountType` | always `CASH` | `CASH` only when spot is the sole product *and* it trades the plain spot ledger; `MARGIN` otherwise |
 
 Gate.io keeps a separate wallet per product, and the client aggregates the
@@ -518,7 +517,7 @@ product.
   bounded by the pair's own published slippage cap rather than a hard-coded
   percentage. A pair that publishes no cap falls back to a documented default;
   see [execution.md](execution.md).
-* **Time in force is honoured.** 0.1.0 sent `gtc` for every LIMIT order
+* **Time in force is honored.** 0.1.0 sent `gtc` for every LIMIT order
   regardless of what the order asked for, so an IOC or FOK limit rested on the
   book. 0.2.0a1 maps GTC, IOC and FOK, expresses post-only as `poc`, and
   refuses anything Gate.io cannot express — a time in force such as GTD or DAY,
@@ -535,7 +534,7 @@ product.
   it does not (delivery and options).
 * **More order types.** STOP_MARKET, STOP_LIMIT, MARKET_IF_TOUCHED and
   LIMIT_IF_TOUCHED route to each product's price-trigger endpoint; `reduce_only`
-  and iceberg (`display_qty`) are honoured. Options have no price-trigger
+  and iceberg (`display_qty`) are honored. Options have no price-trigger
   endpoint, so conditional types are rejected there.
 * **Bar intervals widened** from eight (1m to 1d) to eleven (1s to 7d).
 

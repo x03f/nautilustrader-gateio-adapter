@@ -98,7 +98,10 @@ async def main() -> int:
         return 1
 
     base_url = resolve_http_url(ENVIRONMENT)
-    print(f"environment: {ENVIRONMENT}  ->  {base_url}")
+    # Which pair was actually used: with only the mainnet pair exported, a
+    # testnet run signs with it and fails at the testnet host.
+    source = "GATE_TESTNET_API_*" if os.environ.get("GATE_TESTNET_API_KEY") else "GATE_API_*"
+    print(f"environment: {ENVIRONMENT}  ->  {base_url}  (credentials from {source})")
 
     async with GateioHttpClient(api_key, api_secret, base_url=base_url) as client:
         # Align the signature timestamp with the venue clock before signing.

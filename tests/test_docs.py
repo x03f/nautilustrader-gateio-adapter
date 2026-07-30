@@ -14,8 +14,8 @@ Covered:
   synthetic quotes, the paper module, the standalone reconciliation helper, the
   ``GATEIO`` venue string) except where it explicitly documents the removal;
 * every import shown in the documentation and the examples resolves;
-* the feature matrix uses the agreed status vocabulary, and nothing claims
-  ``Stable`` while no mainnet validation is recorded;
+* the feature matrix uses the platform's two glyphs and nothing else, and claims
+  no mainnet run while none is recorded;
 * CI verifies the built wheel from outside the source tree, importing every
   sub-package, and cleans stale artefacts before building.
 """
@@ -51,24 +51,16 @@ WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 #: for being accurate.
 HISTORICAL_PAGES = {"migration-0.1-to-0.2.md", "review-matrix.md"}
 
-#: The status vocabulary the feature matrix is allowed to use.
-#: The only status words a feature matrix may use. The vocabulary is closed on
-#: purpose: "mostly works" and "should be fine" are how a reader ends up trusting
-#: an untested path with money. Two shades of "implemented" are kept apart
-#: because they answer different questions — whether the behaviour is covered by
-#: tests at all, and whether the venue has ever agreed with those tests.
-STATUS_VOCABULARY = frozenset(
-    {
-        "Stable",
-        "Experimental",
-        "Partial",
-        "Implemented — mock-tested",
-        "Implemented — mainnet validation pending",
-        "Implemented — not mainnet-validated",
-        "Unsupported",
-        "Not applicable",
-    },
-)
+#: The only two cell values a capability column may hold, which is
+#: NautilusTrader's own convention for an integration matrix: a check mark for
+#: supported, a hyphen for unsupported. The set is closed on purpose. "mostly
+#: works" and "should be fine" are how a reader ends up trusting an untested path
+#: with money, and a third glyph invites exactly that. What a check mark is
+#: evidence *of* is a separate question, which the Mainnet column answers.
+MATRIX_GLYPHS = frozenset({"✓", "-"})
+
+#: Headers of the columns whose cells are capability glyphs.
+PRODUCT_COLUMNS = ("Spot", "Perp", "Inverse", "Delivery", "Options")
 
 
 def _table_cells(line: str) -> list[str]:
@@ -391,55 +383,57 @@ class TestDocumentedImports:
 # --------------------------------------------------------------------------
 
 
-def _matrix_status_cells() -> list[str]:
-    """Every cell of a README table column headed ``Status``."""
+def _matrix_cells(headers: tuple[str, ...]) -> list[str]:
+    """Every README feature-matrix cell under one of ``headers``."""
     text = README.read_text(encoding="utf-8")
     section = text.split("## Feature support matrix", 1)[1].split("\n## ", 1)[0]
-    statuses: list[str] = []
-    header_index: int | None = None
+    found: list[str] = []
+    columns: list[int] = []
     for line in section.splitlines():
         if not line.startswith("|"):
-            header_index = None
+            columns = []
             continue
         cells = _table_cells(line)
-        if "Status" in cells:
-            header_index = cells.index("Status")
+        # Every matrix table opens with a Feature column, and a data row may
+        # legitimately hold a column name of its own ("Spot" in the Mainnet
+        # cell), so the header is recognized by that first cell rather than by
+        # the presence of a name anywhere in the row.
+        if cells and cells[0] == "Feature":
+            columns = [index for index, cell in enumerate(cells) if cell in headers]
             continue
-        if header_index is None or set("".join(cells)) <= {"-", ":"}:
+        if not columns or set("".join(cells)) <= {"-", ":"}:
             continue
-        if header_index < len(cells):
-            statuses.append(cells[header_index])
-    return statuses
+        found.extend(cells[index] for index in columns if index < len(cells))
+    return found
 
 
 class TestFeatureMatrix:
-    """The matrix must use the agreed vocabulary and not overclaim."""
+    """The matrix must use the two glyphs, and claim no run it does not have."""
 
     def test_matrix_rows_were_parsed(self) -> None:
-        assert len(_matrix_status_cells()) > 20
+        assert len(_matrix_cells(PRODUCT_COLUMNS)) > 20
 
-    def test_every_status_uses_the_vocabulary(self) -> None:
-        unknown = sorted(
-            {
-                status
-                for status in _matrix_status_cells()
-                # Rows may qualify a status in parentheses, e.g.
-                # "Partial (delivery and options reject explicitly)".
-                if status.split(" (")[0].strip().strip("*") not in STATUS_VOCABULARY
-            },
-        )
-        assert not unknown, f"feature matrix uses statuses outside the vocabulary: {unknown}"
+    def test_every_capability_cell_is_a_glyph(self) -> None:
+        unknown = sorted(set(_matrix_cells(PRODUCT_COLUMNS)) - MATRIX_GLYPHS)
+        assert not unknown, f"feature matrix uses cells outside the two glyphs: {unknown}"
 
-    def test_nothing_is_stable_without_a_recorded_mainnet_result(self) -> None:
+    def test_nothing_claims_a_run_that_is_not_recorded(self) -> None:
+        """A named product in the Mainnet column has to be backed by the record.
+
+        The column names the products a real run covered, so while the record is
+        empty every cell in it must be the hyphen. This is the successor to a
+        guard on the word ``Stable``, which the matrix no longer uses: the claim
+        a reader acts on now is the Mainnet cell.
+        """
         validation = (DOCS / "validation.md").read_text(encoding="utf-8")
         results = validation.split("### Mainnet validation results", 1)[1].split("\n###", 1)[0]
-        has_results = "nothing recorded yet" not in results
-        stable_rows = [s for s in _matrix_status_cells() if s.split(" (")[0].strip() == "Stable"]
-        if not has_results:
-            assert not stable_rows, (
-                "the feature matrix marks rows Stable while docs/validation.md records no "
-                f"mainnet result: {stable_rows}"
-            )
+        if "nothing recorded yet" not in results:
+            return
+        claimed = sorted({cell for cell in _matrix_cells(("Mainnet",)) if cell != "-"})
+        assert not claimed, (
+            "the feature matrix names mainnet runs while docs/validation.md records "
+            f"none: {claimed}"
+        )
 
     def test_the_validation_page_records_runs(self) -> None:
         """The results section must carry rows, and the README must point at it.
@@ -459,7 +453,9 @@ class TestFeatureMatrix:
         ]
         # A header row and a separator alone are not results.
         assert len(rows) > 1, "docs/validation.md records no mainnet run"
-        assert "Mainnet validation results" in README.read_text(encoding="utf-8")
+        assert "](docs/validation.md" in README.read_text(encoding="utf-8"), (
+            "the README does not link the page that carries the record"
+        )
 
     def test_the_validation_page_states_no_venue_identifier(self) -> None:
         """No account id, order id, trade id or balance, on the page that is most

@@ -40,13 +40,13 @@ asks for it in:
 
 ## Instrument id per product
 
-| Product | Instrument id | `raw_symbol` |
-|---|---|---|
-| Spot | `BTC_USDT.GATE_IO` | `BTC_USDT` |
-| Perpetual (linear, USDT-margined) | `BTC_USDT-PERP.GATE_IO` | `BTC_USDT` |
-| Perpetual (inverse, BTC-margined) | `BTC_USD-PERP.GATE_IO` | `BTC_USD` |
-| Delivery future | `BTC_USDT_20260807.GATE_IO` | `BTC_USDT_20260807` |
-| Option | `BTC_USDT-20260729-70000-C.GATE_IO` | `BTC_USDT-20260729-70000-C` |
+| Product                           | Instrument id                       | `raw_symbol`                |
+|-----------------------------------|-------------------------------------|-----------------------------|
+| Spot                              | `BTC_USDT.GATE_IO`                  | `BTC_USDT`                  |
+| Perpetual (linear, USDT-margined) | `BTC_USDT-PERP.GATE_IO`             | `BTC_USDT`                  |
+| Perpetual (inverse, BTC-margined) | `BTC_USD-PERP.GATE_IO`              | `BTC_USD`                   |
+| Delivery future                   | `BTC_USDT_20260807.GATE_IO`         | `BTC_USDT_20260807`         |
+| Option                            | `BTC_USDT-20260729-70000-C.GATE_IO` | `BTC_USDT-20260729-70000-C` |
 
 `raw_symbol` on every instrument is always the exact string Gate.io uses, so a
 round trip back to the API never has to reverse a transformation.
@@ -55,12 +55,12 @@ round trip back to the API never has to reverse a transformation.
 
 Measured against the live venue:
 
-| Comparison | Colliding symbols |
-|---|---|
-| Spot vs USDT perpetual | **527** |
-| Spot vs delivery future | 0 |
-| Spot vs BTC-settled perpetual | 0 |
-| USDT perpetual vs BTC-settled perpetual | 0 |
+| Comparison                              | Colliding symbols |
+|-----------------------------------------|-------------------|
+| Spot vs USDT perpetual                  | **527**           |
+| Spot vs delivery future                 | 0                 |
+| Spot vs BTC-settled perpetual           | 0                 |
+| USDT perpetual vs BTC-settled perpetual | 0                 |
 
 `BTC_USDT` is both a spot market and a perpetual contract, and 526 other
 contracts share that problem, so a perpetual instrument id must carry something

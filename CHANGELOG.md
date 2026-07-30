@@ -135,6 +135,56 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   the platform behaviour it described is still documented, pinned against
   `subscribe_option_greeks`, which is still not implemented.
 
+### Documentation
+
+- **The README is rewritten.** The capability matrices use the platform's own
+  convention — a check mark for supported, a hyphen for unsupported, nothing else
+  — and a Mainnet column that names the products a recorded run covered, so the
+  two questions a reader has stay separate. The Status section says which of the
+  two the matrices describe: they describe the branch, and the published
+  `0.2.0a1` predates the hooks this round added. New: a section on subscribing to
+  `GateioTicker`, whose metadata form is not guessable and fails silently when it
+  is wrong, and four more entries under "What will bite you" — a refused request
+  never completing, deltas and depth overwriting each other, a halt shorter than
+  the poll interval, and the contingent-order-list refusal.
+
+- **Four claims corrected against the code.** The class that reads `__name__` off
+  a factory is `TradingNodeBuilder`, not `LiveNodeBuilder`. A spot-only key does
+  not need account read access: both fee reads may fail and the client carries on,
+  and only a derivative product makes the account id mandatory (README,
+  `SECURITY.md`). The spot batch endpoint takes up to ten orders on each of up to
+  four pairs, checked independently, not ten in total (`docs/execution.md`). An
+  unserved depth push interval falls back to the product's first accepted value,
+  and only spot has more than one to choose from (`docs/market-data.md`).
+
+- **Four pages no longer say the venue has never been touched.** `SECURITY.md`,
+  `CONTRIBUTING.md`, `docs/configuration.md` and `docs/migration-0.1-to-0.2.md`
+  state the bounded record instead, which is what `docs/validation.md` has said
+  since the mainnet campaign.
+
+- **`examples/07_trading_node_orders.py`** places one spot testnet order through a
+  `TradingNode` rather than through the REST namespace, behind the same
+  `GATEIO_ALLOW_ORDERS=YES` gate example 06 uses, and takes no mainnet credential
+  fallback. It has never been run against Gate.io, which the file and the examples
+  page both say. Example 06 now reports a failed cancel instead of exiting with a
+  traceback and a live order; example 04 drops a `KeyboardInterrupt` branch the
+  platform's own signal handler makes unreachable; example 05 prints which
+  credential pair it signed with.
+
+- `docs/testing.md` said to run `pytest -m integration`, which collects nothing:
+  no test carries the marker yet. `docs/roadmap.md` states Stage 0's outcome and
+  its two residuals rather than narrating nine rounds of audit. `docs/errors.md`,
+  `docs/products.md` and `docs/execution.md` drop the qualifying preambles that
+  said less than the sentences after them. American spelling throughout, and the
+  argument for a pure-Python adapter is made once, in `docs/architecture.md`,
+  with links from the pages that used to repeat it.
+
+- The feature-matrix guard in `tests/test_docs.py` follows the matrix's new
+  shape: capability cells must be one of the two glyphs, and while
+  `docs/validation.md` records no run, no Mainnet cell may name a product. It
+  replaces the status-vocabulary guard, which parsed a column the matrix no
+  longer has.
+
 ## [0.2.0a1] - 2026-07-29
 
 The first release of this adapter that Gate.io itself has answered. Everything

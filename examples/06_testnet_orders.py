@@ -12,12 +12,12 @@ Safety gates in this script (they live here, not in the adapter):
    constant. No environment variable or flag redirects this script to mainnet.
 3. **Bounded notional.** The order value is capped at ``MAX_NOTIONAL_USDT`` and
    the limit price sits far below the market.
-4. **Cancel in ``finally``.** The order is cancelled even if an assertion or an
-   exception intervenes.
+4. **Cancel in ``finally``.** The order is canceled even if an assertion or an
+   exception intervenes, and a failed cancel is printed rather than swallowed.
 
 The adapter itself has no order kill switch: ``environment`` defaults to
 mainnet, and the controls that bind are the API key's permissions and IP
-allow-list. See docs/configuration.md.
+allowlist. See docs/configuration.md.
 
 Credentials: REQUIRED, testnet only.
 
@@ -139,9 +139,19 @@ async def main() -> int:
             ]
             print(f"resting: {'yes' if resting else 'no'}")
         finally:
-            # Gate 4: cancel no matter what happened above.
-            cancelled = await spot.cancel_order(order_id, PAIR)
-            print(f"cancelled: id={cancelled['id']} status={cancelled.get('status')}")
+            # Gate 4: cancel no matter what happened above, and say so loudly if
+            # the cancel itself fails. An order left resting is the one outcome
+            # this script must never hide.
+            try:
+                canceled = await spot.cancel_order(order_id, PAIR)
+                print(f"canceled: id={canceled['id']} status={canceled.get('status')}")
+            except Exception:
+                print(
+                    f"CANCEL FAILED - order {order_id} may still be resting on the "
+                    f"{PAIR} testnet book; cancel it by hand before rerunning.",
+                    file=sys.stderr,
+                )
+                raise
 
     return 0
 

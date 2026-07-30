@@ -57,10 +57,10 @@ jobs:
         with:
           python-version: "3.13"
 
-      # A previous build's artefacts must never survive into a release upload:
+      # A previous build's artifacts must never survive into a release upload:
       # `python -m build` does not clear `dist/`, so a stale wheel from an older
       # version would still be there for `twine upload` to pick up.
-      - name: Clean previous build artefacts
+      - name: Clean previous build artifacts
         run: rm -rf dist/ build/ *.egg-info
 
       - name: Build sdist and wheel

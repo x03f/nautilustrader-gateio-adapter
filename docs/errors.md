@@ -23,20 +23,20 @@ handles them for you.
 
 ## The taxonomy at a glance
 
-| Exception | Import from | Says | Your move |
-|---|---|---|---|
-| `GateioError` | `nautilus_gateio` | Base of every venue/transport failure; carries `status`, `label`, `message` | Branch on the subclass or the label |
-| `GateioClientError` | `nautilus_gateio` | 4xx — Gate.io refused this request (bad params, auth, limits) | Fix the request; retrying unchanged repeats the refusal |
-| `GateioServerError` | `nautilus_gateio` | 5xx — Gate.io reported an internal failure | Usually retryable; on a mutating call see the ambiguity section |
-| `GateioRequestAmbiguousError` | `nautilus_gateio.http.client` | The request may have reached the venue; the outcome is unknown | Reconcile (query the order, poll the transfer) before resubmitting |
-| `GateioAmbiguousServerError` | `nautilus_gateio.http.client` | 5xx on a mutating request — both of the above at once | Same as ambiguous; server-error handlers still catch it |
-| `OrderValidationError` | `nautilus_gateio` | The order violates an exchange constraint (tick grid, whole contracts, expiry in the past) | Correct the order; nothing was sent |
-| `UnsupportedOrderError` | `nautilus_gateio` | Gate.io cannot express this order without changing its meaning | Submit what the venue can express, or emulate locally |
-| `WalletNotProvisionedError` | `nautilus_gateio` | This wallet does not exist yet on the account — a definite absence | Ignorable until you fund/transfer into the wallet |
-| `WalletQueryRefusedError` | `nautilus_gateio` | Gate.io refused to answer the query — nothing is known about the ledger | Fix the key permission or account mode; do not read as "empty" |
-| `PositionStatusUnavailable` | `nautilus_gateio.execution` | A position query got no usable answer | Handled by the engine; fix the underlying refusal it names |
-| `FillReportsUnavailable` | `nautilus_gateio.execution` | A trade listing did not answer in full; carries what did answer readably | Handled by the engine; fix what the message names |
-| `OrderReportsUnavailable` | `nautilus_gateio.execution` | An order listing did not answer in full; carries what did parse | Handled by the engine; at startup the node refuses to start |
+| Exception                     | Import from                   | Says                                                                                       | Your move                                                          |
+|-------------------------------|-------------------------------|--------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
+| `GateioError`                 | `nautilus_gateio`             | Base of every venue/transport failure; carries `status`, `label`, `message`                | Branch on the subclass or the label                                |
+| `GateioClientError`           | `nautilus_gateio`             | 4xx — Gate.io refused this request (bad params, auth, limits)                              | Fix the request; retrying unchanged repeats the refusal            |
+| `GateioServerError`           | `nautilus_gateio`             | 5xx — Gate.io reported an internal failure                                                 | Usually retryable; on a mutating call see the ambiguity section    |
+| `GateioRequestAmbiguousError` | `nautilus_gateio.http.client` | The request may have reached the venue; the outcome is unknown                             | Reconcile (query the order, poll the transfer) before resubmitting |
+| `GateioAmbiguousServerError`  | `nautilus_gateio.http.client` | 5xx on a mutating request — both of the above at once                                      | Same as ambiguous; server-error handlers still catch it            |
+| `OrderValidationError`        | `nautilus_gateio`             | The order violates an exchange constraint (tick grid, whole contracts, expiry in the past) | Correct the order; nothing was sent                                |
+| `UnsupportedOrderError`       | `nautilus_gateio`             | Gate.io cannot express this order without changing its meaning                             | Submit what the venue can express, or emulate locally              |
+| `WalletNotProvisionedError`   | `nautilus_gateio`             | This wallet does not exist yet on the account — a definite absence                         | Ignorable until you fund/transfer into the wallet                  |
+| `WalletQueryRefusedError`     | `nautilus_gateio`             | Gate.io refused to answer the query — nothing is known about the ledger                    | Fix the key permission or account mode; do not read as "empty"     |
+| `PositionStatusUnavailable`   | `nautilus_gateio.execution`   | A position query got no usable answer                                                      | Handled by the engine; fix the underlying refusal it names         |
+| `FillReportsUnavailable`      | `nautilus_gateio.execution`   | A trade listing did not answer in full; carries what did answer readably                   | Handled by the engine; fix what the message names                  |
+| `OrderReportsUnavailable`     | `nautilus_gateio.execution`   | An order listing did not answer in full; carries what did parse                            | Handled by the engine; at startup the node refuses to start        |
 
 `should_retry(error)` is also exported at the package root: it answers "is this
 failure worth retrying" the same way the transport answers it internally.
@@ -57,11 +57,11 @@ everything else `GateioClientError`. Three errors are raised with **status 0 or
 a locally assigned status** because no response produced them — each is raised
 only when no byte of the request left the process:
 
-| Label | Status | Raised when |
-|---|---|---|
-| `NETWORK_ERROR` | 0 | Every attempt failed before anything was sent — the venue cannot have seen the request |
-| `CLIENT_CLOSED` | 0 | The shared `GateioHttpClient` was closed (or acquired after closing) |
-| `MISSING_CREDENTIALS` | 401 | A signed endpoint was called without API credentials |
+| Label                 | Status | Raised when                                                                            |
+|-----------------------|--------|----------------------------------------------------------------------------------------|
+| `NETWORK_ERROR`       | 0      | Every attempt failed before anything was sent — the venue cannot have seen the request |
+| `CLIENT_CLOSED`       | 0      | The shared `GateioHttpClient` was closed (or acquired after closing)                   |
+| `MISSING_CREDENTIALS` | 401    | A signed endpoint was called without API credentials                                   |
 
 That reservation is deliberate: a status-0 error is *proof of non-delivery*,
 which is what lets the execution client treat these as definitive rather than
@@ -355,11 +355,7 @@ which is a definite answer, not a failed query.
 
 ## What NautilusTrader handles for you
 
-To summarise the division of labour at its proven level (offline tests drive the
-real platform state machine; the only error handling a live run has exercised is
-what the recorded runs happened to meet — a post-only refusal and a repeated
-cancel on spot, a reduce-only refusal on the perpetual, and the local denial of
-a sell the account could not cover — see [validation.md](validation.md)):
+The division of labor:
 
 * **Order commands**: every exception becomes `OrderDenied`, `OrderRejected`,
   `OrderModifyRejected`/`OrderCancelRejected`, or a logged unresolved outcome
@@ -373,3 +369,9 @@ a sell the account could not cover — see [validation.md](validation.md)):
 * **What is yours**: exceptions from code that calls the HTTP namespaces, the
   instrument provider or the symbology helpers directly — there the taxonomy
   above is the contract.
+
+Offline tests drive the real platform state machine. The only error handling a
+live run has exercised is what the recorded runs met: a post-only refusal and a
+repeated cancel on spot, a reduce-only refusal on the perpetual, and the local
+denial of a sell the account could not cover (see
+[validation.md](validation.md)).

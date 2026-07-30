@@ -14,7 +14,7 @@ follow that.
 [The deliberate Python-only architecture](#the-deliberate-python-only-architecture)
 explains why, and — more importantly — what that decision does *not* excuse.
 
-**The release is alpha.** The behaviour described here is implemented and
+**The release is alpha.** The behavior described here is implemented and
 covered by the unit suite against recorded and simulated venue payloads.
 Live-venue validation covers the market-data paths, spot execution, a series of
 orders on one USDT perpetual including a position read back from the venue by a
@@ -43,6 +43,7 @@ nautilus_gateio/
     signing.py           HMAC-SHA512 request and WebSocket signing, client ids
     symbols.py           instrument id <-> Gate.io symbol (the only such place)
     parsing.py           tolerant payload field conversion
+    status.py            instrument listing payload -> MarketStatusAction, and the diff
   http/
     client.py            shared transport: signing, pacing, retries, errors
     spot.py margin.py futures.py options.py wallet.py   typed namespaces
@@ -51,6 +52,7 @@ nautilus_gateio/
     public.py            public channels for one product
     private.py           authenticated channels for one product
   books.py               local L2 book assembly and sequence validation
+  types.py               venue-native data types (GateioTicker)
   instruments.py         Gate.io payload -> NautilusTrader instrument
   providers.py           GateioInstrumentProvider (multi-product, filtered)
   config.py              GateioDataClientConfig, GateioExecClientConfig
@@ -61,14 +63,14 @@ nautilus_gateio/
 
 The dependency direction is one-way, from the bottom of this table upwards:
 
-| Layer | Imports | NautilusTrader types in its own API |
-|---|---|---|
-| `books.py` | standard library only | none |
-| `common/*` | standard library only | identifiers and enums only (`constants.py`, `enums.py`, `symbols.py`) |
-| `http/*` | `common/*`, `httpx` | none — namespaces return decoded JSON unchanged |
-| `websocket/*` | `common/*`, `websockets`, the platform's logger and task cancellation | none — the transport hands raw envelopes to a callback |
-| `instruments.py`, `providers.py` | `http/*`, `common/*` | instrument and provider types |
-| `data.py`, `execution.py`, `factories.py` | everything below | the full live-client surface |
+| Layer                                     | Imports                                                               | NautilusTrader types in its own API                                   |
+|-------------------------------------------|-----------------------------------------------------------------------|-----------------------------------------------------------------------|
+| `books.py`                                | standard library only                                                 | none                                                                  |
+| `common/*`                                | standard library only                                                 | identifiers and enums only (`constants.py`, `enums.py`, `symbols.py`) |
+| `http/*`                                  | `common/*`, `httpx`                                                   | none — namespaces return decoded JSON unchanged                       |
+| `websocket/*`                             | `common/*`, `websockets`, the platform's logger and task cancellation | none — the transport hands raw envelopes to a callback                |
+| `instruments.py`, `providers.py`          | `http/*`, `common/*`                                                  | instrument and provider types                                         |
+| `data.py`, `execution.py`, `factories.py` | everything below                                                      | the full live-client surface                                          |
 
 The consequence worth knowing is that the REST and WebSocket layers can be used
 directly, without a trading node: nothing in their signatures is a NautilusTrader
@@ -77,18 +79,18 @@ object. (The distribution still depends on `nautilus_trader`, because
 framework's order enums.)
 
 `books.py` has no framework dependency at all: it deals in `Decimal` prices and
-sizes, so the snapshot-plus-increment synchronisation algorithm can be unit
+sizes, so the snapshot-plus-increment synchronization algorithm can be unit
 tested without a trading environment. Turning its output into venue data types is
 the data client's job.
 
 ## The two clients and their factories
 
-| Component | Base class | Role |
-|---|---|---|
-| `GateioDataClient` | `LiveMarketDataClient` | subscriptions and historical requests for every configured product |
-| `GateioExecutionClient` | `LiveExecutionClient` | order submission, modification, cancellation, account state and all four report generators |
-| `GateioLiveDataClientFactory` | `LiveDataClientFactory` | builds the data client from `GateioDataClientConfig` |
-| `GateioLiveExecClientFactory` | `LiveExecClientFactory` | builds the execution client from `GateioExecClientConfig` |
+| Component                     | Base class              | Role                                                                                       |
+|-------------------------------|-------------------------|--------------------------------------------------------------------------------------------|
+| `GateioDataClient`            | `LiveMarketDataClient`  | subscriptions and historical requests for every configured product                         |
+| `GateioExecutionClient`       | `LiveExecutionClient`   | order submission, modification, cancellation, account state and all four report generators |
+| `GateioLiveDataClientFactory` | `LiveDataClientFactory` | builds the data client from `GateioDataClientConfig`                                       |
+| `GateioLiveExecClientFactory` | `LiveExecClientFactory` | builds the execution client from `GateioExecClientConfig`                                  |
 
 Both factories are registered with a `TradingNode` under the venue's client id:
 
@@ -102,6 +104,10 @@ from nautilus_gateio import (
 node.add_data_client_factory(GATEIO, GateioLiveDataClientFactory)
 node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)
 ```
+
+A node config can carry both entries declaratively instead, with one caveat about
+the execution factory; see
+[configuration.md](configuration.md#registering-from-a-declarative-config).
 
 There is one client of each kind, not one per product. A single data client
 multiplexes every product named in `products`, and a single execution client
@@ -157,10 +163,10 @@ it. Signatures embed a timestamp, so a drifting local clock produces
 `INVALID_SIGNATURE`; and Gate.io's optional `x-gate-exptime` submission deadline
 bounds how late a request delayed in flight may still be accepted. Calling
 `sync_time()` measures the offset against the venue and enables both. Neither
-client calls it during connect, so an unsynchronised transport signs with the
+client calls it during connect, so an unsynchronized transport signs with the
 local clock and sends no deadline header — the deadline is deliberately withheld
 rather than computed from a clock that has not been checked, since an
-unsynchronised clock would expire valid requests.
+unsynchronized clock would expire valid requests.
 
 Perpetual and delivery futures share one namespace class, because Gate.io serves
 them from paths that differ only in two segments. The `/futures/{settle}` versus
@@ -192,7 +198,7 @@ request that reached the venue and was never answered however often it was
 replayed; `NETWORK_ERROR` is reserved for the case where no byte of any attempt
 left the process. A cancel is why that distinction is load-bearing: `DELETE` *is*
 replayed, and reporting a definitive failure for an order the venue had already
-cancelled is what the execution client would then tell the strategy.
+canceled is what the execution client would then tell the strategy.
 
 ## One WebSocket transport per product
 
@@ -204,13 +210,13 @@ identity of a `GateioWebSocketClient` rather than a parameter of each call. The
 product also selects the application-level ping channel and whether the
 fractional-size handshake header applies.
 
-| Product | Channel namespace | Default endpoint |
-|---|---|---|
-| Spot | `spot.*` | `wss://api.gateio.ws/ws/v4/` |
-| Perpetual (linear, USDT) | `futures.*` | `wss://fx-ws.gateio.ws/v4/ws/usdt` |
-| Perpetual (inverse, BTC) | `futures.*` | `wss://fx-ws.gateio.ws/v4/ws/btc` |
-| Delivery futures | `futures.*` | `wss://fx-ws.gateio.ws/v4/ws/delivery/usdt` |
-| Options | `options.*` | `wss://op-ws.gateio.live/v4/ws` |
+| Product                  | Channel namespace | Default endpoint                            |
+|--------------------------|-------------------|---------------------------------------------|
+| Spot                     | `spot.*`          | `wss://api.gateio.ws/ws/v4/`                |
+| Perpetual (linear, USDT) | `futures.*`       | `wss://fx-ws.gateio.ws/v4/ws/usdt`          |
+| Perpetual (inverse, BTC) | `futures.*`       | `wss://fx-ws.gateio.ws/v4/ws/btc`           |
+| Delivery futures         | `futures.*`       | `wss://fx-ws.gateio.ws/v4/ws/delivery/usdt` |
+| Options                  | `options.*`       | `wss://op-ws.gateio.live/v4/ws`             |
 
 Gate.io publishes testnet WebSocket endpoints for spot and USDT perpetuals only,
 which is why configuring any other product together with
@@ -255,7 +261,7 @@ the subscription replay, the proactive close triggered by the venue's `upgrade`
 notification and the task wrapping a coroutine returned by the message handler —
 is registered in one collection, and `disconnect()` hands that collection to the
 platform's `cancel_tasks_with_timeout`. That is what takes a strong reference
-snapshot before cancelling, so a task held only by the event loop cannot be
+snapshot before canceling, so a task held only by the event loop cannot be
 collected mid-cancellation, and what reports the task names if they do not
 settle in time. A task the transport does not register is a task shutdown cannot
 account for.
@@ -271,7 +277,7 @@ implements `load_all_async`, `load_ids_async` and `load_async`. It loads each
 configured product independently through the typed namespaces, so the venue's
 path layout is expressed in exactly one place.
 
-Two behaviours in it are deliberate and worth knowing before an account starts:
+Two behaviors in it are deliberate and worth knowing before an account starts:
 
 **Per-product degradation.** Gate.io creates the futures, delivery and options
 wallets on first use and answers `USER_NOT_FOUND` until then; a key may also lack
@@ -284,7 +290,7 @@ several products configured.
 transformations, and a payload that cannot be represented faithfully yields
 `None` plus a warning rather than raising — one bad entry never aborts a batch
 load. The important case is price scale: a few Gate.io spot pairs quote more
-decimals than a standard NautilusTrader build can represent, and quantising such
+decimals than a standard NautilusTrader build can represent, and quantizing such
 a price yields `0.000000000`, which `Price` accepts in silence. Publishing the
 instrument anyway would mean publishing zeroes as if they were venue prices, so
 the instrument is not published at all.
@@ -330,13 +336,13 @@ looks like, `raw_symbol` on the instrument is the exact symbol Gate.io uses, so
 a round trip back to the API never has to reverse a transformation. The suffix
 exists in the instrument id and nowhere else.
 
-| Product | Instrument id | `raw_symbol` |
-|---|---|---|
-| Spot | `BTC_USDT.GATE_IO` | `BTC_USDT` |
-| Perpetual (linear) | `BTC_USDT-PERP.GATE_IO` | `BTC_USDT` |
-| Perpetual (inverse) | `BTC_USD-PERP.GATE_IO` | `BTC_USD` |
-| Delivery future | `BTC_USDT_20260807.GATE_IO` | `BTC_USDT_20260807` |
-| Option | `BTC_USDT-20260729-70000-C.GATE_IO` | `BTC_USDT-20260729-70000-C` |
+| Product             | Instrument id                       | `raw_symbol`                |
+|---------------------|-------------------------------------|-----------------------------|
+| Spot                | `BTC_USDT.GATE_IO`                  | `BTC_USDT`                  |
+| Perpetual (linear)  | `BTC_USDT-PERP.GATE_IO`             | `BTC_USDT`                  |
+| Perpetual (inverse) | `BTC_USD-PERP.GATE_IO`              | `BTC_USD`                   |
+| Delivery future     | `BTC_USDT_20260807.GATE_IO`         | `BTC_USDT_20260807`         |
+| Option              | `BTC_USDT-20260729-70000-C.GATE_IO` | `BTC_USDT-20260729-70000-C` |
 
 ## Dataflow: market data
 
@@ -358,13 +364,17 @@ GateioPublicWebSocket                    GateioHttpClient + namespaces
    MarkPriceUpdate      <- futures.tickers / options.contract_tickers
    IndexPriceUpdate     <- futures.tickers / options.contract_tickers
    FundingRateUpdate    <- futures.tickers, and REST funding_rate on request
+   OrderBookDepth10     <- *.order_book, the venue's periodic snapshot channel
+   InstrumentStatus     <- polled instrument listings; Gate.io has no status channel
+   InstrumentClose      <- REST settlement after expiry, delivery and options only
+   GateioTicker         <- *.tickers, published as CustomData
                         |
                         v
                  Nautilus DataEngine
 ```
 
 Nothing is published that the venue did not send: quotes come from the real
-`book_ticker` best bid/offer stream, not from a synthesised spread. Sizes that
+`book_ticker` best bid/offer stream, not from a synthesized spread. Sizes that
 truncate to zero at the instrument's precision are dropped rather than published
 as zeros, and an empty book side is absent rather than zero.
 
@@ -441,7 +451,7 @@ to change. It never changes that setting on the operator's behalf.
 
 **No local kill switch.** A boolean inside the process is not a security
 boundary. Control over what a key may do belongs on the key itself
-(permissions, IP allow-list) and in the explicit choice of `environment` — which
+(permissions, IP allowlist) and in the explicit choice of `environment` — which
 defaults to mainnet, so that an execution client can never be pointed at a
 different exchange environment than the operator believes.
 
@@ -460,7 +470,7 @@ for contributors, and an FFI boundary to keep correct — cost that buys an
 external package very little, since the adapter's work is JSON parsing and
 socket handling bounded by network latency, not by the interpreter. Pure Python
 also keeps the whole implementation readable and modifiable by the people most
-likely to need to: users debugging their own venue behaviour.
+likely to need to: users debugging their own venue behavior.
 
 **What this does not excuse.** The distinction that matters is between
 *functional correctness* requirements and *repository convention*.
