@@ -52,8 +52,6 @@ string, the instrument ids and the execution environment default all changed.
 |-----------|-----------------|----------------|-------------|
 | `0.2.0a1` | `>=1.230.0,<2`  | `>=3.12,<3.15` | v4          |
 
-Not yet published on PyPI. Install from GitHub:
-
 ```bash
 pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter"
 ```
