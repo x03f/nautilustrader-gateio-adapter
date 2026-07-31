@@ -73,6 +73,13 @@ from nautilus_gateio.common.constants import (
     DEFAULT_MAX_REQUESTS_PER_SECOND,
     GATEIO_API_PREFIX,
     GATEIO_HTTP_MAINNET,
+    GATEIO_HTTP_TESTNET,
+)
+from nautilus_gateio.common.credentials import (
+    ENV_API_KEY,
+    ENV_API_SECRET,
+    ENV_TESTNET_API_KEY,
+    ENV_TESTNET_API_SECRET,
 )
 from nautilus_gateio.common.errors import (
     GateioError,
@@ -281,6 +288,20 @@ class GateioHttpClient:
     def has_credentials(self) -> bool:
         return bool(self._api_key and self._api_secret)
 
+    def _credential_env_names(self) -> str:
+        """Name the environment variables *this* client would have read.
+
+        A testnet client that is told to set the mainnet pair sends the operator
+        into the fallback trap: with only the mainnet key exported, a testnet run
+        signs with it against the testnet host and the venue answers
+        ``INVALID_SIGNATURE``, which reads like a signing bug and is a missing
+        account. So the message names the pair the configured host actually
+        resolves.
+        """
+        if self.base_url == GATEIO_HTTP_TESTNET:
+            return f"{ENV_TESTNET_API_KEY} / {ENV_TESTNET_API_SECRET}"
+        return f"{ENV_API_KEY} / {ENV_API_SECRET}"
+
     # -- clock -------------------------------------------------------------
 
     async def sync_time(self) -> int:
@@ -359,7 +380,7 @@ class GateioHttpClient:
             raise GateioError(
                 401,
                 "MISSING_CREDENTIALS",
-                "this endpoint requires API credentials (set GATE_API_KEY / GATE_API_SECRET)",
+                f"this endpoint requires API credentials (set {self._credential_env_names()})",
             )
 
         method = method.upper()

@@ -56,6 +56,24 @@ string, the instrument ids and the execution environment default all changed.
 pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter"
 ```
 
+That line installs the **default branch**, which is ahead of the published release and is what the
+pages here describe. To install the release instead, pin the tag:
+
+```bash
+pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter@v0.2.0a1"
+```
+
+The package is not on PyPI, so a bare `pip install nautilustrader-gateio-adapter` finds nothing;
+the name is an install name, not a PyPI name. Both builds report `__version__ == "0.2.0a1"`, because
+the branch carries the next version's work under the released number, so the version string cannot
+tell them apart. `pip freeze` can — it appends the commit that was installed, and the release is
+`0e0814f`:
+
+```bash
+pip freeze | grep gateio
+# nautilustrader-gateio-adapter @ git+https://github.com/x03f/...@0e0814f5818011...
+```
+
 `nautilus_trader` is a declared dependency, so pip will pull it in. It is a large wheel, and on a
 platform with no wheel it is a long source build; installing it into the target environment first
 makes any failure there easier to read.
@@ -99,7 +117,9 @@ Nothing checks at startup that credentials are present, because their absence is
 public market data needs none. A data client without a key runs and looks healthy. An execution
 client without a key also builds and reaches `READY`, and then fails at its first signed request
 with `MISSING_CREDENTIALS` (`nautilus_gateio/http/client.py`). A misspelled variable name produces
-exactly that failure.
+exactly that failure, and what you see is a node that waits a minute and then reports
+`Timed out (60.0s) waiting for engines to connect and initialize`, with the real cause one `[ERROR]`
+line above it ([troubleshooting.md](docs/troubleshooting.md#the-node-hangs-for-a-minute-and-then-reports-a-timeout)).
 
 On `environment="testnet"` the testnet variables take precedence and fall back to the mainnet pair.
 With only the mainnet pair exported, a testnet run signs with the mainnet key against the testnet
@@ -124,15 +144,16 @@ need it: if both reads fail it logs two warnings and carries on. A client config
 derivative product refuses to start, raising a `RuntimeError` that names the missing read
 permission. Beyond that, what is called follows the configuration:
 
-| What you configure                           | REST sections called   |
-|----------------------------------------------|------------------------|
-| `SPOT`                                       | `/spot/*`              |
-| `spot_account_mode=MARGIN` or `CROSS_MARGIN` | `/margin/*`            |
-| `spot_account_mode=UNIFIED`                  | `/unified/*`           |
-| `PERP`, `INVERSE`                            | `/futures/{settle}/*`  |
-| `FUT`                                        | `/delivery/{settle}/*` |
-| `OPT`                                        | `/options/*`           |
-| `transfer()`                                 | `/wallet/*` transfers  |
+| What you configure                           | REST sections called            |
+|----------------------------------------------|---------------------------------|
+| any execution client, at startup             | `/wallet/fee`, then `/spot/fee` |
+| `SPOT`                                       | `/spot/*`                       |
+| `spot_account_mode=MARGIN` or `CROSS_MARGIN` | `/margin/*`                     |
+| `spot_account_mode=UNIFIED`                  | `/unified/*`                    |
+| `PERP`, `INVERSE`                            | `/futures/{settle}/*`           |
+| `FUT`                                        | `/delivery/{settle}/*`          |
+| `OPT`                                        | `/options/*`                    |
+| `transfer()`                                 | `/wallet/*` transfers           |
 
 [SECURITY.md](SECURITY.md) states what the adapter does with credentials, module by module, and what
 identifies you in a log even though it is not a credential.
@@ -272,6 +293,9 @@ Gate.io's ticker message carries figures NautilusTrader has no type for: the 24-
 greeks and implied volatilities on options, the delivery basis. They reach a strategy as custom data
 rather than being dropped.
 
+This type is on the branch only. A build pinned to `v0.2.0a1` has no `GateioTicker`, and the import
+below raises `ImportError` there.
+
 ```python
 from nautilus_trader.model.data import DataType
 
@@ -297,7 +321,9 @@ Gate.io is five venues behind one API key, and most first-order failures are ven
 than code.
 
 - **Keys.** Permissions as above, no withdrawal permission, IP allowlist. Testnet keys are issued by
-  a separate testnet account and are not the mainnet ones.
+  a separate testnet account and are not the mainnet ones: the testnet is served at
+  `https://testnet.gate.com`, and the account and its key are created there. The API host the
+  adapter talks to, `https://api-testnet.gateapi.io`, is not a page you can register on.
 - **Wallets are segregated per product.** USDT sitting in the spot wallet cannot open a perpetual
   position. The futures, delivery and options wallets do not exist until the first internal transfer
   into them; until then Gate.io answers `USER_NOT_FOUND`, and the adapter logs a warning and skips
@@ -466,7 +492,11 @@ config = TradingNodeConfig(
     data_clients={
         "GATE_IO": ImportableConfig(
             path="nautilus_gateio.config:GateioDataClientConfig",
-            config={"products": ["SPOT", "PERP"], "instrument_provider": {"load_all": True}},
+            config={
+                "environment": "testnet",  # state it on BOTH clients, see below
+                "products": ["SPOT", "PERP"],
+                "instrument_provider": {"load_all": True},
+            },
             factory=ImportableFactoryConfig(
                 path="nautilus_gateio.factories:GateioLiveDataClientFactory",
             ),
@@ -487,6 +517,11 @@ node.build()
 
 What that path requires, verified against `nautilus_trader` 1.230.0:
 
+- **`environment` is per client, and it defaults to mainnet.** The two entries are separate
+  configurations, so leaving it off the data client while setting it on the execution client is how
+  a node ends up trading in one environment while watching prices from another. The startup log
+  states each one; read both lines
+  ([configuration.md](docs/configuration.md#the-environment-default-is-mainnet)).
 - **The execution factory has to be registered in Python.** Give the exec entry a
   `factory=ImportableFactoryConfig(...)` and `node.build()` raises
   `AttributeError: 'GateioLiveExecClientFactory' object has no attribute '__name__'`.
@@ -588,8 +623,9 @@ Ordered by how soon you are likely to meet it.
   ([review-matrix.md](docs/review-matrix.md#residual-risks)).
 
 [docs/troubleshooting.md](docs/troubleshooting.md) covers the failures that have actually happened,
-including `INVALID_SIGNATURE`, `USER_NOT_FOUND`, `FORBIDDEN`, orders stuck in flight and books that
-keep resynchronizing.
+including the 60-second startup timeout a missing credential produces,
+`INVALID_SIGNATURE`, `USER_NOT_FOUND`, `FORBIDDEN`, orders stuck in flight and books that keep
+resynchronizing.
 
 ## Feature support matrix
 

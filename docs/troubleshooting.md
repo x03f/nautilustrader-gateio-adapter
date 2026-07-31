@@ -2,6 +2,44 @@
 
 Real failure modes, and what to do about them.
 
+## The node hangs for a minute and then reports a timeout
+
+```
+[WARN] TradingNode: Timed out (60.0s) waiting for engines to connect and initialize
+```
+
+That line is the symptom, not the cause. The cause is one `[ERROR] Error on
+'_connect'` line above it, and on a first run it is almost always
+`MISSING_CREDENTIALS`:
+
+```
+[WARN]  ExecClient-GATE_IO: Cannot read /wallet/fee (MISSING_CREDENTIALS); falling back to /spot/fee
+[WARN]  ExecClient-GATE_IO: Cannot read the account user id: Gate.io 401 MISSING_CREDENTIALS: ...
+[ERROR] ExecClient-GATE_IO: Error on '_connect'
+GateioError(Gate.io 401 MISSING_CREDENTIALS: channel spot.orders is private and requires API credentials)
+```
+
+Nothing checks at startup that credentials are present, because their absence is
+a valid state: public market data needs none, and a data client without a key
+runs and looks healthy. An execution client also builds and reaches `READY`, and
+then fails at its first signed request. So a variable that is unset, misspelled
+or exported in a different shell produces a healthy-looking start, a 60-second
+wait, and that timeout.
+
+The error names the pair for the environment the client is configured for —
+`GATE_TESTNET_API_KEY` / `GATE_TESTNET_API_SECRET` on the testnet, the mainnet
+pair otherwise. Check them in the process that actually runs the node:
+
+```bash
+python -c "import os; print([n for n in ('GATE_API_KEY','GATE_API_SECRET','GATE_TESTNET_API_KEY','GATE_TESTNET_API_SECRET') if os.getenv(n)])"
+```
+
+The package reads those four names and no others. `GATEIO_API_KEY` — with the
+"IO" — is read by nothing.
+
+The strategy never starts on this path, so no order is constructed and nothing
+reaches the venue.
+
 ## `INVALID_SIGNATURE` or HTTP 401 on private requests
 
 Two usual causes:
@@ -27,6 +65,11 @@ over from 0.1.0 that relied on the default now targets mainnet. Set
 Symptom: balances come back empty, or orders reference instruments the account
 has never traded. Testnet balances exist only on `https://api-testnet.gateapi.io`
 and mainnet balances only on `https://api.gateio.ws`.
+
+The testnet account is a separate registration from the mainnet one, made on the
+testnet's own site at `https://testnet.gate.com`; its key is issued there. The
+API host above is where the adapter sends requests, not where an account is
+opened.
 
 ## `ValueError: Gate.io has no testnet endpoint for ...`
 

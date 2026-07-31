@@ -18,7 +18,11 @@ from typing import Any
 import httpx
 import pytest
 
-from nautilus_gateio.common.constants import GATEIO_API_PREFIX, GATEIO_HTTP_MAINNET
+from nautilus_gateio.common.constants import (
+    GATEIO_API_PREFIX,
+    GATEIO_HTTP_MAINNET,
+    GATEIO_HTTP_TESTNET,
+)
 from nautilus_gateio.common.errors import (
     GateioClientError,
     GateioError,
@@ -175,6 +179,26 @@ async def test_signed_request_without_credentials_never_reaches_the_transport():
     assert excinfo.value.status == 401
     assert excinfo.value.label == "MISSING_CREDENTIALS"
     assert log == []
+
+
+async def test_the_missing_credential_message_names_the_pair_for_this_host():
+    """A testnet client must not send the operator to the mainnet variables.
+
+    Exporting only the mainnet pair for a testnet run signs with the wrong key
+    against the testnet host, and Gate.io answers ``INVALID_SIGNATURE`` — a
+    missing account that reads like a signing bug.
+    """
+    mainnet = make_client(lambda request: httpx.Response(200, json=[]))
+    testnet = make_client(lambda request: httpx.Response(200, json=[]))
+    testnet.base_url = GATEIO_HTTP_TESTNET
+
+    with pytest.raises(GateioError) as on_mainnet:
+        await mainnet.get("/spot/accounts", signed=True)
+    with pytest.raises(GateioError) as on_testnet:
+        await testnet.get("/spot/accounts", signed=True)
+
+    assert "GATE_API_KEY / GATE_API_SECRET" in on_mainnet.value.message
+    assert "GATE_TESTNET_API_KEY / GATE_TESTNET_API_SECRET" in on_testnet.value.message
 
 
 async def test_signature_covers_the_literal_json_body():

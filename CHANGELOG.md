@@ -127,6 +127,20 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   instrument whose payload did not survive a round trip settled as a put with no
   multiplier — silently, because `bool(None)` is `False`.
 
+- **The sdist shipped a test suite that could not run.** `MANIFEST.in` carried
+  `tests/` but not the pages, examples and CI workflow those tests read, so
+  `pytest` inside an unpacked sdist aborted during collection on a missing file
+  and every other test went with it. The sdist now carries `docs/`, `examples/`,
+  `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md` and
+  `.github/workflows/ci.yml`, and the whole suite passes from an unpacked sdist
+  with nothing installed.
+
+- **`MISSING_CREDENTIALS` named the mainnet variables on a testnet client.**
+  Obeying that hint exports the mainnet pair for a testnet run, which signs with
+  the wrong key against the testnet host and gets `INVALID_SIGNATURE` back — a
+  missing account that reads like a signing bug. The message now names the pair
+  the configured host resolves.
+
 ### Changed
 
 - The market-data, products and execution pages and the README matrices state
@@ -184,6 +198,27 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   `docs/validation.md` records no run, no Mainnet cell may name a product. It
   replaces the status-vocabulary guard, which parsed a column the matrix no
   longer has.
+
+- **The README says which build its install line gives.** That line installs the
+  default branch; the pinned line for the published release is now next to it,
+  along with the fact that the name is not a PyPI name and that both builds
+  report `0.2.0a1`, so only `pip freeze` and its commit tell them apart. The
+  `GateioTicker` snippet carries the same warning where it is used rather than
+  only in Status.
+
+- **The declarative example no longer makes the mistake its own pages warn
+  about.** It set `environment` on the execution client and left it off the data
+  client, which defaults to mainnet — a node trading in one environment while
+  watching prices from another. Both entries state it now, and the requirement is
+  the first bullet under the example.
+
+- **A missing credential has a troubleshooting entry**, first on the page,
+  because it is the most likely first failure and its symptom is a 60-second wait
+  ending in `Timed out (60.0s) waiting for engines to connect and initialize`
+  with the cause one line above. The key-permission table gains the `/wallet/fee`
+  read every execution client makes at startup, which the prose already
+  described. Both pages now say where a testnet account is registered, which is
+  not the API host.
 
 ## [0.2.0a1] - 2026-07-29
 

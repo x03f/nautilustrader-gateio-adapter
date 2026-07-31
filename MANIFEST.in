@@ -1,1 +1,12 @@
 recursive-include tests *.py
+
+# The sdist carries the test suite, so it has to carry what the suite reads.
+# `tests/test_docs.py` and `tests/test_data_book_depth.py` assert that the prose
+# still matches the code, which means opening the pages, the examples and the CI
+# workflow. Ship the suite without them and `pytest` inside an unpacked sdist
+# aborts during collection on a missing file, taking every other test with it.
+recursive-include docs *.md
+recursive-include examples *.py
+include examples/README.md
+include CHANGELOG.md CONTRIBUTING.md SECURITY.md
+include .github/workflows/ci.yml
