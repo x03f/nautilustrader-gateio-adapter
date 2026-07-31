@@ -137,13 +137,17 @@ commit the validation runs were made against.
 _Exit met: released. The release gate passed all ten conditions on the tagged commit — 1833 tests,
 the wheel built and installed clean, its documented public imports verified from that install, the
 TradingNode smoke, reconnect and restart recovery over 43 scenarios, REST/WebSocket/Nautilus
-reconciliation, and a clean account preflight. The default branch carries the same tree as the tag,
-which matters because the superseded `v0.1.0` release directs readers to install from it._
+reconciliation, and a clean account preflight. At the release the default branch carried the same
+tree as the tag, which mattered because the superseded `v0.1.0` release directs readers to install
+from it._
 
 ### Stage 8 — Toward beta and a stable release
 
 Driven by what real use surfaces. Widening live validation, fixing operational defects, and the
 technical decisions deferred out of the alpha.
+
+This is where the default branch is: it reports `0.2.0a2.dev0` — past `0.2.0a1`, before the next
+alpha.
 
 ## How work is done here
 

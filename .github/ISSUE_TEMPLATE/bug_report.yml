@@ -12,13 +12,26 @@ body:
         **Do not report security vulnerabilities here.** Use
         [private vulnerability reporting](../../security/advisories/new) instead.
   - type: input
+    id: adapter-build
+    attributes:
+      label: Adapter build
+      description: >
+        Output of `pip freeze | grep gateio`. On a git install it names the exact
+        commit, which is what identifies a build — the branch moves, and every
+        build of it reports the same version.
+      placeholder: "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter@0e0814f5818011..."
+    validations:
+      required: true
+  - type: input
     id: adapter-version
     attributes:
       label: Adapter version
-      description: Output of `python -c "import nautilus_gateio; print(nautilus_gateio.__version__)"`
-      placeholder: "0.2.0a1"
+      description: >
+        Output of `python -c "import nautilus_gateio; print(nautilus_gateio.__version__)"`.
+        `0.2.0a2.dev0` is the default branch; `0.2.0a1` is the released tag.
+      placeholder: "0.2.0a2.dev0"
     validations:
-      required: true
+      required: false
   - type: input
     id: nautilus-version
     attributes:

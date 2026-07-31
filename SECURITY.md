@@ -2,10 +2,11 @@
 
 ## Supported versions
 
-| Version   | Status                                                                                |
-|-----------|---------------------------------------------------------------------------------------|
-| `0.2.0a1` | Current alpha. Security fixes are published against this line                         |
-| `0.1.x`   | Superseded. No fixes; preserved unchanged at the `v0.1.0` tag for reference           |
+| Version        | Status                                                                                        |
+|----------------|-----------------------------------------------------------------------------------------------|
+| `0.2.0a2.dev0` | The default branch. A fix lands here first, and is released from here                         |
+| `0.2.0a1`      | Current release, tag `v0.2.0a1`. A security fix is published as the next release on this line |
+| `0.1.x`        | Superseded. No fixes; preserved unchanged at the `v0.1.0` tag for reference                   |
 
 This is alpha software. Live validation reaches the market-data paths, spot
 execution, one USDT perpetual and one option contract, and no further; see
@@ -19,7 +20,8 @@ Report privately through
 [GitHub private vulnerability reporting](https://github.com/x03f/nautilustrader-gateio-adapter/security/advisories/new).
 Do **not** open a public issue for a security problem.
 
-A useful report states the adapter version, the product and the endpoint or
+A useful report states the adapter build — the line `pip freeze | grep gateio`
+prints, which names the commit on a git install — the product and the endpoint or
 channel involved, what an attacker gains, and — if you have one — a minimal
 reproduction.
 

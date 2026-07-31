@@ -7,11 +7,12 @@ with Gate.io.
 
 ## What helps most right now
 
-`0.2.0a1` carries a bounded mainnet record: spot, one USDT perpetual, one option
-contract, and nothing beyond it. Inverse perpetuals, delivery futures and every
-margin ledger have never had an order sent. A passing suite is evidence about the
-code rather than about the exchange, so the most valuable contribution is
-evidence from the exchange:
+The released `0.2.0a1` carries a bounded mainnet record: spot, one USDT
+perpetual, one option contract, and nothing beyond it — and nothing added to the
+branch since has been run against the venue at all. Inverse perpetuals, delivery
+futures and every margin ledger have never had an order sent. A passing suite is
+evidence about the code rather than about the exchange, so the most valuable
+contribution is evidence from the exchange:
 
 * **Validation results.** If you exercise a path against the real venue, a pull
   request adding a row to [docs/validation.md](docs/validation.md) — date,
@@ -37,8 +38,18 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 ```
 
+### The version on this branch
+
+The default branch carries a development version — `0.2.0a2.dev0` — which is
+[PEP 440](https://peps.python.org/pep-0440/) for *after `0.2.0a1`, before the
+next alpha*. It is deliberately not the released number, so a build of this
+branch can never claim to be the release, and it is not bumped per commit:
+`pip freeze` names the commit for a git install, which is the finer-grained
+answer. A release sets it, following [docs/releasing.md](docs/releasing.md). A
+pull request leaves it alone.
+
 Python >= 3.12 and < 3.15, with `nautilus_trader` >= 1.230.0 and < 2, as pinned
-in `pyproject.toml`. CI runs on 3.12 and 3.13.
+in `pyproject.toml` on this branch. CI runs on 3.12 and 3.13.
 
 ## Running the tests
 
@@ -98,7 +109,8 @@ A partial rewrite along other lines is not a change to open unannounced.
 
 ## Reporting an issue
 
-Use the issue template, which asks for the adapter version, the `nautilus_trader`
+Use the issue template, which asks for the adapter build — the line `pip freeze`
+prints, which names the commit on a git install — and the `nautilus_trader`
 version, the Python version, the operating system and the environment. Beyond
 that, a report that can be acted on states which product and which path
 (subscription, order submission, reconciliation), what happened, what you

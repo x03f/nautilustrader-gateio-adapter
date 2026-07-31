@@ -124,7 +124,7 @@ from nautilus_gateio.websocket import (
     GateioWebSocketClient,
 )
 
-__version__ = "0.2.0a1"
+__version__ = "0.2.0a2.dev0"
 
 __all__ = [
     "GATEIO",

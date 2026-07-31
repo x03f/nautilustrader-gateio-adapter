@@ -19,6 +19,9 @@ python examples/01_public_rest.py
 
 Examples 01 to 04 need no credentials and touch only public endpoints.
 
+These are the examples on the default branch. A checkout of `v0.2.0a1` has six of
+them — `07_trading_node_orders.py` is newer than that release.
+
 ## Symbology in the examples
 
 Instrument ids follow the adapter's rule: the exact venue symbol, with `-PERP`

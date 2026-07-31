@@ -26,7 +26,8 @@ and it is not affiliated with, maintained by or endorsed by Gate.io or Nautech S
 
 ## Status
 
-**Alpha, `0.2.0a1`**, built against `nautilus_trader` 1.230.0 on Python 3.13.
+**Alpha.** A build of this branch reports `0.2.0a2.dev0`; the published release reports `0.2.0a1`.
+Both are built against `nautilus_trader` 1.230.0 on Python 3.13.
 
 Gate.io mainnet has answered the public market-data paths, the whole spot order lifecycle, one
 USDT perpetual and one option contract. No order has been sent on an inverse perpetual or a
@@ -40,7 +41,8 @@ The capability matrices below describe the branch, which is what the install lin
 published `0.2.0a1` release predates several of the client hooks they list — order book depth,
 instrument status and settlement closes, the venue ticker type, order lists and `query_account` —
 so a build pinned to that version has less than the matrices show. [CHANGELOG.md](CHANGELOG.md)
-keeps the two apart.
+keeps the two apart, and so does the version: `0.2.0a2.dev0` is a build of this branch, `0.2.0a1` is
+the release.
 
 Interfaces may change between 0.x releases. Upgrading from 0.1.0 is a port rather than a version
 bump: read [docs/migration-0.1-to-0.2.md](docs/migration-0.1-to-0.2.md) first, because the venue
@@ -48,26 +50,31 @@ string, the instrument ids and the execution environment default all changed.
 
 ## Requirements and installation
 
-| Adapter   | nautilus_trader | Python         | Gate.io API |
-|-----------|-----------------|----------------|-------------|
-| `0.2.0a1` | `>=1.230.0,<2`  | `>=3.12,<3.15` | v4          |
+| Adapter                       | nautilus_trader | Python         | Gate.io API |
+|-------------------------------|-----------------|----------------|-------------|
+| `main` (`0.2.0a2.dev0`)       | `>=1.230.0,<2`  | `>=3.12,<3.15` | v4          |
+| `v0.2.0a1` (the released tag) | `>=1.230.0,<2`  | `>=3.12,<3.15` | v4          |
 
 ```bash
 pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter"
 ```
 
-That line installs the **default branch**, which is ahead of the published release and is what the
-pages here describe. To install the release instead, pin the tag:
+That line installs the **default branch**, which is ahead of the published release, reports
+`0.2.0a2.dev0`, and is what the pages here describe. To install the release instead, pin the tag:
 
 ```bash
 pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter@v0.2.0a1"
 ```
 
-The package is not on PyPI, so a bare `pip install nautilustrader-gateio-adapter` finds nothing;
-the name is an install name, not a PyPI name. Both builds report `__version__ == "0.2.0a1"`, because
-the branch carries the next version's work under the released number, so the version string cannot
-tell them apart. `pip freeze` can — it appends the commit that was installed, and the release is
-`0e0814f`:
+The package is not on PyPI, so a bare `pip install nautilustrader-gateio-adapter` finds nothing, and
+neither does `nautilustrader-gateio-adapter==0.2.0a1`: the name is an install name rather than a
+PyPI name, and that version is a git tag rather than a PyPI release. The two builds report different
+versions — `0.2.0a2.dev0` from the branch, `0.2.0a1` from the tag. A development release sorts after
+the release it followed and before the release it is working toward
+([PEP 440](https://peps.python.org/pep-0440/)), which is what the branch is, so `__version__` says
+which side of the release a build sits on. It does not say which commit: the branch moves, and every
+build of it reports the same `0.2.0a2.dev0`. For that, `pip freeze` appends the commit it installed,
+and the release commit is `0e0814f`:
 
 ```bash
 pip freeze | grep gateio
@@ -82,7 +89,7 @@ Check that the two versions line up before anything else:
 
 ```bash
 python -c "import nautilus_gateio, nautilus_trader; print(nautilus_gateio.__version__, nautilus_trader.__version__)"
-# 0.2.0a1 1.230.0
+# 0.2.0a2.dev0 1.230.0        (0.2.0a1 if you pinned the tag)
 ```
 
 For development:
@@ -293,8 +300,8 @@ Gate.io's ticker message carries figures NautilusTrader has no type for: the 24-
 greeks and implied volatilities on options, the delivery basis. They reach a strategy as custom data
 rather than being dropped.
 
-This type is on the branch only. A build pinned to `v0.2.0a1` has no `GateioTicker`, and the import
-below raises `ImportError` there.
+This type is on the branch only. A build pinned to `v0.2.0a1` — anything whose `__version__` reads
+`0.2.0a1` — has no `GateioTicker`, and the import below raises `ImportError` there.
 
 ```python
 from nautilus_trader.model.data import DataType

@@ -10,6 +10,12 @@ port, not a version bump.
 seen, is in [validation.md](validation.md) per capability. Re-test your own
 strategy after the port.
 
+This page compares two releases: `0.1.0` and `0.2.0a1`. Every version it names
+below is one of those two, and none of them moves. The default branch is ahead
+of `0.2.0a1` and reports `0.2.0a2.dev0`; every change described here applies to
+it as well, and what it adds beyond the release is in the
+[changelog](../CHANGELOG.md) under `[Unreleased]`.
+
 Read this page in full first. Most of these changes fail loudly: an
 `ImportError`, a `TypeError` from a constructor, a `ValueError` raised before
 any network activity. Four do not. The execution environment default (§1), the
@@ -52,6 +58,10 @@ To stay on it, pin the tag:
 ```bash
 pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter@v0.1.0"
 ```
+
+To move off it, see the README's
+[requirements and installation](../README.md#requirements-and-installation),
+which gives both the branch and the pinned `v0.2.0a1` release.
 
 The full record of what changed is in the
 [changelog](../CHANGELOG.md).

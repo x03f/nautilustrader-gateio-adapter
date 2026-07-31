@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A build of this branch reports `0.2.0a2.dev0`. Everything in this section is on
+the branch and in no released version; `0.2.0a1` is below.
+
 This round closes hooks the adapter had left to the base class, where the base
 class does not fail cleanly: `LiveMarketDataClient` records a subscription before
 it starts the task that raises `NotImplementedError`, so an unimplemented hook
@@ -143,6 +146,17 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
 
 ### Changed
 
+- **The branch no longer reports the released version.** `pyproject.toml` and
+  `nautilus_gateio.__version__` carry `0.2.0a2.dev0`: a
+  [PEP 440](https://peps.python.org/pep-0440/) developmental release of the next
+  alpha, which sorts after the `0.2.0a1` release and before any `0.2.0a2`.
+  Before this, a build from the branch and a build from the `v0.2.0a1` tag both
+  answered `0.2.0a1`, so a bug report could not say which code it was about and
+  only `pip freeze` could tell them apart. `docs/releasing.md` now carries the
+  procedure that keeps the two distinct: drop the `.dev` segment to cut the
+  release, and bump the branch to the next `.dev0` immediately after tagging.
+  The tag `v0.2.0a1` and its published artefacts are unchanged.
+
 - The market-data, products and execution pages and the README matrices state
   what is now implemented, with the mainnet column empty for all of it. The
   passage explaining that `subscribe_order_book_depth` is unimplemented is gone;
@@ -201,10 +215,11 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
 
 - **The README says which build its install line gives.** That line installs the
   default branch; the pinned line for the published release is now next to it,
-  along with the fact that the name is not a PyPI name and that both builds
-  report `0.2.0a1`, so only `pip freeze` and its commit tell them apart. The
-  `GateioTicker` snippet carries the same warning where it is used rather than
-  only in Status.
+  along with the fact that neither the name nor the version resolves on PyPI. The
+  branch and the release no longer report the same version — the branch carries a
+  development version — and `pip freeze` still names the commit, which is what
+  identifies a branch build. The `GateioTicker` snippet carries the same warning
+  where it is used rather than only in Status.
 
 - **The declarative example no longer makes the mistake its own pages warn
   about.** It set `environment` on the execution client and left it off the data

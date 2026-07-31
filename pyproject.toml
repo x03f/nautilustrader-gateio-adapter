@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nautilustrader-gateio-adapter"
-version = "0.2.0a1"
+version = "0.2.0a2.dev0"
 description = "Community-maintained Gate.io adapter for NautilusTrader: spot, margin, perpetual, delivery and options market data and execution over REST and WebSocket"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"

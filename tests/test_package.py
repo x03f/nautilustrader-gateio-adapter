@@ -23,6 +23,7 @@ import importlib
 import json
 import os
 import pkgutil
+import re
 import shutil
 import subprocess
 import sys
@@ -232,6 +233,27 @@ class TestPublicApi:
     def test_version_matches_pyproject(self):
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         assert nautilus_gateio.__version__ == pyproject["project"]["version"]
+
+    def test_version_is_canonical_pep440(self):
+        """The version must be spelled in PEP 440 canonical form.
+
+        The build job compares the raw string from ``pyproject.toml`` against the
+        filenames the build backend produced, and the backend writes the
+        *normalized* version into a filename. A legal but non-canonical spelling
+        such as ``0.2.0-a2.dev0`` or ``0.2.0a2.DEV0`` therefore fails the release
+        gate instead of the suite. Catch it here, where the message says why.
+        """
+        # PEP 440's own expression: "the following regular expression matches
+        # all valid version identifiers in canonical form".
+        canonical = re.compile(
+            r"^([1-9][0-9]*!)?(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))*"
+            r"((a|b|rc)(0|[1-9][0-9]*))?(\.post(0|[1-9][0-9]*))?(\.dev(0|[1-9][0-9]*))?$",
+        )
+        version = nautilus_gateio.__version__
+        assert canonical.match(version), (
+            f"{version!r} is not a canonical PEP 440 version; the wheel and sdist "
+            "filenames would not match the string in pyproject.toml"
+        )
 
     def test_version_is_exported(self):
         assert "__version__" in nautilus_gateio.__all__
