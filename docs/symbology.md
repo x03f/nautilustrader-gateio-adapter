@@ -53,7 +53,10 @@ round trip back to the API never has to reverse a transformation.
 
 ## Why perpetuals need a suffix and nothing else does
 
-Measured against the live venue:
+Measured against the live venue's listings on 2026-07-22. Gate.io lists new
+contracts continually, so read these as the survey that settled the question,
+not as today's count; the shape of the answer is what matters, and only the
+perpetual column has ever been non-zero.
 
 | Comparison                              | Colliding symbols |
 |-----------------------------------------|-------------------|
