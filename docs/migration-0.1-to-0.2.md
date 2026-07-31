@@ -42,8 +42,8 @@ Nothing was deleted. The history of the release is preserved so that a working
 deployment can stay where it is:
 
 * the `v0.1.0` tag is untouched, and its GitHub release remains published;
-* the implementation is retained on the branch `legacy/v0.1.0`, which points at
-  the same commit as the tag;
+* that tag is what retains the implementation: check it out to read or run the
+  0.1.0 code;
 * `0.1.0` receives no further changes — no fixes, no backports. It is kept
   readable, not maintained.
 

@@ -5,7 +5,7 @@
 | Version   | Status                                                                                |
 |-----------|---------------------------------------------------------------------------------------|
 | `0.2.0a1` | Current alpha. Security fixes are published against this line                         |
-| `0.1.x`   | Superseded. No fixes; preserved unchanged on the `legacy/v0.1.0` branch for reference |
+| `0.1.x`   | Superseded. No fixes; preserved unchanged at the `v0.1.0` tag for reference           |
 
 This is alpha software. Live validation reaches the market-data paths, spot
 execution, one USDT perpetual and one option contract, and no further; see

@@ -810,8 +810,8 @@ treat every capability as needing your own verification before it carries money.
 The per-capability status is in [docs/validation.md](docs/validation.md); the
 audit trail behind the code is in [docs/review-matrix.md](docs/review-matrix.md).
 
-0.1.0 remains available: its tag and release are untouched and its
-implementation is preserved on the `legacy/v0.1.0` branch.
+0.1.0 remains available: its tag and its GitHub release are untouched, and the
+`v0.1.0` tag is what preserves that implementation.
 
 ### Fixed since the 0.2.0 development line
 
