@@ -597,33 +597,51 @@ class GateioDataClient(LiveMarketDataClient):
         self._bar_flush_task = self.create_task(self._flush_bars_loop())
 
     async def _disconnect(self) -> None:
-        # Order matters, and it is the reverse of the order the resources were
-        # acquired in. `cancel_pending_tasks` is the platform's bounded teardown
-        # (live/cancellation.py): it snapshots strong references, cancels, and
-        # gathers with a timeout. Running it first means no background task is
-        # still using a socket or the HTTP pool when those are released. The base
-        # `disconnect()` calls it again once this coroutine returns, which is
-        # harmless — by then the WeakSet holds nothing pending.
-        await self.cancel_pending_tasks()
-        self._update_instruments_task = None
-        self._bar_flush_task = None
-        # The close watchers were cancelled with everything else above; dropping
-        # the handles keeps `_subscribe_instrument_close` from reporting an
-        # already-subscribed instrument after a reconnect cycle.
-        self._instrument_close_tasks.clear()
+        # First, and the only load-bearing statement here: from this line no
+        # request reaches the wire, whoever births it and whenever it wakes.
+        # `cancel_pending_tasks` below takes a *snapshot* of the registry
+        # (live/cancellation.py), so it can neither see a task born from a
+        # WebSocket frame that arrives afterwards nor stop one that is merely
+        # asleep in it; the gate covers both, and covers the instrument reload,
+        # which reaches the venue through the shared provider rather than
+        # through this client's namespaces.
+        self._http_client.stop_accepting()
+        try:
+            # The platform's bounded teardown: it snapshots strong references,
+            # cancels, and gathers with a timeout. The base `disconnect()` calls
+            # it again once this coroutine returns, which is harmless — by then
+            # the WeakSet holds nothing pending.
+            await self.cancel_pending_tasks()
+            self._update_instruments_task = None
+            self._bar_flush_task = None
+            # The close watchers were cancelled with everything else above;
+            # dropping the handles keeps `_subscribe_instrument_close` from
+            # reporting an already-subscribed instrument after a reconnect cycle.
+            self._instrument_close_tasks.clear()
 
-        for product, client in self._ws_clients.items():
-            try:
-                await client.disconnect()
-            except Exception as e:  # noqa: BLE001 - shutdown must not raise
-                self._log.warning(f"Error disconnecting {product.value} WebSocket: {e}")
-        self._ws_clients.clear()
-
-        # Released last. The transport is shared with the execution client and
-        # reference counted, so this call is what actually closes the pool when
-        # this client is the last holder; anything still in flight would see
-        # `CLIENT_CLOSED` rather than a clean cancellation.
-        await self._http_client.close()
+            # `popitem`, not `.items()`: a `_connect` still in flight inserts
+            # into this dict, and iterating it live raises `RuntimeError:
+            # dictionary changed size during iteration` past the inner `except`
+            # below, killing `_disconnect_with_cleanup` (live/data_client.py)
+            # before `cancel_pending_tasks()` and `_set_connected(False)`.
+            while self._ws_clients:
+                product, client = self._ws_clients.popitem()
+                try:
+                    await client.disconnect()
+                except Exception as e:  # noqa: BLE001 - shutdown must not raise
+                    self._log.warning(f"Error disconnecting {product.value} WebSocket: {e}")
+        except Exception as e:  # noqa: BLE001 - the platform's wrapper has no try
+            self._log.exception("Error during Gate.io data client teardown", e)
+        finally:
+            # Released last, and always. The transport is shared with the
+            # execution client and reference counted, so this call is what
+            # closes the pool when this client is the last holder. It waits
+            # briefly for whatever is already on the wire: closing the pool
+            # underneath an unanswered request makes `httpx` raise a bare
+            # `RuntimeError` that no handler here classifies (measured on httpx
+            # 0.28.1 — the older comment claiming such a request would see
+            # `CLIENT_CLOSED` was simply wrong).
+            await self._http_client.close()
 
     # -- instruments -------------------------------------------------------
 
@@ -648,6 +666,16 @@ class GateioDataClient(LiveMarketDataClient):
             except asyncio.CancelledError:
                 self._log.debug("Canceled task 'update_instruments'")
                 return
+            except GateioError as e:
+                if e.label == "CLIENT_CLOSED":
+                    # The gate is shut, so the node is stopping. This loop
+                    # reaches the venue through the *shared* instrument
+                    # provider, which is why the refusal arrives as an error
+                    # rather than as a cancellation; leave quietly instead of
+                    # turning shutdown into a wall of ERROR lines.
+                    self._log.debug("Stopping 'update_instruments': the transport is closing")
+                    return
+                self._log.error(f"Error updating instruments: {e}")
             except Exception as e:  # noqa: BLE001 - the task must survive venue errors
                 self._log.error(f"Error updating instruments: {e}")
 
@@ -1503,7 +1531,19 @@ class GateioDataClient(LiveMarketDataClient):
         A book that cannot be aligned is never abandoned: without a retry the
         subscription would stay silent for the life of the process, since every
         further notification is buffered while the book is unsynchronised.
+
+        Except while the node is stopping. The gate refuses the snapshot, that
+        refusal arrives here as a failure, and re-arming would answer it with a
+        *new* task — created after `cancel_pending_tasks` has already taken its
+        snapshot, so nothing will ever cancel it. The guard sits in this one
+        funnel rather than at the three failure branches that call it, so a
+        retry that fails again cannot re-arm itself either.
         """
+        if not self._http_client.is_accepting:
+            self._log.debug(
+                f"Not re-arming the order book retry for {instrument_id}: transport is closing",
+            )
+            return
 
         async def _retry() -> None:
             await asyncio.sleep(SNAPSHOT_RETRY_DELAY_SECS)

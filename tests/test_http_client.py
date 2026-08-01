@@ -7,10 +7,16 @@ code path only.
 The retry-safety tests are the regression cover for the finding that mutating
 requests (order submission, wallet transfer, margin borrow) were transparently
 replayed on 5xx and on network timeouts, which can execute an order twice.
+
+The teardown tests at the end are the regression cover for the transport gate:
+"stopped accepting" is a state of its own, separate from "closed", because a
+request parked in the rate limiter used to wake to a closed socket pool and
+raise a bare ``RuntimeError`` that no handler in this adapter classifies.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable
 from typing import Any
@@ -795,3 +801,356 @@ async def test_async_context_manager_acquires_and_closes():
 
     assert client.is_closed is True
     assert client._client.is_closed is True
+
+
+# -- the transport gate: nothing leaves the process once teardown begins ------
+#
+# Every "nothing was sent" assertion below carries a positive control: the same
+# spy transport records a request while the gate is open, so an assertion of
+# `len(log) == 1` cannot be satisfied by a spy that was never wired up.
+
+CANCEL_PARAMS: dict[str, Any] = {"contract": "BTC_USDT"}
+CANCELLED = {"id": "1001", "status": "cancelled"}
+
+
+class _ParkingLimiter:
+    """A limiter that can hold one acquisition open, as pacing and 429 backoff do.
+
+    This is the window the gate exists for: the request has passed every entry
+    check in ``request()`` and owns no connection yet.
+    """
+
+    def __init__(self) -> None:
+        self.acquired = 0
+        self.backoff = 0.0
+        self.parked = asyncio.Event()
+        self.released = asyncio.Event()
+        self.park_next = False
+
+    async def acquire(self) -> None:
+        self.acquired += 1
+        if self.park_next:
+            self.park_next = False
+            self.parked.set()
+            await self.released.wait()
+
+    def on_rate_limited(self) -> None:
+        self.backoff = 0.5
+
+    def on_success(self) -> None:
+        self.backoff = 0.0
+
+
+async def test_a_cancel_parked_in_the_limiter_is_refused_rather_than_sent():
+    """T1. The node stops while a cancel waits its turn in the rate limiter.
+
+    On ``main`` this request wakes to a socket pool that has already been
+    closed, and ``httpx`` raises ``RuntimeError("Cannot send a request, as the
+    client has been closed.")``. That is not an ``httpx.HTTPError``, so the
+    attempt loop never sees it, nothing classifies it, and the callers that
+    catch only ``GateioError`` let it out raw — a cancel sweep that reports
+    success while the order is still live.
+    """
+    log: list[httpx.Request] = []
+    client = make_client(
+        counting_handler([httpx.Response(200, json=CANCELLED)], log),
+        api_key="k",
+        api_secret="s",
+    )
+    limiter = _ParkingLimiter()
+    client._limiter = limiter  # type: ignore[assignment]
+
+    # Positive control: this very spy records a cancel while the gate is open.
+    assert await client.delete("/futures/usdt/orders/1000", params=CANCEL_PARAMS) == CANCELLED
+    assert len(log) == 1
+
+    limiter.park_next = True
+    parked = asyncio.ensure_future(
+        client.delete("/futures/usdt/orders/1001", params=CANCEL_PARAMS),
+    )
+    await asyncio.wait_for(limiter.parked.wait(), timeout=2.0)
+
+    await client.close()  # the node stops while the cancel is still parked
+    limiter.released.set()
+
+    with pytest.raises(GateioError) as excinfo:
+        await parked
+
+    assert excinfo.value.label == "CLIENT_CLOSED"
+    assert not isinstance(excinfo.value, GateioRequestAmbiguousError), (
+        "no byte of this request left the process, so the outcome is definitive"
+    )
+    assert len(log) == 1, "a request reached the wire after the transport was released"
+
+
+async def test_a_gate_closed_between_attempts_reports_an_unknown_outcome():
+    """T2. Attempt 1 reached the venue; the node stops before attempt 2.
+
+    ``CLIENT_CLOSED`` would be a lie here and an expensive one:
+    ``is_ambiguous_outcome`` treats a plain ``GateioError`` as definitive, so a
+    cancel Gate.io may already have applied would be answered with
+    ``OrderCancelRejected``.
+    """
+    from nautilus_gateio.execution import is_ambiguous_outcome
+
+    log: list[httpx.Request] = []
+    client = make_client(
+        counting_handler([httpx.ReadError("connection reset by peer")], log),
+        api_key="k",
+        api_secret="s",
+        max_retries=3,
+    )
+
+    async def _retry_delay(attempt: int) -> None:
+        await client.close()  # the node stops during the retry backoff
+
+    client._retry_delay = _retry_delay  # type: ignore[assignment]
+
+    with pytest.raises(GateioRequestAmbiguousError) as excinfo:
+        await client.delete("/futures/usdt/orders/1001", params=CANCEL_PARAMS)
+
+    assert len(log) == 1
+    assert excinfo.value.label == "REQUEST_AMBIGUOUS"
+    assert "reconcile" in excinfo.value.message
+    assert is_ambiguous_outcome(excinfo.value) is True
+
+
+async def test_closing_one_owner_gates_the_transport_for_every_other_owner():
+    """T3. The gate is global to the shared transport, on purpose and by design.
+
+    The data client, the execution client and the instrument provider share one
+    transport, and the background work that has to be stopped — the instrument
+    reload — reaches the venue through the shared provider rather than through
+    any one client's namespaces. A gate scoped to an owner would not cover it.
+    The cost is stated here and in ``docs/architecture.md``: a component that
+    stops on its own mutes REST for the others. NautilusTrader's engines
+    disconnect all of their clients together, so this is the hand-written
+    ``disconnect()`` case, not the node-shutdown case.
+    """
+    log: list[httpx.Request] = []
+    client = make_client(counting_handler([httpx.Response(200, json={"server_time": 1})], log))
+    client.acquire()  # data client
+    client.acquire()  # execution client
+
+    # Positive control: the spy records traffic while both owners are running.
+    assert await client.get("/spot/time") == {"server_time": 1}
+    assert len(log) == 1
+
+    await client.close()  # the data client stops first
+
+    assert client.owner_count == 1
+    assert client.is_closed is False, "the pool must survive while an owner holds it"
+    assert client.is_accepting is False
+
+    with pytest.raises(GateioError) as excinfo:
+        await client.get("/spot/time")
+
+    assert excinfo.value.label == "CLIENT_CLOSED"
+    assert len(log) == 1
+
+
+async def test_close_waits_for_the_request_already_on_the_wire():
+    """T4. A cancel on the wire gets the venue's real answer, not a guess.
+
+    Without the drain the pool is torn down under it and the caller is handed
+    ``REQUEST_AMBIGUOUS`` for an order the venue had in fact cancelled — the
+    reconciliation that resolves ambiguity cannot run, because the node is
+    stopping.
+    """
+    journal: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, json=CANCELLED)
+
+    client = make_client(handler, api_key="k", api_secret="s")
+
+    async def _cancel() -> None:
+        payload = await client.delete("/futures/usdt/orders/1001", params=CANCEL_PARAMS)
+        journal.append(f"answered:{payload['status']}")
+
+    async def _teardown() -> None:
+        await asyncio.sleep(0.02)
+        await client.close()
+        journal.append("closed")
+
+    started = time.monotonic()
+    await asyncio.gather(_cancel(), _teardown())
+    elapsed = time.monotonic() - started
+
+    assert journal == ["answered:cancelled", "closed"], (
+        f"close() did not wait for the request already on the wire: {journal}"
+    )
+    assert elapsed >= 0.25
+
+
+async def test_close_gives_up_on_a_venue_that_never_answers():
+    """T5. The drain is bounded, and what breaks out of it is still classified.
+
+    The transport models what a real socket does, which is what the platform's
+    own budget assumes: the venue never answers, ``aclose()`` breaks the pending
+    read, and ``httpx`` reports ``ReadError`` (measured on httpx 0.28.1 — an
+    ``httpx.HTTPError``, and not one of ``_UNSENT_ERRORS``, so it classifies as
+    "reached the venue"). What the caller must never see is a raw
+    ``RuntimeError``.
+    """
+
+    class _NeverAnswering(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.requests: list[httpx.Request] = []
+            self.torn_down = asyncio.Event()
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            await self.torn_down.wait()
+            raise httpx.ReadError("the connection was closed while awaiting the response")
+
+        async def aclose(self) -> None:
+            self.torn_down.set()
+
+    transport = _NeverAnswering()
+    client = GateioHttpClient(api_key="k", api_secret="s", max_retries=3)
+    client._client = httpx.AsyncClient(transport=transport, base_url=GATEIO_HTTP_MAINNET)
+    client._limiter = _RecordingLimiter()  # type: ignore[assignment]
+
+    async def _retry_delay(attempt: int) -> None:
+        return None
+
+    client._retry_delay = _retry_delay  # type: ignore[assignment]
+
+    cancel = asyncio.ensure_future(
+        client.delete("/futures/usdt/orders/1001", params=CANCEL_PARAMS),
+    )
+    while not transport.requests:
+        await asyncio.sleep(0)
+
+    started = time.monotonic()
+    await client.close()
+    elapsed = time.monotonic() - started
+
+    # What the caller is handed matters more than the timing: a raw
+    # `RuntimeError` is the failure this whole change exists to remove.
+    with pytest.raises(GateioError) as excinfo:
+        await cancel
+
+    assert isinstance(excinfo.value, GateioRequestAmbiguousError)
+    assert len(transport.requests) == 1
+    # The bound is the platform's own budget for external connections, 2 s. The
+    # node's whole disconnect budget is 10 s and the sockets already spend up to
+    # 5 s each, so a drain that helped itself to more would be the drop that
+    # prints "Timed out waiting for engines to disconnect".
+    assert 1.5 <= elapsed <= 3.5, f"the drain was not bounded by the platform budget: {elapsed}"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (httpx.Response(400, json={"label": "INVALID_PARAM_VALUE", "message": "bad"}), GateioError),
+        (httpx.ReadTimeout("timed out"), GateioRequestAmbiguousError),
+    ],
+    ids=["venue-refusal", "answer-never-arrived"],
+)
+async def test_a_failed_request_leaves_no_drain_owing(failure: Any, expected: type):
+    """T6. The in-flight count is released on every exit, not just the happy one.
+
+    A counter left standing after a failure is a silent defect: nothing is
+    wrong until the node stops, and then every shutdown pays the full drain
+    timeout for a transport that has nothing on the wire.
+    """
+    log: list[httpx.Request] = []
+    client = make_client(counting_handler([failure], log), api_key="k", api_secret="s")
+
+    with pytest.raises(expected):
+        await client.post("/spot/orders", body=ORDER_BODY)
+
+    started = time.monotonic()
+    await client.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5, f"close() waited for a request that had already failed: {elapsed}"
+    assert len(log) == 1
+
+
+async def test_the_gate_is_read_with_no_await_left_before_the_send():
+    """T7. The check is the last statement before the send, and must stay there.
+
+    The guarantee is not the check itself but its position: on a single-threaded
+    loop, "gate open" and "request sent" are one step only while nothing between
+    them can yield. ``_build_headers`` is the nearest neighbour, so it is where
+    the stop is driven from. Moving the check one line up makes this fail.
+    """
+    log: list[httpx.Request] = []
+    client = make_client(
+        counting_handler([httpx.Response(200, json=CANCELLED)], log),
+        api_key="k",
+        api_secret="s",
+    )
+
+    # Positive control: this spy records a cancel while the gate is open.
+    assert await client.delete("/futures/usdt/orders/1000", params=CANCEL_PARAMS) == CANCELLED
+    assert len(log) == 1
+
+    build_headers = client._build_headers
+
+    def _stop_while_building(*args: Any, **kwargs: Any) -> Any:
+        client.stop_accepting()
+        return build_headers(*args, **kwargs)
+
+    client._build_headers = _stop_while_building  # type: ignore[assignment]
+
+    with pytest.raises(GateioError) as excinfo:
+        await client.delete("/futures/usdt/orders/1001", params=CANCEL_PARAMS)
+
+    assert excinfo.value.label == "CLIENT_CLOSED"
+    assert len(log) == 1, "the request was sent although the gate shut while headers were built"
+
+
+async def test_stop_accepting_is_idempotent_and_sticky():
+    """The verb behaves as NautilusTrader's own ``cancel_all_requests()`` does."""
+    client = make_client(lambda r: httpx.Response(200, json={}))
+
+    assert client.is_accepting is True
+    client.stop_accepting()
+    client.stop_accepting()
+    assert client.is_accepting is False
+    assert client.is_closed is False, "the gate is not the pool"
+
+    await client.close()
+    assert client.is_accepting is False
+
+
+async def test_the_factory_replaces_a_gated_transport_that_still_has_owners():
+    """T12. "Spent" is two states now, and the factory has to know both.
+
+    A client that stops while another still holds a reference leaves the cached
+    transport gated with ``owner_count`` above zero and nothing closed. A
+    factory that checks only ``is_closed`` hands the next node in the process a
+    live-looking transport that refuses every request.
+    """
+    from nautilus_gateio import factories
+
+    first = factories.get_cached_gateio_http_client(base_url=GATEIO_HTTP_MAINNET)
+    first.acquire()  # data client
+    first.acquire()  # execution client
+    await first.close()  # the data client stops first
+
+    assert first.owner_count == 1
+    assert first.is_closed is False
+    assert first.is_accepting is False
+
+    second = factories.get_cached_gateio_http_client(base_url=GATEIO_HTTP_MAINNET)
+
+    assert second is not first
+    assert second.is_accepting is True
+    assert second.is_closed is False
+
+    log: list[httpx.Request] = []
+    second._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(counting_handler([httpx.Response(200, json={"a": 1})], log)),
+        base_url=GATEIO_HTTP_MAINNET,
+    )
+    assert await second.get("/spot/time") == {"a": 1}
+    assert len(log) == 1
+
+    await first._client.aclose()
+    await second.close()

@@ -15,6 +15,7 @@ import asyncio
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
@@ -43,11 +44,19 @@ from nautilus_trader.model.instruments import Instrument
 
 from nautilus_gateio import data as data_module
 from nautilus_gateio.books import GateioOrderBook
-from nautilus_gateio.common.constants import GATEIO_CLIENT_ID, GATEIO_VENUE
+from nautilus_gateio.common.constants import (
+    GATEIO_CLIENT_ID,
+    GATEIO_HTTP_MAINNET,
+    GATEIO_VENUE,
+)
 from nautilus_gateio.common.enums import GateioProductType
 from nautilus_gateio.common.errors import GateioClientError
 from nautilus_gateio.config import ORDER_BOOK_UPDATE_INTERVALS_MS, GateioDataClientConfig
 from nautilus_gateio.data import GateioDataClient, venue_quantity
+from nautilus_gateio.http.client import GateioHttpClient, RateLimiter
+from nautilus_gateio.http.futures import GateioFuturesHttpAPI
+from nautilus_gateio.http.options import GateioOptionsHttpAPI
+from nautilus_gateio.http.spot import GateioSpotHttpAPI
 from nautilus_gateio.instruments import (
     parse_option_instrument,
     parse_perpetual_instrument,
@@ -1579,10 +1588,15 @@ async def test_funding_rate_history_is_refused_for_a_product_without_funding(
 
 
 class _RecordingTransport:
-    """A stand-in for the shared HTTP transport that records its release."""
+    """A stand-in for the shared HTTP transport that records its teardown."""
 
     def __init__(self, journal: list[str]) -> None:
         self._journal = journal
+        self.is_accepting = True
+
+    def stop_accepting(self) -> None:
+        self.is_accepting = False
+        self._journal.append("gate")
 
     async def close(self) -> None:
         self._journal.append("http")
@@ -1652,14 +1666,19 @@ async def test_completed_background_tasks_do_not_accumulate() -> None:
 
 
 async def test_disconnect_settles_its_tasks_before_releasing_the_transports() -> None:
-    """Shutdown order is the reverse of acquisition, and it is awaited.
+    """Shutdown closes the gate first and releases the transport last.
 
-    Two properties in one sequence. The background task is cancelled *and
-    awaited* through the platform's bounded teardown rather than merely told to
-    cancel, and the shared HTTP transport - which is reference counted, so this
-    release is what closes the pool for both clients - goes last, after the
-    sockets. Releasing it first meant a request still in flight failed with
-    ``CLIENT_CLOSED`` instead of being cancelled cleanly.
+    Three properties in one sequence. The gate goes first, before anything is
+    awaited, because that is the only step that binds work this snapshot cannot
+    see. The background task is then cancelled *and awaited* through the
+    platform's bounded teardown rather than merely told to cancel. The shared
+    HTTP transport - reference counted, so this release is what closes the pool
+    for both clients - goes last, after the sockets.
+
+    The order of the last two no longer carries the guarantee, and the comment
+    that used to claim it did was false besides: closing the pool under a
+    request already on the wire does not produce ``CLIENT_CLOSED``, it produces
+    a bare ``RuntimeError`` from ``httpx`` (measured on 0.28.1).
     """
     journal: list[str] = []
     client = _client_on_the_running_loop(_RecordingTransport(journal))
@@ -1680,7 +1699,7 @@ async def test_disconnect_settles_its_tasks_before_releasing_the_transports() ->
     await client._disconnect()
 
     assert task.done(), "_disconnect returned while its background task was still pending"
-    assert journal == ["task", "ws", "http"], f"shutdown ran out of order: {journal}"
+    assert journal == ["gate", "task", "ws", "http"], f"shutdown ran out of order: {journal}"
 
 
 async def test_disconnect_leaves_the_platforms_shutdown_nothing_to_do() -> None:
@@ -1711,3 +1730,233 @@ async def test_disconnect_leaves_the_platforms_shutdown_nothing_to_do() -> None:
 
     await client.cancel_pending_tasks()
     assert [pending for pending in client._tasks if not pending.done()] == []
+
+
+# -- teardown: nothing reaches the venue once `_disconnect` has begun ---------
+#
+# The data client's teardown had two holes of its own. It released the shared
+# transport *last*, so anything still on the wire met a closed socket pool and
+# raised a bare `RuntimeError` rather than the `CLIENT_CLOSED` its own comment
+# promised; and the background work it has to stop - the instrument reload -
+# reaches the venue through the *shared* instrument provider, not through this
+# client's namespaces, so nothing scoped to this client could have stopped it.
+#
+# The gate on the transport covers both, and its position (the first statement
+# of `_disconnect`, before anything is awaited) is what makes the order of
+# everything after it immaterial. Every "nothing was sent" assertion carries a
+# positive control: the same spy must record the same call while the node runs.
+
+
+class _DataWireSpy:
+    """A real ``GateioHttpClient`` whose every send is recorded."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.transport = GateioHttpClient(max_retries=1)
+        self.transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(self._handle),
+            base_url=GATEIO_HTTP_MAINNET,
+        )
+        self.transport._limiter = RateLimiter(max_per_second=1_000.0)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.sent.append(f"{request.method} {request.url.raw_path.decode()}")
+        return httpx.Response(
+            200,
+            json={"id": 10, "current": 1, "update": 1, "bids": [], "asks": []},
+        )
+
+    def since(self, mark: int) -> list[str]:
+        return self.sent[mark:]
+
+
+def _data_client_with_a_wire_spy() -> tuple[GateioDataClient, _DataWireSpy]:
+    spy = _DataWireSpy()
+    client = _client_on_the_running_loop(spy.transport.acquire())
+    client._spot_http = GateioSpotHttpAPI(spy.transport)
+    client._options_http = GateioOptionsHttpAPI(spy.transport)
+    client._futures_http = {
+        GateioProductType.PERP: GateioFuturesHttpAPI(spy.transport, settle="usdt"),
+        GateioProductType.INVERSE: GateioFuturesHttpAPI(spy.transport, settle="btc"),
+        GateioProductType.FUT: GateioFuturesHttpAPI(spy.transport, settle="usdt", delivery=True),
+    }
+    client._books[PERP_ID] = GateioOrderBook("BTC_USDT")
+    return client, spy
+
+
+async def _settle_tasks(client: GateioDataClient, rounds: int = 400) -> None:
+    """Let every task the client scheduled run to completion."""
+    for _ in range(rounds):
+        await asyncio.sleep(0.01)
+        if not [task for task in client._tasks if not task.done()]:
+            return
+
+
+class _SlowSocket:
+    """A socket whose close takes as long as the platform allows it to.
+
+    ``cancel_tasks_with_timeout`` gives a socket's receive loop up to 5 s, and
+    the sockets are closed one after another, so this window is wide in a real
+    node. It is where a last frame arrives.
+    """
+
+    def __init__(self, delay: float = 0.05, during: Any = None) -> None:
+        self.delay = delay
+        self.during = during
+        self.disconnected = False
+
+    async def disconnect(self) -> None:
+        if self.during is not None:
+            self.during()
+        await asyncio.sleep(self.delay)
+        self.disconnected = True
+
+
+async def test_a_frame_arriving_during_teardown_cannot_resnapshot_a_book() -> None:
+    """A reconnect during teardown schedules a REST snapshot per subscribed book.
+
+    The receive loop lives in the WebSocket client's own registry, so the task
+    it creates here is born *after* ``cancel_pending_tasks`` took its snapshot,
+    against a transport that used to still be open.
+    """
+    client, spy = _data_client_with_a_wire_spy()
+
+    # Positive control: the same resync reaches the same spy while running.
+    await client._handle_ws_reconnect(GateioProductType.PERP)
+    await _settle_tasks(client)
+    assert any("order_book" in line for line in spy.sent), (
+        f"the resnapshot never reached the spy: {spy.sent}"
+    )
+    mark = len(spy.sent)
+
+    socket = _SlowSocket(
+        delay=0.05,
+        during=lambda: client.create_task(
+            client._handle_ws_reconnect(GateioProductType.PERP),
+            log_msg="late reconnect",
+        ),
+    )
+    client._ws_clients[GateioProductType.PERP] = socket  # type: ignore[assignment]
+
+    await client._disconnect()
+    await _settle_tasks(client)
+
+    assert spy.since(mark) == [], "a request left the process after `_disconnect` had begun"
+
+
+async def test_a_refused_snapshot_does_not_re_arm_itself_during_teardown() -> None:
+    """A retry armed after the snapshot is an orphan nothing will ever cancel.
+
+    ``cancel_pending_tasks`` has already taken its snapshot by then, so each
+    stopping node would leave one live task per unsynchronised book behind.
+    """
+    client, spy = _data_client_with_a_wire_spy()
+
+    # Positive control: while the node runs, a failed snapshot *is* re-armed.
+    armed: list[InstrumentId] = []
+    real_create_task = client.create_task
+
+    def _record(coro: Any, **kwargs: Any) -> Any:
+        armed.append(kwargs.get("log_msg", ""))
+        return real_create_task(coro, **kwargs)
+
+    client.create_task = _record  # type: ignore[method-assign]
+    client._schedule_book_retry(PERP_ID)
+    assert any("retry" in str(entry) for entry in armed), "the retry was never armed at all"
+    await client.cancel_pending_tasks()
+    armed.clear()
+
+    spy.transport.stop_accepting()
+    client._schedule_book_retry(PERP_ID)
+
+    assert armed == [], "a retry task was armed after the transport stopped accepting"
+
+
+async def test_the_instrument_reload_leaves_its_loop_when_the_gate_shuts() -> None:
+    """The reload reaches the venue through the *shared* provider.
+
+    That is why the gate lives on the transport rather than on the client: a
+    gate scoped to this client would not cover this loop at all. It must also
+    stop rather than log, or a node with a five-second socket teardown prints
+    one error per interval while it is shutting down.
+    """
+    client, spy = _data_client_with_a_wire_spy()
+
+    async def _initialize(reload: bool = False) -> None:
+        # What the shared provider does: it reaches the venue over the same
+        # transport, through namespaces this client never sees.
+        await spy.transport.get("/spot/currency_pairs")
+
+    client._instrument_provider.initialize = _initialize  # type: ignore[method-assign]
+    client._send_all_instruments_to_data_engine = lambda: None  # type: ignore[method-assign]
+
+    # The loop's own cadence is minutes; it is driven here at 0.05 s so the test
+    # observes several turns rather than one.
+    task = client.create_task(client._update_instruments(0.05 / 60), log_msg="update_instruments")
+    client._update_instruments_task = task
+    try:
+        # Positive control: the reload reaches the spy while the node runs.
+        for _ in range(200):
+            if len(spy.sent) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(spy.sent) >= 2, f"the reload never reached the spy: {spy.sent}"
+        mark = len(spy.sent)
+
+        spy.transport.stop_accepting()
+
+        # It leaves the loop by itself; nothing cancels it here.
+        await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+
+        assert task.done()
+        assert spy.since(mark) == []
+    finally:
+        task.cancel()
+
+
+async def test_a_connect_still_inserting_sockets_does_not_abort_teardown() -> None:
+    """``_connect`` inserts each socket into the dict before connecting it.
+
+    A teardown that starts while it is in flight iterates a dict that grows
+    underneath it: ``RuntimeError: dictionary changed size during iteration``
+    escapes the per-socket ``except`` and flies out of ``_disconnect``, and the
+    platform's ``_disconnect_with_cleanup`` has no ``try`` - so
+    ``cancel_pending_tasks()`` and ``_set_connected(False)`` never run and the
+    shared transport is never released.
+    """
+    client, spy = _data_client_with_a_wire_spy()
+    late = _SlowSocket(delay=0.0)
+    first = _SlowSocket(
+        delay=0.05,
+        during=lambda: client._ws_clients.__setitem__(GateioProductType.SPOT, late),
+    )
+    client._ws_clients[GateioProductType.PERP] = first  # type: ignore[assignment]
+    owners = spy.transport.owner_count
+
+    await client._disconnect()
+
+    assert spy.transport.owner_count == owners - 1, "the shared transport was never released"
+    assert first.disconnected and late.disconnected, "a socket was left open"
+    assert client._ws_clients == {}
+
+
+async def test_a_cancelled_teardown_still_releases_the_transport() -> None:
+    """``CancelledError`` is not an ``Exception``; only ``finally`` catches it.
+
+    The node's disconnect budget is bounded, so the teardown task can be
+    cancelled from outside. Releasing the transport in the body rather than in
+    ``finally`` would pin the shared pool open for the whole process.
+    """
+    client, spy = _data_client_with_a_wire_spy()
+
+    class _Cancelled:
+        async def disconnect(self) -> None:
+            raise asyncio.CancelledError
+
+    client._ws_clients[GateioProductType.PERP] = _Cancelled()  # type: ignore[assignment]
+    owners = spy.transport.owner_count
+
+    with pytest.raises(asyncio.CancelledError):
+        await client._disconnect()
+
+    assert spy.transport.owner_count == owners - 1, "a cancelled teardown leaked the transport"

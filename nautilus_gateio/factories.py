@@ -92,12 +92,18 @@ def get_cached_gateio_http_client(
     timeout_secs: float = DEFAULT_HTTP_TIMEOUT_SECS,
     max_retries: int = 3,
 ) -> GateioHttpClient:
-    """Return the shared :class:`GateioHttpClient`, rebuilding a closed one.
+    """Return the shared :class:`GateioHttpClient`, rebuilding a spent one.
 
     The transport is shared and reference counted, so it is closed when the last
     client releases it on shutdown. Within one process a second trading node can
-    then ask for it again; handing back the closed instance would fail on its
-    first request, so a closed entry is dropped and rebuilt instead.
+    then ask for it again; handing back the spent instance would fail on its
+    first request, so it is dropped and rebuilt instead.
+
+    "Spent" is two states, not one. A transport that has stopped accepting is
+    just as unusable as a closed one, and a client that stops while another
+    still holds a reference leaves exactly that: gated, with ``owner_count``
+    above zero and nothing closed. Checking only ``is_closed`` would hand the
+    next node a live-looking transport that refuses every request.
 
     See :func:`_cached_gateio_http_client` for the parameters.
     """
@@ -108,7 +114,7 @@ def get_cached_gateio_http_client(
         timeout_secs=timeout_secs,
         max_retries=max_retries,
     )
-    if client.is_closed:
+    if client.is_closed or not client.is_accepting:
         _cached_gateio_http_client.cache_clear()
         client = _cached_gateio_http_client(
             api_key=api_key,

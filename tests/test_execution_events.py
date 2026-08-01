@@ -13,6 +13,7 @@ import time
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 from nautilus_trader.model.enums import (
     OrderSide,
@@ -30,8 +31,15 @@ from nautilus_trader.model.identifiers import TradeId, VenueOrderId
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from nautilus_trader.model.position import Position
 
+from nautilus_gateio.common.constants import GATEIO_HTTP_MAINNET
 from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
 from nautilus_gateio.common.errors import GateioClientError
+from nautilus_gateio.http.client import GateioHttpClient, RateLimiter
+from nautilus_gateio.http.futures import GateioFuturesHttpAPI
+from nautilus_gateio.http.margin import GateioMarginHttpAPI
+from nautilus_gateio.http.options import GateioOptionsHttpAPI
+from nautilus_gateio.http.spot import GateioSpotHttpAPI
+from nautilus_gateio.http.wallet import GateioWalletHttpAPI
 
 try:  # pytest inserts the tests directory on the path; support both layouts
     from tests.test_execution_orders import (
@@ -2704,3 +2712,274 @@ class TestRecoveredTradeWithoutAdoptedOrder:
         assert env.spot.called("get_order")
         assert len(mass_statuses) == 1
         assert env.reports == []
+
+
+# -- teardown: nothing reaches the venue once `_disconnect` has begun ---------
+#
+# Three shapes of work outlive the first line of `_disconnect`, and each one
+# killed an earlier attempt at fixing this:
+#
+# * a task asleep in the platform's registry - `cancel_pending_tasks` takes a
+#   snapshot and runs only *after* `_disconnect` returns
+#   (live/execution_client.py), so a poll waking inside the socket-teardown
+#   window is nobody's responsibility;
+# * a task born from a WebSocket frame that arrives *during* teardown - the
+#   receive loops live in the WebSocket clients' own registries, so no snapshot
+#   of this client's registry can contain them;
+# * a `_connect` still inserting sockets into the dict `_disconnect` is
+#   emptying.
+#
+# The guarantee here belongs to the transport, not to the order of the steps:
+# `stop_accepting()` is the first statement of `_disconnect`, and the single
+# exit onto the wire refuses everything after it. Every "nothing was sent"
+# assertion below carries a positive control - the same spy must record the
+# same call while the node is running.
+
+
+class _WireSpy:
+    """A real ``GateioHttpClient`` whose every send is recorded.
+
+    Nothing between the client and the socket is stubbed: the gate, the attempt
+    loop and the drain are the code under test, and ``sent`` is literally what
+    would have gone out.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.transport = GateioHttpClient(api_key="k", api_secret="s", max_retries=1)
+        self.transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(self._handle),
+            base_url=GATEIO_HTTP_MAINNET,
+        )
+        self.transport._limiter = RateLimiter(max_per_second=1_000.0)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.raw_path.decode()
+        self.sent.append(f"{request.method} {path}")
+        listing = any(part in path for part in ("positions", "orders", "my_trades", "candlesticks"))
+        return httpx.Response(200, json=[] if listing else {})
+
+    def since(self, mark: int) -> list[str]:
+        return self.sent[mark:]
+
+
+class _SlowWebSocket:
+    """A socket whose close takes as long as a real one may.
+
+    ``ws_client.disconnect()`` awaits ``cancel_tasks_with_timeout``, which the
+    platform allows up to ``DEFAULT_TASK_CANCELLATION_TIMEOUT`` (5 s) *per
+    socket*, one after another. That window is where a sleeping poll wakes up
+    and where a last frame arrives, so it is modelled here rather than assumed
+    away.
+    """
+
+    def __init__(self, delay: float = 0.2, during: Any = None) -> None:
+        self.delay = delay
+        self.during = during
+        self.disconnected = False
+
+    async def disconnect(self) -> None:
+        if self.during is not None:
+            self.during()
+        await asyncio.sleep(self.delay)
+        self.disconnected = True
+
+
+def _exec_on_the_running_loop(**kwargs: Any) -> tuple[ExecHarness, _WireSpy]:
+    """An execution client bound to the running loop, on a recorded transport."""
+    env = ExecHarness(loop=asyncio.get_running_loop(), **kwargs)
+    spy = _WireSpy()
+    client = env.client
+    client._http_client = spy.transport.acquire()
+    client._spot_http = GateioSpotHttpAPI(spy.transport)
+    client._margin_http = GateioMarginHttpAPI(spy.transport)
+    client._options_http = GateioOptionsHttpAPI(spy.transport)
+    client._wallet_http = GateioWalletHttpAPI(spy.transport)
+    client._futures_http = {
+        GateioProductType.PERP: GateioFuturesHttpAPI(spy.transport, settle="usdt"),
+        GateioProductType.INVERSE: GateioFuturesHttpAPI(spy.transport, settle="btc"),
+        GateioProductType.FUT: GateioFuturesHttpAPI(spy.transport, settle="usdt", delivery=True),
+    }
+    return env, spy
+
+
+async def _settle(client: Any, rounds: int = 60) -> None:
+    """Let every task the client scheduled run to completion."""
+    for _ in range(rounds):
+        pending = [task for task in client._tasks if not task.done()]
+        if not pending:
+            await asyncio.sleep(0.01)
+            if not [task for task in client._tasks if not task.done()]:
+                return
+        await asyncio.sleep(0.01)
+
+
+async def _wait_for_wire(spy: _WireSpy, rounds: int = 200) -> None:
+    for _ in range(rounds):
+        if spy.sent:
+            return
+        await asyncio.sleep(0.01)
+
+
+async def test_a_sleeping_account_poll_cannot_reach_the_venue_during_teardown():
+    """T8. The input that killed the quiesce-the-handlers attempt.
+
+    The poll sleeps in the platform's task registry. ``_disconnect`` does not
+    cancel it - only ``cancel_pending_tasks()`` does, and the platform runs that
+    *after* ``_disconnect`` returns - so it wakes inside the window where the
+    sockets are being closed and asks for the wallets. Measured on that branch
+    as ``.../futures/usdt/accounts`` going out after teardown had begun.
+    """
+    env, spy = _exec_on_the_running_loop(products=(GateioProductType.PERP,))
+    poll = env.client.create_task(
+        env.client._poll_account_state(0.05),
+        log_msg="poll_account_state",
+    )
+    try:
+        # Positive control: the same spy records the same poll while running.
+        await _wait_for_wire(spy)
+        assert spy.sent, "the poll never reached the spy; 'nothing was sent' would prove nothing"
+        assert any("/futures/usdt/accounts" in line for line in spy.sent)
+        mark = len(spy.sent)
+
+        env.client._ws_clients[GateioProductType.PERP] = _SlowWebSocket(delay=0.3)
+
+        await env.client._disconnect()
+        await asyncio.sleep(0.05)
+
+        assert spy.since(mark) == [], "a request left the process after `_disconnect` had begun"
+    finally:
+        poll.cancel()
+
+
+async def test_the_account_poll_leaves_its_loop_when_the_gate_shuts():
+    """T13. A refused poll must stop polling, not log and spin.
+
+    Without this the shutdown of a node with a 5 s socket teardown prints one
+    error per poll interval per product, and real incidents are lost in it.
+    """
+    env, spy = _exec_on_the_running_loop(products=(GateioProductType.PERP,))
+    poll = env.client.create_task(
+        env.client._poll_account_state(0.05),
+        log_msg="poll_account_state",
+    )
+    try:
+        await _wait_for_wire(spy)
+        assert spy.sent
+        mark = len(spy.sent)
+
+        spy.transport.stop_accepting()
+
+        # It returns by itself; nothing cancels it here.
+        await asyncio.wait_for(asyncio.shield(poll), timeout=3.0)
+
+        assert poll.done()
+        assert spy.since(mark) == []
+    finally:
+        poll.cancel()
+
+
+async def test_a_frame_arriving_during_teardown_cannot_start_a_venue_sweep():
+    """T9. The input that killed the cancel-tasks-first attempt.
+
+    A private socket reconnects while it is being closed. The handler is
+    synchronous and schedules the reconnect sweep through ``create_task``, so
+    the task is born *after* ``cancel_pending_tasks`` took its snapshot.
+    Measured on that branch as ``.../futures/usdt/orders?status=finished``
+    going out after teardown had begun.
+    """
+    env, spy = _exec_on_the_running_loop(products=(GateioProductType.PERP,))
+
+    # Positive control: the same sweep reaches the same spy while running.
+    env.client._handle_ws_reconnect(GateioProductType.PERP)
+    await _settle(env.client)
+    assert any("/futures/usdt/orders" in line for line in spy.sent), (
+        f"the reconnect sweep never reached the spy: {spy.sent}"
+    )
+    mark = len(spy.sent)
+
+    env.client._ws_clients[GateioProductType.PERP] = _SlowWebSocket(
+        delay=0.2,
+        during=lambda: env.client._handle_ws_reconnect(GateioProductType.PERP),
+    )
+
+    await env.client._disconnect()
+    await _settle(env.client)
+
+    assert spy.since(mark) == [], "a request left the process after `_disconnect` had begun"
+
+
+async def test_a_connect_still_inserting_sockets_does_not_abort_teardown():
+    """T10. The second way the quiesce attempt failed, and it was the expensive one.
+
+    ``_connect`` runs as a task and inserts each socket into ``_ws_clients``
+    before connecting it, so a teardown that starts while it is in flight
+    iterates a dict that grows underneath it. ``RuntimeError: dictionary changed
+    size during iteration`` is not caught by the per-socket ``except`` and flies
+    out of ``_disconnect``, and the platform's wrapper has no ``try``: neither
+    ``cancel_pending_tasks()`` nor ``_set_connected(False)`` runs, the client
+    reports ``is_connected`` forever, and the shared transport's refcount never
+    reaches zero - so the pool never closes for *any* client.
+    """
+    env, spy = _exec_on_the_running_loop(products=(GateioProductType.PERP,))
+    late = _SlowWebSocket(delay=0.0)
+    first = _SlowWebSocket(
+        delay=0.05,
+        during=lambda: env.client._ws_clients.__setitem__(GateioProductType.SPOT, late),
+    )
+    env.client._ws_clients[GateioProductType.PERP] = first
+    env.client._set_connected(True)
+    owners = spy.transport.owner_count
+
+    env.client.disconnect()  # the platform's own wrapper, which has no `try`
+
+    for _ in range(300):
+        if not env.client.is_connected:
+            break
+        await asyncio.sleep(0.01)
+
+    assert env.client.is_connected is False, "`_disconnect` raised past the platform's wrapper"
+    assert spy.transport.owner_count == owners - 1, "the shared transport was never released"
+    assert first.disconnected and late.disconnected, "a socket was left open"
+    assert env.client._ws_clients == {}
+
+
+async def test_a_socket_that_fails_to_close_still_releases_the_transport():
+    """T11a. A raising ``disconnect()`` is reported, not propagated."""
+    env, spy = _exec_on_the_running_loop(products=(GateioProductType.PERP,))
+
+    class _Raising:
+        async def disconnect(self) -> None:
+            raise RuntimeError("the socket was already gone")
+
+    env.client._ws_clients[GateioProductType.PERP] = _Raising()
+    owners = spy.transport.owner_count
+
+    await env.client._disconnect()
+
+    assert spy.transport.owner_count == owners - 1
+    assert env.client._ws_clients == {}
+
+
+async def test_a_cancelled_teardown_still_releases_the_transport():
+    """T11b. ``CancelledError`` is not an ``Exception``; only ``finally`` catches it.
+
+    The teardown task can be cancelled from outside - the node's disconnect
+    budget is bounded (``timeout_disconnection``) - and a socket close that is
+    cancelled mid-await raises straight through every ``except Exception``. If
+    the transport were released in the body rather than in ``finally``, that one
+    cancellation would pin the shared pool open for the whole process.
+    """
+    env, spy = _exec_on_the_running_loop(products=(GateioProductType.PERP,))
+
+    class _Cancelled:
+        async def disconnect(self) -> None:
+            raise asyncio.CancelledError
+
+    env.client._ws_clients[GateioProductType.PERP] = _Cancelled()
+    owners = spy.transport.owner_count
+
+    with pytest.raises(asyncio.CancelledError):
+        await env.client._disconnect()
+
+    assert spy.transport.owner_count == owners - 1, "a cancelled teardown leaked the transport"

@@ -92,6 +92,40 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
 
 ### Fixed
 
+- **Shutdown put requests on the wire, and broke the ones already on it.** Two
+  faults with one cause: "the transport is closed" was the only shutdown state
+  there was. A request that had passed the closed check and was waiting in the
+  rate limiter woke to a closed `httpx` pool and raised
+  `RuntimeError("Cannot send a request, as the client has been closed.")` — not
+  an `httpx.HTTPError`, so the attempt loop never saw it, nothing classified it,
+  and call sites that catch only `GateioError` let it out raw. A cancel that
+  ended this way looked like a swept order that was in fact still live. And
+  because the data client released the transport *last*, work that started after
+  teardown began — a reconnect sweep from a frame arriving while the sockets were
+  closing, a sleeping account poll, an instrument reload going through the shared
+  provider, a re-armed order book snapshot — went out to the venue during
+  shutdown. `GateioHttpClient` now has a gate (`stop_accepting()` /
+  `is_accepting`) separate from the pool, closed as the first statement of both
+  clients' `_disconnect`; the single exit onto the wire refuses everything after
+  it, with `CLIENT_CLOSED` when no byte was sent and `REQUEST_AMBIGUOUS` when an
+  earlier attempt had already reached the venue. Requests already in flight are
+  now drained (bounded by the platform's 2 s budget for external connections)
+  before the pool closes, so a cancel on the wire gets the venue's real answer.
+  The comment in `data.py` claiming an in-flight request would see `CLIENT_CLOSED`
+  was false and is gone.
+
+- **A teardown that raised left the client connected and the pool pinned open.**
+  Both clients iterated `_ws_clients` while a `_connect` still in flight could
+  insert into it, which raises `RuntimeError: dictionary changed size during
+  iteration` past the per-socket `except`. NautilusTrader's
+  `_disconnect_with_cleanup` has no `try`, so that killed it before
+  `cancel_pending_tasks()` and `_set_connected(False)`: the client reported
+  `is_connected` forever, a socket stayed open, and the shared transport's
+  refcount never reached zero — meaning the pool never closed for *any* client.
+  The dict is now drained with `popitem()`, the body is wrapped, and the
+  transport is released in a `finally`, so even a cancelled teardown gives it
+  back.
+
 - **A published `GateioTicker` reached no subscriber.** The row was handed to
   `_handle_data` unwrapped, and `DataEngine` dispatches a venue-native type only
   through `CustomData`: anything else falls to `Cannot handle data: unrecognized
@@ -145,6 +179,21 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   the configured host resolves.
 
 ### Changed
+
+- **Breaking for anyone calling `GateioHttpClient.close()` directly.** It now
+  does two things it did not do before, and both are observable to other holders
+  of the same transport. It closes the gate **unconditionally**, even when the
+  caller is not the last owner: after any owner's `close()`, every other owner's
+  requests fail with `CLIENT_CLOSED` on a transport whose `is_closed` is still
+  `False`. And the last owner's call now waits up to 2 s for requests already on
+  the wire before tearing the pool down, so `close()` is no longer instant.
+  The gate is sticky — a transport that has stopped accepting never resumes, and
+  the cached factory entry is discarded and rebuilt when it is closed **or** no
+  longer accepting. Under NautilusTrader none of this is visible: the engines
+  disconnect all of their clients together and the kernel disconnects both
+  engines in succession, after the farewell cancels have run. Code that
+  disconnects one client by hand while another goes on trading is affected; see
+  `docs/architecture.md`, "Two shutdown states".
 
 - **The branch no longer reports the released version.** `pyproject.toml` and
   `nautilus_gateio.__version__` carry `0.2.0a2.dev0`: a

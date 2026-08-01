@@ -61,12 +61,14 @@ offset, because an unsynchronised clock would otherwise expire valid requests.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from types import TracebackType
 from typing import Any, Final
 
 import httpx
+from nautilus_trader.live.cancellation import DEFAULT_FUTURE_CANCELLATION_TIMEOUT
 
 from nautilus_gateio.common.constants import (
     DEFAULT_HTTP_TIMEOUT_SECS,
@@ -183,6 +185,22 @@ class GateioHttpClient:
     :meth:`close` is idempotent and safe to call from a client that never
     acquired.
 
+    Shutdown has **two** states, not one, and they are deliberately separate:
+
+    * *accepting* (:attr:`is_accepting`, closed by :meth:`stop_accepting`) is
+      the gate — "no further request will leave this process". It is synchronous,
+      sticky and global to the transport;
+    * *closed* (:attr:`is_closed`, set by the last :meth:`close`) is the socket
+      pool — "there are no connections left".
+
+    Conflating the two is what made teardown leak. A request already parked in
+    the rate limiter has passed every entry check; when the pool was closed
+    underneath it, ``httpx`` raised a bare ``RuntimeError`` ("Cannot send a
+    request, as the client has been closed."), which is *not* an
+    ``httpx.HTTPError``, so the attempt loop in :meth:`request` never saw it,
+    never retried and never classified it. The gate refuses that request before
+    the send instead, with a typed adapter error.
+
     Parameters
     ----------
     api_key, api_secret : str
@@ -227,8 +245,48 @@ class GateioHttpClient:
         self._clock_synced = False
         self._owners = 0
         self._closed = False
+        #: The gate. `False` means no further request leaves this process.
+        self._accepting = True
+        #: Requests currently between `self._client.request(...)` and its return.
+        self._inflight = 0
+        #: Set exactly while `_inflight` is zero, so `close` can await quiet.
+        self._drained = asyncio.Event()
+        self._drained.set()
 
     # -- lifecycle ---------------------------------------------------------
+
+    def stop_accepting(self) -> None:
+        """Close the gate: no further request leaves this process.
+
+        Synchronous, idempotent, never raises, and **sticky** — there is no
+        ``reopen()``. NautilusTrader's own adapters expose the same verb as
+        ``cancel_all_requests()`` (``adapters/bybit/execution.py``,
+        ``adapters/okx/execution.py``, ``adapters/kraken/data.py``,
+        ``adapters/bitmex/data.py``) and it is sticky there too.
+
+        This is the first statement of both clients' ``_disconnect``, which is
+        what makes the *order* of everything below it immaterial: whoever births
+        a request during teardown — a WebSocket frame, a sleeping poller, a
+        retry armed before the stop — meets the gate rather than a half-closed
+        socket pool.
+
+        The gate is **global to this transport**, which is shared by the data
+        client, the execution client and the instrument provider. A component
+        that stops therefore mutes REST for every other holder. That is what the
+        bundled adapters do (``adapters/bybit/factories.py`` hands one HTTP
+        client to both clients and both call the gate in ``_disconnect``), and it
+        is safe under NautilusTrader because the engines disconnect all of their
+        clients together (``live/data_engine.py``, ``live/execution_engine.py``)
+        and the kernel disconnects both engines in succession. Code that calls
+        ``disconnect()`` on one client by hand while another keeps trading is the
+        case this does not serve; see ``docs/architecture.md``.
+        """
+        self._accepting = False
+
+    @property
+    def is_accepting(self) -> bool:
+        """Whether the transport still lets new requests onto the wire."""
+        return self._accepting
 
     def acquire(self) -> GateioHttpClient:
         """Register an owner of this shared transport.
@@ -253,7 +311,27 @@ class GateioHttpClient:
         Idempotent: closing an already-closed client, or closing without ever
         having acquired, is a no-op rather than an error, so shutdown paths do
         not need to coordinate.
+
+        Two things happen before the pool is torn down, and both are visible to
+        every other owner:
+
+        * the gate closes unconditionally, even when this is *not* the last
+          owner, because nothing may be handed a pool that is about to
+          disappear (see :meth:`stop_accepting`);
+        * the last owner then waits, briefly, for the requests already on the
+          wire to be answered, so a cancel in flight receives the venue's real
+          answer instead of a fabricated ``REQUEST_AMBIGUOUS``. The wait is
+          bounded by NautilusTrader's own budget for external connections
+          (``DEFAULT_FUTURE_CANCELLATION_TIMEOUT``, 2 s) because the node's whole
+          disconnect budget is ``timeout_disconnection`` (10 s by default) and
+          the WebSockets already spend most of it.
+
+        Note that ``is_closed`` flips *before* the drain, so a second concurrent
+        call returns while the first is still waiting for ``aclose()``. Callers
+        that need "the pool is gone" must await the call that owns the close.
         """
+        # The gate always precedes the pool.
+        self.stop_accepting()
         if self._owners > 0:
             self._owners -= 1
             if self._owners > 0:
@@ -261,6 +339,8 @@ class GateioHttpClient:
         if self._closed:
             return
         self._closed = True
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._drained.wait(), DEFAULT_FUTURE_CANCELLATION_TIMEOUT)
         await self._client.aclose()
 
     @property
@@ -370,11 +450,11 @@ class GateioHttpClient:
         `Retry safety`_. A mutating request whose outcome is unknown raises
         :class:`GateioRequestAmbiguousError`.
         """
-        if self._closed:
+        if self._closed or not self._accepting:
             raise GateioError(
                 0,
                 "CLIENT_CLOSED",
-                "the GateioHttpClient has been closed; no further requests are possible",
+                "the GateioHttpClient is no longer accepting requests; nothing was sent",
             )
         if signed and not self.has_credentials:
             raise GateioError(
@@ -396,13 +476,50 @@ class GateioHttpClient:
             final_attempt = attempt >= self.max_retries
             await self._limiter.acquire()
             headers = self._build_headers(method, url_path, query, payload, signed, expiring)
-            try:
-                response = await self._client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    content=payload or None,
+            # The last statement before the send, with no `await` between the two:
+            # this attempt may have slept in the limiter or in `_retry_delay`
+            # while the node started shutting down. Anything inserted in between
+            # reopens the window silently, which is why a test drives the gate
+            # shut from inside `_build_headers`.
+            if not self._accepting:
+                if reached_venue:
+                    # An earlier attempt was answered, so `CLIENT_CLOSED` would
+                    # be a lie: the execution layer treats a plain `GateioError`
+                    # as a definitive outcome and would reject a cancel Gate.io
+                    # may already have applied.
+                    raise GateioRequestAmbiguousError(
+                        0,
+                        "REQUEST_AMBIGUOUS",
+                        f"{method} {path} reached the venue and the transport stopped accepting "
+                        "before it was answered; it may or may not have been applied - "
+                        "reconcile before resubmitting",
+                    ) from last_error
+                raise GateioError(
+                    0,
+                    "CLIENT_CLOSED",
+                    f"{method} {path} was not sent: the transport stopped accepting requests "
+                    "(the client is disconnecting)",
                 )
+            try:
+                # `finally`, not the success path: a raise out of the error
+                # branches below would otherwise leave the counter up forever and
+                # make every later shutdown pay the full drain timeout in
+                # silence. The counted region is the send alone — a request
+                # parked in `_retry_delay` is not on the wire and must not hold
+                # the drain open.
+                self._inflight += 1
+                self._drained.clear()
+                try:
+                    response = await self._client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        content=payload or None,
+                    )
+                finally:
+                    self._inflight -= 1
+                    if self._inflight == 0:
+                        self._drained.set()
             except httpx.HTTPError as exc:
                 unsent = isinstance(exc, _UNSENT_ERRORS)
                 reached_venue = reached_venue or not unsent

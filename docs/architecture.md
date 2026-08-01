@@ -141,9 +141,69 @@ Shutdown is reference counted. Each owner calls `acquire()` when it takes the
 transport and `close()` when it releases it in `_disconnect`, and the underlying
 `httpx` pool is closed exactly once, by the last release. `close()` is
 idempotent and safe to call from a component that never acquired, so shutdown
-paths need no coordination. A cached entry that has been closed is discarded and
-rebuilt on the next request, because handing a closed client to a second node in
-the same process would fail on its first call.
+paths need no coordination.
+
+### Two shutdown states: the gate and the pool
+
+The transport has two states, and they are deliberately separate.
+
+* **Accepting** (`is_accepting`, closed by `stop_accepting()`) is the *gate*:
+  "no further request will leave this process". It is synchronous, idempotent,
+  never raises, and **sticky** — there is no way to reopen it. This is the same
+  verb the adapters bundled with NautilusTrader 1.230.0 expose as
+  `cancel_all_requests()` (`adapters/bybit`, `adapters/okx`, `adapters/kraken`,
+  `adapters/bitmex`), and it is sticky there too.
+* **Closed** (`is_closed`) is the *socket pool*: the last owner has released it
+  and the `httpx` client is gone.
+
+`stop_accepting()` is the first statement of both clients' `_disconnect`, before
+anything is awaited, and `close()` calls it too — even when the caller is not
+the last owner, because nothing may reach a pool that is about to disappear.
+
+The gate is what makes the *order* of the remaining teardown steps immaterial,
+which is the whole point. Work that outlives the first line of `_disconnect`
+comes in three shapes, and no ordering covers all three: a task asleep in the
+platform's registry (`cancel_pending_tasks` snapshots the registry and, per
+`live/execution_client.py`, runs only *after* `_disconnect` returns); a task born
+from a WebSocket frame that arrives while the sockets are being closed (the
+receive loops live in the WebSocket clients' own registries, which no snapshot of
+this client's registry contains); and the instrument reload, which reaches the
+venue through the *shared* instrument provider rather than through either
+client's namespaces. All three meet the same single exit onto the wire.
+
+The last owner's `close()` then waits, briefly, for the requests already on the
+wire to be answered, so a cancel in flight receives the venue's real answer
+rather than a fabricated `REQUEST_AMBIGUOUS`. The wait is bounded by the
+platform's own budget for external connections (`DEFAULT_FUTURE_CANCELLATION_TIMEOUT`,
+2 s), because the node's whole disconnect budget is `timeout_disconnection` (10 s
+by default) and the WebSockets already spend most of it. A request that outlasts
+the drain is broken by `aclose()`, which `httpx` reports as `ReadError` — an
+`httpx.HTTPError` that classifies as "reached the venue", so the caller is told
+to reconcile.
+
+Two consequences worth stating plainly:
+
+* **The gate is global to the shared transport.** A component that stops mutes
+  REST for every other holder of the same transport. Under NautilusTrader that is
+  harmless — the engines disconnect all of their clients together and the kernel
+  disconnects both engines in succession, after the farewell cancels have already
+  run — and it is what the bundled Bybit adapter does with its own single cached
+  client. Code that calls `disconnect()` on one client by hand while another goes
+  on trading is the case this does not serve.
+* **`is_closed` alone no longer means "spent".** A client that stops while
+  another still holds a reference leaves the cached transport gated with
+  `owner_count` above zero and nothing closed, so the factory discards a cached
+  entry that is closed **or** no longer accepting, and rebuilds it on the next
+  request.
+
+Two limits are not closed by this and are not claimed to be. Calling `connect()`
+again on a client that has been disconnected still fails, because the gate is
+sticky: the failure is now a typed `CLIENT_CLOSED` rather than sometimes a bare
+`RuntimeError`, but it is still a failure — a second node in the same process
+gets a fresh transport through the factory instead. And a `_connect` that has
+inserted a socket into `_ws_clients` but not yet awaited `connect()` on it can
+still open that socket after `_disconnect` has emptied the dict; it is closed
+when the platform cancels the `_connect` task immediately afterwards.
 
 ## Typed REST namespaces over one transport
 

@@ -60,13 +60,16 @@ only when no byte of the request left the process:
 | Label                 | Status | Raised when                                                                            |
 |-----------------------|--------|----------------------------------------------------------------------------------------|
 | `NETWORK_ERROR`       | 0      | Every attempt failed before anything was sent — the venue cannot have seen the request |
-| `CLIENT_CLOSED`       | 0      | The shared `GateioHttpClient` was closed (or acquired after closing)                   |
+| `CLIENT_CLOSED`       | 0      | The shared `GateioHttpClient` was closed, or stopped accepting, before this request was sent — not one byte of it left the process |
 | `MISSING_CREDENTIALS` | 401    | A signed endpoint was called without API credentials                                   |
 
 That reservation is deliberate: a status-0 error is *proof of non-delivery*,
 which is what lets the execution client treat these as definitive rather than
 ambiguous (see below). `NETWORK_ERROR` is never used for a request that was on
-the wire — that case has its own type.
+the wire — that case has its own type. Neither is `CLIENT_CLOSED`: a request
+that reached the venue on an earlier attempt and met the closed gate on a later
+one raises `GateioRequestAmbiguousError`, because the venue may already have
+applied it.
 
 ## What a 4xx and a 5xx mean
 

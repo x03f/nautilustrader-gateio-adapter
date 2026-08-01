@@ -1093,19 +1093,38 @@ class GateioExecutionClient(LiveExecutionClient):
             )
 
     async def _disconnect(self) -> None:
-        # Release this client's share of the transport. It is reference counted,
-        # so the socket pool closes only once every holder has let go (seam-08).
-        await self._http_client.close()
-        if self._account_poll_task is not None:
-            self._account_poll_task.cancel()
-            self._account_poll_task = None
+        # First, cheapest, and the only load-bearing statement here. From this
+        # line no request reaches the wire, whoever births it and whenever it
+        # wakes: a WebSocket frame that arrives while the sockets are being
+        # closed, a poller sleeping in the task registry, a retry armed a moment
+        # ago. Everything below may then run in any order, which is the point —
+        # the guarantee belongs to the transport, not to the ordering.
+        self._http_client.stop_accepting()
+        try:
+            if self._account_poll_task is not None:
+                self._account_poll_task.cancel()
+                self._account_poll_task = None
 
-        for product, ws_client in self._ws_clients.items():
-            try:
-                await ws_client.disconnect()
-            except Exception as e:  # noqa: BLE001 - shutdown must not raise
-                self._log.warning(f"Error disconnecting {product.value} WebSocket: {e}")
-        self._ws_clients.clear()
+            # `popitem`, not `.items()`: a `_connect` still in flight inserts
+            # into this dict, and iterating it live raises `RuntimeError:
+            # dictionary changed size during iteration` past the inner `except`
+            # below. That kills `_disconnect_with_cleanup`
+            # (live/execution_client.py) before `cancel_pending_tasks()` and
+            # `_set_connected(False)` ever run, leaving the client reporting
+            # `is_connected` forever and the transport's refcount stuck.
+            while self._ws_clients:
+                product, ws_client = self._ws_clients.popitem()
+                try:
+                    await ws_client.disconnect()
+                except Exception as e:  # noqa: BLE001 - shutdown must not raise
+                    self._log.warning(f"Error disconnecting {product.value} WebSocket: {e}")
+        except Exception as e:  # noqa: BLE001 - the platform's wrapper has no try
+            self._log.exception("Error during Gate.io execution client teardown", e)
+        finally:
+            # Released last, and always. It drains what is already on the wire
+            # and drops one reference; reaching it on every path is what keeps
+            # the shared pool from being pinned open by a failed teardown.
+            await self._http_client.close()
 
     def _cache_instruments(self) -> None:
         """Publish the provider's instruments and currencies into the cache."""
@@ -2221,10 +2240,22 @@ class GateioExecutionClient(LiveExecutionClient):
         while True:
             try:
                 await asyncio.sleep(interval_secs)
+                if not self._http_client.is_accepting:
+                    # Woken inside the shutdown window. The gate would refuse
+                    # every wallet read anyway; leaving now keeps a stopping node
+                    # from printing a wall of errors and from spinning at the
+                    # poll interval until the platform gets round to cancelling.
+                    self._log.debug("Stopping 'poll_account_state': the transport is closing")
+                    return
                 await self._update_account_state()
             except asyncio.CancelledError:
                 self._log.debug("Canceled task 'poll_account_state'")
                 return
+            except GateioError as e:
+                if e.label == "CLIENT_CLOSED":
+                    self._log.debug("Stopping 'poll_account_state': the transport is closing")
+                    return
+                self._log.error(f"Error polling account state: {e}")
             except Exception as e:  # noqa: BLE001 - the poll must survive venue errors
                 self._log.error(f"Error polling account state: {e}")
 
