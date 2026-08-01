@@ -33,9 +33,9 @@ from nautilus_trader.model.identifiers import PositionId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.model.position import Position
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioError, WalletNotProvisionedError
-from nautilus_gateio.execution import (
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioError, WalletNotProvisionedError
+from gateio_nt.execution import (
     REPORT_PAGE_LIMIT,
     FillReportsUnavailable,
     OrderReportsUnavailable,
@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover - depends on the pytest import mode
         ExecHarness,
     )
 
-from nautilus_gateio.instruments import parse_perpetual_instrument, parse_spot_instrument
+from gateio_nt.instruments import parse_perpetual_instrument, parse_spot_instrument
 
 WINDOW_START = datetime(2026, 7, 25, tzinfo=UTC)
 WINDOW_END = datetime(2026, 7, 27, tzinfo=UTC)
@@ -296,7 +296,7 @@ class TestFillReportPagination:
 
         env.run(env.client.generate_fill_reports(_fill_reports_command()))
 
-        from nautilus_gateio.execution import MAX_REPORT_PAGES
+        from gateio_nt.execution import MAX_REPORT_PAGES
 
         assert len(env.perp.calls_named("my_trades")) == MAX_REPORT_PAGES
 

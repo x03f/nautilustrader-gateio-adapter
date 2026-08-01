@@ -21,7 +21,7 @@ class GateioProductType(Enum):
 
     Each product has its own REST namespace, WebSocket endpoint and wallet on
     Gate.io, so the product is part of an instrument's identity (see
-    :mod:`nautilus_gateio.common.symbols`).
+    :mod:`gateio_nt.common.symbols`).
     """
 
     SPOT = "SPOT"

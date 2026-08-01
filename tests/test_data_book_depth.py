@@ -30,12 +30,12 @@ from nautilus_trader.model.data import OrderBookDelta, OrderBookDepth10
 from nautilus_trader.model.enums import BookType, OrderSide, RecordFlag
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
 
-from nautilus_gateio import data as data_module
-from nautilus_gateio.common.constants import GATEIO_CLIENT_ID, GATEIO_VENUE
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.config import GateioDataClientConfig
-from nautilus_gateio.data import DEPTH10_LEVELS, GateioDataClient
-from nautilus_gateio.websocket.public import GateioPublicWebSocket
+from gateio_nt import data as data_module
+from gateio_nt.common.constants import GATEIO_CLIENT_ID, GATEIO_VENUE
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.config import GateioDataClientConfig
+from gateio_nt.data import DEPTH10_LEVELS, GateioDataClient
+from gateio_nt.websocket.public import GateioPublicWebSocket
 from tests.test_data_client import (
     OPTION_ID,
     OPTION_SYMBOL,

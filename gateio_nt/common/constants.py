@@ -6,7 +6,7 @@ from typing import Final
 
 from nautilus_trader.model.identifiers import ClientId, Venue
 
-from nautilus_gateio.common.enums import GateioProductType
+from gateio_nt.common.enums import GateioProductType
 
 # NautilusTrader already identifies this venue as ``GATE_IO`` (see the Tardis
 # integration's venue mapping), so the adapter uses the same string to stay

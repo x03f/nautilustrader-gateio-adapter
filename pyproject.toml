@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nautilustrader-gateio-adapter"
+name = "gateio-nt-community"
 version = "0.2.0a2.dev0"
 description = "Community-maintained Gate.io adapter for NautilusTrader: spot, margin, perpetual, delivery and options market data and execution over REST and WebSocket"
 readme = "README.md"
@@ -61,17 +61,17 @@ dev = [
 # Every one of these is rendered as a link on the package page, so every one has
 # to resolve. The default branch is `main`: a `blob/master` path here would 404
 # for anyone who followed it.
-Homepage = "https://github.com/x03f/nautilustrader-gateio-adapter"
-Documentation = "https://github.com/x03f/nautilustrader-gateio-adapter/tree/main/docs"
-Source = "https://github.com/x03f/nautilustrader-gateio-adapter"
-Issues = "https://github.com/x03f/nautilustrader-gateio-adapter/issues"
-Changelog = "https://github.com/x03f/nautilustrader-gateio-adapter/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/x03f/gateio-nt-community"
+Documentation = "https://github.com/x03f/gateio-nt-community/tree/main/docs"
+Source = "https://github.com/x03f/gateio-nt-community"
+Issues = "https://github.com/x03f/gateio-nt-community/issues"
+Changelog = "https://github.com/x03f/gateio-nt-community/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
-include = ["nautilus_gateio*"]
+include = ["gateio_nt*"]
 
 [tool.setuptools.package-data]
-nautilus_gateio = ["py.typed"]
+gateio_nt = ["py.typed"]
 
 [tool.ruff]
 line-length = 100

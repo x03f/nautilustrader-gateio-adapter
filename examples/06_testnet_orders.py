@@ -37,7 +37,7 @@ import sys
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any
 
-from nautilus_gateio import (
+from gateio_nt import (
     GATEIO_HTTP_TESTNET,
     GateioHttpClient,
     GateioSpotHttpAPI,

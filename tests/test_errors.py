@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.errors import (
     ACCOUNT_MODE_LABELS,
     WALLET_NOT_PROVISIONED_LABELS,
     GateioClientError,
@@ -17,7 +17,7 @@ from nautilus_gateio.common.errors import (
     error_from_response,
     should_retry,
 )
-from nautilus_gateio.http.margin import require_wallet
+from gateio_nt.http.margin import require_wallet
 
 
 class TestErrorFromResponse:
@@ -164,22 +164,22 @@ class TestTheDistinctionIsReachableFromOutsideThePackage:
     """The type exists so that a *caller* can catch a refusal before an absence.
 
     It was introduced without being re-exported, so the only import path that
-    reached it was `nautilus_gateio.common.errors`, which the documentation does
+    reached it was `gateio_nt.common.errors`, which the documentation does
     not advertise as public. A distinction available to the adapter and to
     nobody else is not a distinction the package offers.
     """
 
     def test_both_wallet_error_types_are_exported_from_the_package_root(self):
-        import nautilus_gateio
+        import gateio_nt
 
         for name in ("WalletNotProvisionedError", "WalletQueryRefusedError"):
-            assert name in nautilus_gateio.__all__
-            assert getattr(nautilus_gateio, name, None) is not None
+            assert name in gateio_nt.__all__
+            assert getattr(gateio_nt, name, None) is not None
 
     def test_a_caller_can_catch_the_refusal_before_the_absence(self):
         """Order matters: the refusal is a subclass, so it must be caught first."""
-        from nautilus_gateio import WalletNotProvisionedError as Absence
-        from nautilus_gateio import WalletQueryRefusedError as Refusal
+        from gateio_nt import WalletNotProvisionedError as Absence
+        from gateio_nt import WalletQueryRefusedError as Refusal
 
         assert issubclass(Refusal, Absence)
 

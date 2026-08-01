@@ -39,11 +39,11 @@ from nautilus_trader.model.identifiers import (
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price, Quantity
 
-from nautilus_gateio.common.constants import GATEIO_CLIENT_ID
-from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
-from nautilus_gateio.config import GateioExecClientConfig
-from nautilus_gateio.execution import GateioExecutionClient
-from nautilus_gateio.instruments import (
+from gateio_nt.common.constants import GATEIO_CLIENT_ID
+from gateio_nt.common.enums import GateioProductType, GateioSpotAccountMode
+from gateio_nt.config import GateioExecClientConfig
+from gateio_nt.execution import GateioExecutionClient
+from gateio_nt.instruments import (
     parse_delivery_instrument,
     parse_option_instrument,
     parse_perpetual_instrument,
@@ -1024,7 +1024,7 @@ class TestOrderRouting:
         assert harness.client.venue.value == "GATE_IO"
 
     def test_conditional_types_route_to_the_price_order_endpoint(self, harness):
-        from nautilus_gateio.execution import CONDITIONAL_ORDER_TYPES, SUPPORTED_ORDER_TYPES
+        from gateio_nt.execution import CONDITIONAL_ORDER_TYPES, SUPPORTED_ORDER_TYPES
 
         assert CONDITIONAL_ORDER_TYPES <= SUPPORTED_ORDER_TYPES
         assert OrderType.LIMIT_IF_TOUCHED in CONDITIONAL_ORDER_TYPES
@@ -1567,7 +1567,7 @@ class TestDeniedVersusRejectedBoundary:
         """The other side of the boundary: Gate.io answered, so Gate.io refused."""
         from nautilus_trader.model.events import OrderDenied, OrderSubmitted
 
-        from nautilus_gateio.common.errors import GateioClientError
+        from gateio_nt.common.errors import GateioClientError
 
         harness.spot.responses["create_order"] = GateioClientError(
             400,
@@ -1591,7 +1591,7 @@ class TestDeniedVersusRejectedBoundary:
 
     def test_a_post_only_refusal_by_the_venue_keeps_due_post_only(self, harness):
         """A venue post-only refusal is a rejection and carries the platform flag."""
-        from nautilus_gateio.common.errors import GateioClientError
+        from gateio_nt.common.errors import GateioClientError
 
         harness.spot.responses["create_order"] = GateioClientError(
             400,

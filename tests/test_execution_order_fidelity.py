@@ -29,7 +29,7 @@ from nautilus_trader.model.enums import (
 from nautilus_trader.model.events import OrderFilled, OrderRejected
 from nautilus_trader.model.objects import Price, Quantity
 
-from nautilus_gateio.common.enums import (
+from gateio_nt.common.enums import (
     GateioFinishAs,
     GateioProductType,
     order_status_from_gateio,

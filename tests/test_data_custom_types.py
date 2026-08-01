@@ -37,13 +37,13 @@ from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer, get_schema
 from nautilus_trader.serialization.base import register_serializable_type
 
-from nautilus_gateio.common.constants import GATEIO_CLIENT_ID, GATEIO_VENUE
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioError
-from nautilus_gateio.config import GateioDataClientConfig
-from nautilus_gateio.data import GateioDataClient
-from nautilus_gateio.types import TICKER_FIELDS, GateioTicker
-from nautilus_gateio.websocket.public import GateioPublicWebSocket
+from gateio_nt.common.constants import GATEIO_CLIENT_ID, GATEIO_VENUE
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioError
+from gateio_nt.config import GateioDataClientConfig
+from gateio_nt.data import GateioDataClient
+from gateio_nt.types import TICKER_FIELDS, GateioTicker
+from gateio_nt.websocket.public import GateioPublicWebSocket
 from tests.test_data_book_depth import RecordingTransport, attach_ws, build_harness
 from tests.test_data_client import (
     OPTION_ID,

@@ -22,7 +22,7 @@ import asyncio
 
 from nautilus_trader.model.identifiers import InstrumentId
 
-from nautilus_gateio import (
+from gateio_nt import (
     GateioFuturesHttpAPI,
     GateioHttpClient,
     GateioInstrumentProvider,

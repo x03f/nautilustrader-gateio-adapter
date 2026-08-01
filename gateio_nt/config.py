@@ -4,7 +4,7 @@ Credentials
 -----------
 ``api_key`` / ``api_secret`` default to ``None``, in which case they are read
 from the environment when the client is created (see
-:mod:`nautilus_gateio.common.credentials`):
+:mod:`gateio_nt.common.credentials`):
 
 * mainnet: ``GATE_API_KEY`` / ``GATE_API_SECRET``
 * testnet: ``GATE_TESTNET_API_KEY`` / ``GATE_TESTNET_API_SECRET``, falling back
@@ -58,7 +58,7 @@ those two fields keep an explicit check (:func:`validate_book_interval_ms`,
 
 Cross-field validation — which products may be combined with which environment
 — still happens in the client constructors
-(:class:`~nautilus_gateio.data.GateioDataClient` and the execution client),
+(:class:`~gateio_nt.data.GateioDataClient` and the execution client),
 which raise ``ValueError`` with an explicit message before any network
 activity. The helper functions in this module (:func:`validate_products`,
 :func:`validate_book_interval_ms`, :func:`validate_snapshot_limit`) are what
@@ -76,14 +76,14 @@ import msgspec
 from nautilus_trader.config import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt
 from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     DEFAULT_HTTP_TIMEOUT_SECS,
     GATEIO_HTTP_MAINNET,
     GATEIO_HTTP_TESTNET,
     ORDER_BOOK_SNAPSHOT_LIMITS,
     ws_url,
 )
-from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
+from gateio_nt.common.enums import GateioProductType, GateioSpotAccountMode
 
 #: Environment strings accepted by the ``environment`` field.
 MAINNET = "mainnet"
@@ -99,7 +99,7 @@ TESTNET_PRODUCTS: tuple[GateioProductType, ...] = (
 #: product, used to validate a configured value before it reaches the venue.
 #: Which of them a *given* product accepts differs: spot and the perpetuals take
 #: ``20`` and ``100``, delivery and options take ``100`` and ``1000``. The
-#: per-product table in ``nautilus_gateio.websocket.public.BOOK_INTERVALS_MS``
+#: per-product table in ``gateio_nt.websocket.public.BOOK_INTERVALS_MS``
 #: is authoritative and a configured interval is clamped against it.
 ORDER_BOOK_UPDATE_INTERVALS_MS: tuple[int, ...] = (20, 100, 1000)
 
@@ -298,7 +298,7 @@ def enforce_field_bounds(config: Any) -> None:
 
 
 class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
-    """Configuration for :class:`~nautilus_gateio.data.GateioDataClient`.
+    """Configuration for :class:`~gateio_nt.data.GateioDataClient`.
 
     Parameters
     ----------

@@ -23,9 +23,9 @@ from nautilus_trader.model.instruments import (
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.tick_scheme.base import get_tick_scheme, list_tick_schemes
 
-import nautilus_gateio.instruments as instruments
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.instruments import (
+import gateio_nt.instruments as instruments
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.instruments import (
     CONTRACT_MARGIN_INIT,
     INVERSE_CONTRACT_FACE_VALUE,
     MAX_PRECISION,

@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-import nautilus_gateio
-from nautilus_gateio.common.parsing import (
+import gateio_nt
+from gateio_nt.common.parsing import (
     MS_THRESHOLD,
     NANOSECONDS_IN_MILLISECOND,
     NANOSECONDS_IN_SECOND,
@@ -185,7 +185,7 @@ class TestSingleCanonicalTimestampConversion:
 
     def test_the_package_defines_it_exactly_once(self):
         """A second definition is the defect itself, so assert against the tree."""
-        package = Path(nautilus_gateio.__file__).resolve().parent
+        package = Path(gateio_nt.__file__).resolve().parent
         definitions = [
             str(path.relative_to(package))
             for path in sorted(package.rglob("*.py"))
@@ -198,8 +198,8 @@ class TestSingleCanonicalTimestampConversion:
 
     def test_every_module_uses_the_canonical_one(self):
         """Importing it is fine; redefining it is not."""
-        from nautilus_gateio import data, execution
-        from nautilus_gateio.common import parsing
+        from gateio_nt import data, execution
+        from gateio_nt.common import parsing
 
         assert data.timestamp_to_nanos is parsing.timestamp_to_nanos
         assert execution.timestamp_to_nanos is parsing.timestamp_to_nanos
@@ -210,13 +210,13 @@ class TestSingleCanonicalTimestampConversion:
     )
     def test_millisecond_timestamps_are_exact_on_every_path(self, millis):
         """The measured 64 ns divergence: the float implementation failed this."""
-        from nautilus_gateio import data
+        from gateio_nt import data
 
         assert data.timestamp_to_nanos(millis) == millis * 1_000_000
 
     def test_the_data_path_and_the_execution_path_agree(self):
         """The property that actually matters: one instant, one value."""
-        from nautilus_gateio import data, execution
+        from gateio_nt import data, execution
 
         for value in (1790000000123, "1790000000123", 1790000000.123456, 1790000000):
             assert data.timestamp_to_nanos(value) == execution.timestamp_to_nanos(value)

@@ -41,9 +41,9 @@ import msgspec
 import pytest
 from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 
-from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
-from nautilus_gateio.config import GateioDataClientConfig, GateioExecClientConfig
-from nautilus_gateio.http.client import EXPIRY_HEADER
+from gateio_nt.common.enums import GateioProductType, GateioSpotAccountMode
+from gateio_nt.config import GateioDataClientConfig, GateioExecClientConfig
+from gateio_nt.http.client import EXPIRY_HEADER
 
 REPO = Path(__file__).resolve().parent.parent
 DOCS = REPO / "docs"
@@ -334,7 +334,7 @@ class TestMigrationGuide:
 # --------------------------------------------------------------------------
 
 IMPORT_LINE = re.compile(
-    r"^\s*(?:from\s+(nautilus_gateio[\w.]*)\s+import\s+(.+)|import\s+(nautilus_gateio[\w.]*))",
+    r"^\s*(?:from\s+(gateio_nt[\w.]*)\s+import\s+(.+)|import\s+(gateio_nt[\w.]*))",
 )
 
 
@@ -561,9 +561,9 @@ def _wheel_verification_block() -> str:
 
 def _sub_packages() -> list[str]:
     """Every importable sub-package of the distribution, from the source tree."""
-    root = REPO / "nautilus_gateio"
+    root = REPO / "gateio_nt"
     return sorted(
-        f"nautilus_gateio.{path.parent.name}"
+        f"gateio_nt.{path.parent.name}"
         for path in root.glob("*/__init__.py")
         if path.parent.name != "__pycache__"
     )
@@ -610,9 +610,9 @@ class TestCiWheelVerification:
     def test_import_smoke_test_exercises_sub_packages(self) -> None:
         steps = _workflow_steps("test")
         smoke = next(run for name, run in steps if "import smoke" in name.lower())
-        assert "nautilus_gateio.common" in smoke
-        assert "nautilus_gateio.http" in smoke
-        assert "nautilus_gateio.websocket" in smoke
+        assert "gateio_nt.common" in smoke
+        assert "gateio_nt.http" in smoke
+        assert "gateio_nt.websocket" in smoke
 
 
 class TestReleaseArtefactHygiene:
@@ -830,7 +830,7 @@ def doc_node_components():
 
 
 def _build_exec_client(components, config: GateioExecClientConfig):
-    from nautilus_gateio.factories import GateioLiveExecClientFactory
+    from gateio_nt.factories import GateioLiveExecClientFactory
 
     clock, msgbus, cache, loop = components
     return GateioLiveExecClientFactory.create(
@@ -1019,7 +1019,7 @@ class TestDocumentedBehaviourIsTheLandedBehaviour:
         from nautilus_trader.model.identifiers import AccountId
         from nautilus_trader.model.objects import AccountBalance, Money
 
-        from nautilus_gateio.common.constants import GATEIO
+        from gateio_nt.common.constants import GATEIO
 
         try:
             _build_exec_client(

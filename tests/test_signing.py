@@ -25,12 +25,12 @@ import re
 
 import pytest
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     CLIENT_ORDER_ID_MAX_BODY,
     CLIENT_ORDER_ID_PREFIX,
     DEFAULT_CLIENT_ORDER_ID_TAG,
 )
-from nautilus_gateio.common.signing import (
+from gateio_nt.common.signing import (
     generate_client_order_id,
     sanitize_client_order_id,
     sign_request,
@@ -223,7 +223,7 @@ class TestRestSignatureBehaviour:
         assert self._sign(api_key="a-different-key") == self._sign()
 
     def test_default_timestamp_is_current_unix_seconds(self, monkeypatch):
-        monkeypatch.setattr("nautilus_gateio.common.signing.time.time", lambda: 1700000000.75)
+        monkeypatch.setattr("gateio_nt.common.signing.time.time", lambda: 1700000000.75)
         headers = sign_request(
             "GET",
             "/api/v4/spot/accounts",

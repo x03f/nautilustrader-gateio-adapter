@@ -8,8 +8,8 @@ own host — so a multi-product session runs several of these side by side.
 The class is transport only: it connects, authenticates subscriptions, keeps the
 connection alive, replays subscriptions after a reconnect and hands decoded
 messages to a callback. It contains no product or trading logic; see
-:mod:`nautilus_gateio.websocket.public` and
-:mod:`nautilus_gateio.websocket.private` for the typed channel helpers.
+:mod:`gateio_nt.websocket.public` and
+:mod:`gateio_nt.websocket.private` for the typed channel helpers.
 
 Protocol summary (Gate.io WebSocket v4)
 --------------------------------------
@@ -37,7 +37,7 @@ representation in the data that would be published, and requesting one would
 only mean discarding the fraction one layer later. Truncating toward zero at the
 venue and truncating toward zero in the adapter produce the same numbers, and
 the adapter does the latter anyway (see
-:func:`nautilus_gateio.data.venue_quantity`) so that it stays correct if the
+:func:`gateio_nt.data.venue_quantity`) so that it stays correct if the
 venue ever pushes fractions regardless of the header.
 
 Pass ``size_decimal=True`` to opt in. Do so only together with an instrument
@@ -64,14 +64,14 @@ from nautilus_trader.live.cancellation import (
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     CHANNEL_PREFIX,
     DEFAULT_WS_MAX_BACKOFF_SECS,
     DEFAULT_WS_RECV_TIMEOUT_SECS,
 )
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioError
-from nautilus_gateio.common.signing import ws_auth_payload
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioError
+from gateio_nt.common.signing import ws_auth_payload
 
 #: Handshake header that makes futures and delivery push exact (possibly
 #: fractional) sizes as strings instead of truncating them toward zero. Opt-in;

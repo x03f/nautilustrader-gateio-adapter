@@ -70,7 +70,7 @@ goes through :func:`venue_quantity`, which truncates toward zero exactly as the
 venue does, and a value that truncates to zero is reported as an absent level or
 a skipped quote rather than as a fabricated zero.
 
-The per-product order book limits live in :mod:`nautilus_gateio.websocket.public`
+The per-product order book limits live in :mod:`gateio_nt.websocket.public`
 and are imported here; they are not restated.
 """
 
@@ -158,45 +158,45 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, TradeId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import FIXED_PRECISION, Price, Quantity
 
-from nautilus_gateio.books import (
+from gateio_nt.books import (
     BID,
     GateioOrderBook,
     OrderBookSequenceError,
     SnapshotStaleError,
     parse_levels,
 )
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     GATEIO_INTERVAL_MS,
     GATEIO_VENUE,
     NAUTILUS_TO_GATEIO_INTERVAL,
 )
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioError
-from nautilus_gateio.common.parsing import (
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioError
+from gateio_nt.common.parsing import (
     precision_from_increment,
     timestamp_to_nanos,
     to_decimal,
     to_float,
     to_int,
 )
-from nautilus_gateio.common.status import diff_and_emit_statuses, market_status_action
-from nautilus_gateio.common.symbols import (
+from gateio_nt.common.status import diff_and_emit_statuses, market_status_action
+from gateio_nt.common.symbols import (
     gateio_to_instrument_id,
     instrument_id_to_gateio,
 )
-from nautilus_gateio.config import (
+from gateio_nt.config import (
     GateioDataClientConfig,
     validate_book_interval_ms,
     validate_products,
     validate_snapshot_limit,
 )
-from nautilus_gateio.http.client import GateioHttpClient
-from nautilus_gateio.http.futures import GateioFuturesHttpAPI
-from nautilus_gateio.http.options import GateioOptionsHttpAPI
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.types import GateioTicker
-from nautilus_gateio.websocket.client import is_transient_ws_error
-from nautilus_gateio.websocket.public import (
+from gateio_nt.http.client import GateioHttpClient
+from gateio_nt.http.futures import GateioFuturesHttpAPI
+from gateio_nt.http.options import GateioOptionsHttpAPI
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.types import GateioTicker
+from gateio_nt.websocket.client import is_transient_ws_error
+from gateio_nt.websocket.public import (
     BOOK_INTERVALS_MS,
     BOOK_LEVELS,
     BOOK_SNAPSHOT_PUSH_INTERVALS,

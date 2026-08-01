@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from nautilus_gateio import GateioProductType, GateioPublicWebSocket
+from gateio_nt import GateioProductType, GateioPublicWebSocket
 
 SYMBOL = "BTC_USDT"
 RUN_SECONDS = 15.0

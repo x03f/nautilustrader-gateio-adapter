@@ -1,6 +1,6 @@
 """Typed helpers for Gate.io's public WebSocket channels.
 
-One instance wraps one :class:`~nautilus_gateio.websocket.client.GateioWebSocketClient`
+One instance wraps one :class:`~gateio_nt.websocket.client.GateioWebSocketClient`
 and therefore one product, because Gate.io serves each product from its own host
 and channel namespace:
 
@@ -44,7 +44,7 @@ is described below per channel. Timestamps named ``t`` are milliseconds,
     differ per product: spot sends ``[["price", "amount"], ...]`` while futures,
     delivery and options send ``[{"p": price, "s": size}, ...]``. Sizes are
     absolute; zero deletes the level.
-    :class:`nautilus_gateio.books.GateioOrderBook` consumes either form.
+    :class:`gateio_nt.books.GateioOrderBook` consumes either form.
 
 ``<product>.order_book``
     A periodic limited-depth snapshot, self-synchronizing and needing no
@@ -78,9 +78,9 @@ import asyncio
 from collections.abc import Callable
 from typing import Any, Final
 
-from nautilus_gateio.common.constants import CHANNEL_PREFIX, ws_url
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.websocket.client import GateioWebSocketClient
+from gateio_nt.common.constants import CHANNEL_PREFIX, ws_url
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.websocket.client import GateioWebSocketClient
 
 #: Candlestick intervals accepted on the WebSocket candlestick channels.
 WS_CANDLE_INTERVALS: Final[frozenset[str]] = frozenset(

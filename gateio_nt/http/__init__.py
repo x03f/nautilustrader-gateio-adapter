@@ -20,12 +20,12 @@ its ``settle`` and ``delivery`` constructor arguments::
 
 from __future__ import annotations
 
-from nautilus_gateio.http.client import GateioHttpClient
-from nautilus_gateio.http.futures import GateioFuturesHttpAPI
-from nautilus_gateio.http.margin import GateioMarginHttpAPI, require_wallet
-from nautilus_gateio.http.options import GateioOptionsHttpAPI
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.http.wallet import ALLOWED_TRANSFER_ACCOUNTS, GateioWalletHttpAPI
+from gateio_nt.http.client import GateioHttpClient
+from gateio_nt.http.futures import GateioFuturesHttpAPI
+from gateio_nt.http.margin import GateioMarginHttpAPI, require_wallet
+from gateio_nt.http.options import GateioOptionsHttpAPI
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.http.wallet import ALLOWED_TRANSFER_ACCOUNTS, GateioWalletHttpAPI
 
 __all__ = [
     "ALLOWED_TRANSFER_ACCOUNTS",

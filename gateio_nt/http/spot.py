@@ -9,7 +9,7 @@ Spot margin is not a separate REST namespace on Gate.io: isolated margin, cross
 margin and unified-account trading are all driven through these same endpoints
 by setting the ``account`` field/parameter (``spot``, ``margin``,
 ``cross_margin``, ``unified``). The balance, borrow and repay endpoints for
-those ledgers live in :mod:`nautilus_gateio.http.margin`.
+those ledgers live in :mod:`gateio_nt.http.margin`.
 
 Two naming asymmetries in Gate.io's own API are preserved verbatim rather than
 smoothed over, because the venue validates them:
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from nautilus_gateio.http.client import GateioHttpClient
+from gateio_nt.http.client import GateioHttpClient
 
 
 class GateioSpotHttpAPI:
@@ -159,7 +159,7 @@ class GateioSpotHttpAPI:
         payloads.
 
         Gate.io marks this endpoint deprecated in favor of ``GET /wallet/fee``
-        (see :meth:`nautilus_gateio.http.wallet.GateioWalletHttpAPI.fee`), which
+        (see :meth:`gateio_nt.http.wallet.GateioWalletHttpAPI.fee`), which
         returns spot, perpetual and delivery rates in one call.
         """
         return await self._client.get("/spot/fee", params={"currency_pair": pair}, signed=True)
@@ -296,7 +296,7 @@ class GateioSpotHttpAPI:
         **This request is never replayed.** A retry could submit the order
         twice, and Gate.io's duplicate-``text`` rejection does not cover an
         order that already filled and closed. If the transport raises
-        :class:`~nautilus_gateio.http.client.GateioRequestAmbiguousError` the
+        :class:`~gateio_nt.http.client.GateioRequestAmbiguousError` the
         submission outcome is unknown: resolve it with :meth:`get_order` on the
         client id rather than resubmitting.
         """

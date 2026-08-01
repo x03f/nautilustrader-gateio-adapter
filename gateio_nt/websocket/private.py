@@ -2,7 +2,7 @@
 
 Every request on these channels carries an ``auth`` object signed over
 ``channel=<channel>&event=<event>&time=<time>``; the transport in
-:mod:`nautilus_gateio.websocket.client` attaches it to subscribes and
+:mod:`gateio_nt.websocket.client` attaches it to subscribes and
 unsubscribes alike.
 
 Payload conventions differ per product, which is the main reason for this class:
@@ -55,9 +55,9 @@ import asyncio
 from collections.abc import Callable, Sequence
 from typing import Any, Final
 
-from nautilus_gateio.common.constants import CHANNEL_PREFIX, ws_url
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.websocket.client import GateioWebSocketClient
+from gateio_nt.common.constants import CHANNEL_PREFIX, ws_url
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.websocket.client import GateioWebSocketClient
 
 #: Wildcard accepted by the private channels in place of a symbol or contract.
 ALL: Final[str] = "!all"

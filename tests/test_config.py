@@ -1,7 +1,7 @@
 """Tests for configuration defaults, validation helpers and URL resolution.
 
-Covers :mod:`nautilus_gateio.config` and the credential resolution in
-:mod:`nautilus_gateio.common.credentials`. The credential environment variables
+Covers :mod:`gateio_nt.config` and the credential resolution in
+:mod:`gateio_nt.common.credentials`. The credential environment variables
 are cleared for every test by an autouse fixture in ``conftest.py``.
 """
 
@@ -15,7 +15,7 @@ import pytest
 from nautilus_trader.common.config import ImportableConfig, NautilusConfig
 from nautilus_trader.common.secure import mask_api_key
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     DEFAULT_HTTP_TIMEOUT_SECS,
     GATEIO_HTTP_MAINNET,
     GATEIO_HTTP_TESTNET,
@@ -28,7 +28,7 @@ from nautilus_gateio.common.constants import (
     GATEIO_WS_SPOT_TESTNET,
     ORDER_BOOK_SNAPSHOT_LIMITS,
 )
-from nautilus_gateio.common.credentials import (
+from gateio_nt.common.credentials import (
     ENV_API_KEY,
     ENV_API_SECRET,
     ENV_TESTNET_API_KEY,
@@ -36,9 +36,9 @@ from nautilus_gateio.common.credentials import (
     mask,
     resolve_credentials,
 )
-from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
-from nautilus_gateio.common.errors import GateioError
-from nautilus_gateio.config import (
+from gateio_nt.common.enums import GateioProductType, GateioSpotAccountMode
+from gateio_nt.common.errors import GateioError
+from gateio_nt.config import (
     MAINNET,
     ORDER_BOOK_UPDATE_INTERVALS_MS,
     TESTNET,
@@ -54,7 +54,7 @@ from nautilus_gateio.config import (
     validate_products,
     validate_snapshot_limit,
 )
-from nautilus_gateio.http.client import GateioHttpClient
+from gateio_nt.http.client import GateioHttpClient
 
 CONFIG_CLASSES = [GateioDataClientConfig, GateioExecClientConfig]
 
@@ -413,8 +413,8 @@ class TestMaskCredential:
         assert secret[4:-4] not in masked
 
 
-DATA_CONFIG_PATH = "nautilus_gateio.config:GateioDataClientConfig"
-EXEC_CONFIG_PATH = "nautilus_gateio.config:GateioExecClientConfig"
+DATA_CONFIG_PATH = "gateio_nt.config:GateioDataClientConfig"
+EXEC_CONFIG_PATH = "gateio_nt.config:GateioExecClientConfig"
 CONFIG_PATHS = {
     GateioDataClientConfig: DATA_CONFIG_PATH,
     GateioExecClientConfig: EXEC_CONFIG_PATH,

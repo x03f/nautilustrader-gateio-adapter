@@ -20,7 +20,7 @@ import itertools
 import re
 import time
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     CLIENT_ORDER_ID_MAX_BODY,
     CLIENT_ORDER_ID_PREFIX,
     DEFAULT_CLIENT_ORDER_ID_TAG,

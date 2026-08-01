@@ -2,9 +2,9 @@
 
 Responsibilities:
 
-* signing private requests (HMAC-SHA512, see :mod:`nautilus_gateio.common.signing`);
+* signing private requests (HMAC-SHA512, see :mod:`gateio_nt.common.signing`);
 * pacing requests and backing off on HTTP 429;
-* translating error payloads into the typed :mod:`nautilus_gateio.common.errors` hierarchy;
+* translating error payloads into the typed :mod:`gateio_nt.common.errors` hierarchy;
 * replaying only those failed requests whose replay provably cannot change the
   outcome at the venue (see `Retry safety`_);
 * exposing a single ``request`` entry point for the typed per-product namespaces.
@@ -74,26 +74,26 @@ from typing import Any, Final
 import httpx
 from nautilus_trader.live.cancellation import DEFAULT_FUTURE_CANCELLATION_TIMEOUT
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     DEFAULT_HTTP_TIMEOUT_SECS,
     DEFAULT_MAX_REQUESTS_PER_SECOND,
     GATEIO_API_PREFIX,
     GATEIO_HTTP_MAINNET,
     GATEIO_HTTP_TESTNET,
 )
-from nautilus_gateio.common.credentials import (
+from gateio_nt.common.credentials import (
     ENV_API_KEY,
     ENV_API_SECRET,
     ENV_TESTNET_API_KEY,
     ENV_TESTNET_API_SECRET,
 )
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.errors import (
     GateioError,
     GateioServerError,
     error_from_response,
     should_retry,
 )
-from nautilus_gateio.common.signing import sign_request
+from gateio_nt.common.signing import sign_request
 
 #: HTTP methods whose replay cannot change the outcome at the venue.
 IDEMPOTENT_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "OPTIONS", "DELETE"})
@@ -140,7 +140,7 @@ class GateioRequestAmbiguousError(GateioError):
     was replayed and never answered. Whether the venue applied it is unknown:
     the caller must reconcile (query the order by client id, poll the transfer
     status) before deciding to resubmit. This is a
-    :class:`~nautilus_gateio.common.errors.GateioError`, so existing handlers
+    :class:`~gateio_nt.common.errors.GateioError`, so existing handlers
     still catch it.
     """
 
@@ -150,7 +150,7 @@ class GateioAmbiguousServerError(GateioServerError, GateioRequestAmbiguousError)
 
     A 5xx can be raised either before or after the venue accepted the request,
     and it was deliberately not replayed. Subclasses
-    :class:`~nautilus_gateio.common.errors.GateioServerError` so that code
+    :class:`~gateio_nt.common.errors.GateioServerError` so that code
     branching on server errors is unaffected, and
     :class:`GateioRequestAmbiguousError` so that a single ``isinstance`` check
     identifies "this mutation may or may not have been applied".

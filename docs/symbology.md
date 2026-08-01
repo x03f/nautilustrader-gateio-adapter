@@ -4,7 +4,7 @@ The adapter follows a **minimum normalization** rule: a Gate.io symbol is used
 verbatim wherever it is already unique, and a suffix is added only where the
 exchange genuinely reuses one symbol for two different instruments.
 
-All conversion lives in `nautilus_gateio.common.symbols`. No other module
+All conversion lives in `gateio_nt.common.symbols`. No other module
 constructs or takes apart an instrument id.
 
 ## Venue
@@ -17,7 +17,7 @@ loaded through other NautilusTrader components. Version 0.1.0 of this adapter
 used `GATEIO`; see the [migration guide](migration-0.1-to-0.2.md).
 
 ```python
-from nautilus_gateio import GATEIO, GATEIO_CLIENT_ID, GATEIO_VENUE
+from gateio_nt import GATEIO, GATEIO_CLIENT_ID, GATEIO_VENUE
 
 GATEIO           # "GATE_IO"
 GATEIO_VENUE     # Venue("GATE_IO")
@@ -97,7 +97,7 @@ parameter.
 ## API
 
 ```python
-from nautilus_gateio import (
+from gateio_nt import (
     GateioProductType,
     gateio_to_instrument_id,
     instrument_id_to_gateio,
@@ -142,7 +142,7 @@ stated form. `instrument_id_to_gateio` (and through it `product_of` and
 that matches none of the structured shapes is a spot pair by the inference rule
 above, not an error.
 
-Two more helpers live in `nautilus_gateio.common.symbols` without a top-level
+Two more helpers live in `gateio_nt.common.symbols` without a top-level
 export, because ordinary code goes through the pair above: `nautilus_symbol`
 (the symbol string alone, without the venue) and `product_from_raw_symbol` (the
 inference rule, with a `perpetual` flag to disambiguate the one case the

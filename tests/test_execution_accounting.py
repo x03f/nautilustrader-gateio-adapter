@@ -35,9 +35,9 @@ from nautilus_trader.model.position import Position
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 
-from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
-from nautilus_gateio.common.errors import GateioClientError, GateioError
-from nautilus_gateio.execution import PositionStatusUnavailable
+from gateio_nt.common.enums import GateioProductType, GateioSpotAccountMode
+from gateio_nt.common.errors import GateioClientError, GateioError
+from gateio_nt.execution import PositionStatusUnavailable
 from tests.test_execution_orders import PERP_BTC_USDT, ExecHarness
 
 GATEIO_VENUE = Venue("GATE_IO")

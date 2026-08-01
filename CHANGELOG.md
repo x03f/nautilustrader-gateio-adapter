@@ -23,6 +23,23 @@ and **Changed**.
 
 ### Changed (breaking)
 
+- **The project, the distribution and the imported package are renamed.** The
+  repository is `gateio-nt-community`, the distribution is `gateio-nt-community`,
+  and the package you import is `gateio_nt`. The former names led with
+  `nautilustrader` and `nautilus`, which NautilusTrader's
+  [trademark policy](https://github.com/nautechsystems/nautilus_trader/blob/develop/TRADEMARK.md)
+  reserves: it forbids those marks as the leading component of a project or
+  package name, restricts the standalone word `nautilus` in the trading domain,
+  and designates `nt` as the shorthand a third-party project uses to signal
+  compatibility instead. `gateio-nt-community` follows the form the policy gives
+  as compliant, and the same form as the community adapters already listed
+  upstream. **Migration:** replace `import nautilus_gateio` with `import
+  gateio_nt` and `from nautilus_gateio... import` with `from gateio_nt... import`;
+  nothing else in the public surface moved, and no symbol was renamed. The install
+  line changes with the repository URL; GitHub redirects the old one, but the
+  pinned form should be updated. Nothing was published to PyPI under the former
+  name, so no release has to be yanked.
+
 - **`spot_account_mode=UNIFIED` without `GateioProductType.SPOT` among
   `products` now raises `ValueError`** from `GateioExecutionClient.__init__`,
   before any network activity. A node whose configuration file pairs `UNIFIED`
@@ -56,7 +73,7 @@ and **Changed**.
 
 - **`subscribe_instrument_status`**, polled from the instrument listings on the
   reload cadence, with the mapping table and the diff in their own module
-  (`nautilus_gateio/common/status.py`). Gate.io publishes no status channel on
+  (`gateio_nt/common/status.py`). Gate.io publishes no status channel on
   any product, which is also the honest limit: a halt shorter than the poll
   interval is invisible. Subscribing reports the current status at once and then
   only on change; `reason` names the venue field that decided it, verbatim; only
@@ -300,7 +317,7 @@ and **Changed**.
 
 - **The credential fingerprint is NautilusTrader's `mask_api_key`, and it
   discloses two characters more than the helper it replaced.**
-  `nautilus_gateio.common.credentials.mask` is now the platform's
+  `gateio_nt.common.credentials.mask` is now the platform's
   `nautilus_trader.common.secure.mask_api_key` — the pure-Python one the OKX and
   Deribit adapters log through, not the `core.nautilus_pyo3` one Binance uses,
   which renders an absent credential as an empty string. Three things changed in
@@ -348,7 +365,7 @@ and **Changed**.
   that gains an order endpoint nobody classified fails the suite.
 
 - **The branch no longer reports the released version.** `pyproject.toml` and
-  `nautilus_gateio.__version__` carry `0.2.0a2.dev0`: a
+  `gateio_nt.__version__` carry `0.2.0a2.dev0`: a
   [PEP 440](https://peps.python.org/pep-0440/) developmental release of the next
   alpha, which sorts after the `0.2.0a1` release and before any `0.2.0a2`.
   Before this, a build from the branch and a build from the `v0.2.0a1` tag both
@@ -366,15 +383,13 @@ and **Changed**.
 
 ### Documentation
 
-- **`docs/releasing.md` no longer tells the releaser to upload the current
-  distribution name to PyPI.** `nautilustrader-gateio-adapter` uses the
-  NautilusTrader trademark and is to be replaced by `gateio-nt-community`
-  (import `gateio_nt`). A PyPI name is never released once claimed, so that
-  upload is not a step a later release could correct — the guide now defers the
-  upload until the rename has landed, and shows the pinned, one-version form
-  without naming the distribution. `tests/test_docs.py` keeps both halves: an
-  upload glob is still refused, and no page may spell out an upload of the
-  present name.
+- **`docs/releasing.md` defers the PyPI upload until a name exists to upload
+  under.** The former distribution name used the NautilusTrader trademark, and a
+  PyPI name is never released once claimed, so that upload was not a step a later
+  release could correct. The guide shows the pinned, one-version form without
+  naming the distribution, and `tests/test_docs.py` keeps both halves: an upload
+  glob is refused, and no page may spell out an upload of a trademark-infringing
+  name.
 
 - **`docs/configuration.md` gains "Numbers outside their range are refused, not
   repaired".** It shows both refusals side by side — the constructor's
@@ -1242,6 +1257,6 @@ Initial release.
 - Documentation set: architecture, configuration, market data, execution, testing, and troubleshooting guides.
 - Unit test suite (no network access required) and continuous integration workflow.
 
-[Unreleased]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.2.0a1...HEAD
-[0.2.0a1]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v0.1.0...v0.2.0a1
-[0.1.0]: https://github.com/x03f/nautilustrader-gateio-adapter/releases/tag/v0.1.0
+[Unreleased]: https://github.com/x03f/gateio-nt-community/compare/v0.2.0a1...HEAD
+[0.2.0a1]: https://github.com/x03f/gateio-nt-community/compare/v0.1.0...v0.2.0a1
+[0.1.0]: https://github.com/x03f/gateio-nt-community/releases/tag/v0.1.0

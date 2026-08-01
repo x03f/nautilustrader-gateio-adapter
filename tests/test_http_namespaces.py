@@ -19,21 +19,21 @@ from typing import Any
 import httpx
 import pytest
 
-from nautilus_gateio.common.constants import GATEIO_API_PREFIX, GATEIO_HTTP_MAINNET
-from nautilus_gateio.common.errors import GateioClientError, GateioServerError
-from nautilus_gateio.http import futures as futures_module
-from nautilus_gateio.http import options as options_module
-from nautilus_gateio.http import spot as spot_module
-from nautilus_gateio.http.client import (
+from gateio_nt.common.constants import GATEIO_API_PREFIX, GATEIO_HTTP_MAINNET
+from gateio_nt.common.errors import GateioClientError, GateioServerError
+from gateio_nt.http import futures as futures_module
+from gateio_nt.http import options as options_module
+from gateio_nt.http import spot as spot_module
+from gateio_nt.http.client import (
     EXPIRY_HEADER,
     GateioHttpClient,
     GateioRequestAmbiguousError,
 )
-from nautilus_gateio.http.futures import GateioFuturesHttpAPI
-from nautilus_gateio.http.margin import GateioMarginHttpAPI
-from nautilus_gateio.http.options import GateioOptionsHttpAPI
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.http.wallet import ALLOWED_TRANSFER_ACCOUNTS, GateioWalletHttpAPI
+from gateio_nt.http.futures import GateioFuturesHttpAPI
+from gateio_nt.http.margin import GateioMarginHttpAPI
+from gateio_nt.http.options import GateioOptionsHttpAPI
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.http.wallet import ALLOWED_TRANSFER_ACCOUNTS, GateioWalletHttpAPI
 
 API = GATEIO_API_PREFIX
 

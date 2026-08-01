@@ -168,13 +168,13 @@ from nautilus_trader.model.objects import (
 )
 from nautilus_trader.model.orders import Order
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     CLIENT_ORDER_ID_MAX_BODY,
     CLIENT_ORDER_ID_PREFIX,
     GATEIO,
     GATEIO_VENUE,
 )
-from nautilus_gateio.common.enums import (
+from gateio_nt.common.enums import (
     GateioFinishAs,
     GateioProductType,
     GateioSpotAccountMode,
@@ -187,7 +187,7 @@ from nautilus_gateio.common.enums import (
     time_in_force_from_gateio,
     time_in_force_to_gateio,
 )
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.errors import (
     GateioError,
     GateioServerError,
     OrderValidationError,
@@ -195,32 +195,32 @@ from nautilus_gateio.common.errors import (
     WalletNotProvisionedError,
     WalletQueryRefusedError,
 )
-from nautilus_gateio.common.parsing import (
+from gateio_nt.common.parsing import (
     timestamp_to_nanos,
     to_decimal,
     to_exact_decimal,
     to_int,
     to_lot_count,
 )
-from nautilus_gateio.common.signing import generate_client_order_id
-from nautilus_gateio.common.symbols import (
+from gateio_nt.common.signing import generate_client_order_id
+from gateio_nt.common.symbols import (
     gateio_to_instrument_id,
     instrument_id_to_gateio,
     parse_option_symbol,
 )
-from nautilus_gateio.config import GateioExecClientConfig, validate_products
-from nautilus_gateio.http.client import (
+from gateio_nt.config import GateioExecClientConfig, validate_products
+from gateio_nt.http.client import (
     CLOCK_DRIFT_WARNING_MS,
     EXPIRY_HEADER,
     GateioHttpClient,
     GateioRequestAmbiguousError,
 )
-from nautilus_gateio.http.futures import GateioFuturesHttpAPI
-from nautilus_gateio.http.margin import GateioMarginHttpAPI, require_wallet
-from nautilus_gateio.http.options import GateioOptionsHttpAPI
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.http.wallet import GateioWalletHttpAPI
-from nautilus_gateio.websocket.private import ALL, GateioPrivateWebSocket
+from gateio_nt.http.futures import GateioFuturesHttpAPI
+from gateio_nt.http.margin import GateioMarginHttpAPI, require_wallet
+from gateio_nt.http.options import GateioOptionsHttpAPI
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.http.wallet import GateioWalletHttpAPI
+from gateio_nt.websocket.private import ALL, GateioPrivateWebSocket
 
 
 class PositionStatusUnavailable(Exception):
@@ -2358,7 +2358,7 @@ class GateioExecutionClient(LiveExecutionClient):
         return order is not None and report.trade_id in order.trade_ids
 
     def _credentials(self) -> tuple[str, str]:
-        from nautilus_gateio.common.credentials import resolve_credentials
+        from gateio_nt.common.credentials import resolve_credentials
 
         return resolve_credentials(
             self._config.api_key,

@@ -4,7 +4,7 @@
 
     from nautilus_trader.live.node import TradingNode
 
-    from nautilus_gateio import (
+    from gateio_nt import (
         GATEIO,
         GateioDataClientConfig,
         GateioExecClientConfig,
@@ -36,13 +36,13 @@ from nautilus_trader.common.config import InstrumentProviderConfig
 from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
 from nautilus_trader.model.identifiers import ClientId
 
-from nautilus_gateio.common.constants import DEFAULT_HTTP_TIMEOUT_SECS, GATEIO_HTTP_MAINNET
-from nautilus_gateio.common.credentials import resolve_credentials
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.config import GateioDataClientConfig, GateioExecClientConfig
-from nautilus_gateio.data import GateioDataClient
-from nautilus_gateio.http.client import GateioHttpClient
-from nautilus_gateio.providers import GateioInstrumentProvider
+from gateio_nt.common.constants import DEFAULT_HTTP_TIMEOUT_SECS, GATEIO_HTTP_MAINNET
+from gateio_nt.common.credentials import resolve_credentials
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.config import GateioDataClientConfig, GateioExecClientConfig
+from gateio_nt.data import GateioDataClient
+from gateio_nt.http.client import GateioHttpClient
+from gateio_nt.providers import GateioInstrumentProvider
 
 if TYPE_CHECKING:
     from nautilus_trader.live.execution_client import LiveExecutionClient
@@ -271,7 +271,7 @@ class GateioLiveExecClientFactory(LiveExecClientFactory):
         """
         # Imported here so that this module remains importable (and the data
         # client usable) independently of the execution module.
-        from nautilus_gateio.execution import GateioExecutionClient
+        from gateio_nt.execution import GateioExecutionClient
 
         # One acquire per client the factory hands the transport to; each
         # releases it in `_disconnect`, and the last release closes it.

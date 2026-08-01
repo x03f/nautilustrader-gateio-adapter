@@ -8,11 +8,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability (do not open an issue)
-    url: https://github.com/x03f/nautilustrader-gateio-adapter/security/advisories/new
+    url: https://github.com/x03f/gateio-nt-community/security/advisories/new
     about: Report privately through GitHub. SECURITY.md says what a report should and must not contain.
   - name: Something failed and you want to check it is already known
-    url: https://github.com/x03f/nautilustrader-gateio-adapter/blob/main/docs/troubleshooting.md
+    url: https://github.com/x03f/gateio-nt-community/blob/main/docs/troubleshooting.md
     about: The failures that have actually happened, with cause and fix. Open a bug report if yours is not there.
   - name: What is and is not supported
-    url: https://github.com/x03f/nautilustrader-gateio-adapter#feature-support-matrix
+    url: https://github.com/x03f/gateio-nt-community#feature-support-matrix
     about: The feature matrix and docs/validation.md record which paths have been run against the venue.

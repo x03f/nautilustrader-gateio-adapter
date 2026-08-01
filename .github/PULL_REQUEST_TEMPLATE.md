@@ -21,6 +21,6 @@
 - [ ] `ruff check .` and `ruff format --check .` are clean
 - [ ] Docs and the README feature matrix are updated if behavior changed
 - [ ] `CHANGELOG.md` has an entry under `[Unreleased]` (if user-visible)
-- [ ] The version in `pyproject.toml` and `nautilus_gateio/__init__.py` is unchanged — a release
+- [ ] The version in `pyproject.toml` and `gateio_nt/__init__.py` is unchanged — a release
       sets it, a pull request does not
 - [ ] No credentials, API keys, or account identifiers committed (including fixtures)

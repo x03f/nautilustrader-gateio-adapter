@@ -10,7 +10,7 @@ Quick start
 .. code-block:: python
 
     from nautilus_trader.live.node import TradingNode
-    from nautilus_gateio import (
+    from gateio_nt import (
         GATEIO,
         GateioDataClientConfig,
         GateioExecClientConfig,
@@ -29,7 +29,7 @@ across products): ``BTC_USDT.GATE_IO``, ``BTC_USDT-PERP.GATE_IO``,
 
 Venue-native data
 -----------------
-:class:`~nautilus_gateio.types.GateioTicker` carries the ticker fields
+:class:`~gateio_nt.types.GateioTicker` carries the ticker fields
 NautilusTrader has no type of its own for: 24-hour statistics, implied
 volatilities, the greeks and the delivery basis. Subscribe to it with the
 metadata form, which is the topic the published rows are addressed to:
@@ -37,7 +37,7 @@ metadata form, which is the topic the published rows are addressed to:
 .. code-block:: python
 
     from nautilus_trader.model.data import DataType
-    from nautilus_gateio import GATEIO_CLIENT_ID, GateioTicker
+    from gateio_nt import GATEIO_CLIENT_ID, GateioTicker
 
     self.subscribe_data(
         DataType(GateioTicker, metadata={"instrument_id": instrument_id}),
@@ -54,8 +54,8 @@ which performs both registrations itself at class definition
 repeating the in-tree call here would stop the package importing at all.
 """
 
-from nautilus_gateio.books import GateioOrderBook, OrderBookSequenceError
-from nautilus_gateio.common.constants import (
+from gateio_nt.books import GateioOrderBook, OrderBookSequenceError
+from gateio_nt.common.constants import (
     GATEIO,
     GATEIO_CLIENT_ID,
     GATEIO_HTTP_MAINNET,
@@ -64,13 +64,13 @@ from nautilus_gateio.common.constants import (
     GATEIO_WS_OPTIONS,
     GATEIO_WS_SPOT,
 )
-from nautilus_gateio.common.credentials import resolve_credentials
-from nautilus_gateio.common.enums import (
+from gateio_nt.common.credentials import resolve_credentials
+from gateio_nt.common.enums import (
     GateioProductType,
     GateioSpotAccountMode,
     GateioTimeInForce,
 )
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.errors import (
     GateioClientError,
     GateioError,
     GateioServerError,
@@ -80,13 +80,13 @@ from nautilus_gateio.common.errors import (
     WalletQueryRefusedError,
     should_retry,
 )
-from nautilus_gateio.common.signing import (
+from gateio_nt.common.signing import (
     generate_client_order_id,
     sanitize_client_order_id,
     sign_request,
     sign_ws_request,
 )
-from nautilus_gateio.common.symbols import (
+from gateio_nt.common.symbols import (
     gateio_to_instrument_id,
     instrument_id_to_gateio,
     parse_delivery_symbol,
@@ -94,14 +94,14 @@ from nautilus_gateio.common.symbols import (
     product_of,
     raw_symbol_of,
 )
-from nautilus_gateio.config import GateioDataClientConfig, GateioExecClientConfig
-from nautilus_gateio.data import GateioDataClient
-from nautilus_gateio.execution import GateioExecutionClient
-from nautilus_gateio.factories import (
+from gateio_nt.config import GateioDataClientConfig, GateioExecClientConfig
+from gateio_nt.data import GateioDataClient
+from gateio_nt.execution import GateioExecutionClient
+from gateio_nt.factories import (
     GateioLiveDataClientFactory,
     GateioLiveExecClientFactory,
 )
-from nautilus_gateio.http import (
+from gateio_nt.http import (
     GateioFuturesHttpAPI,
     GateioHttpClient,
     GateioMarginHttpAPI,
@@ -109,16 +109,16 @@ from nautilus_gateio.http import (
     GateioSpotHttpAPI,
     GateioWalletHttpAPI,
 )
-from nautilus_gateio.instruments import (
+from gateio_nt.instruments import (
     parse_delivery_instrument,
     parse_instrument,
     parse_option_instrument,
     parse_perpetual_instrument,
     parse_spot_instrument,
 )
-from nautilus_gateio.providers import GateioInstrumentProvider
-from nautilus_gateio.types import TICKER_FIELDS, GateioTicker
-from nautilus_gateio.websocket import (
+from gateio_nt.providers import GateioInstrumentProvider
+from gateio_nt.types import TICKER_FIELDS, GateioTicker
+from gateio_nt.websocket import (
     GateioPrivateWebSocket,
     GateioPublicWebSocket,
     GateioWebSocketClient,

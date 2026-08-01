@@ -31,15 +31,15 @@ from nautilus_trader.model.identifiers import TradeId, VenueOrderId
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from nautilus_trader.model.position import Position
 
-from nautilus_gateio.common.constants import GATEIO_HTTP_MAINNET
-from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
-from nautilus_gateio.common.errors import GateioClientError
-from nautilus_gateio.http.client import GateioHttpClient, RateLimiter
-from nautilus_gateio.http.futures import GateioFuturesHttpAPI
-from nautilus_gateio.http.margin import GateioMarginHttpAPI
-from nautilus_gateio.http.options import GateioOptionsHttpAPI
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.http.wallet import GateioWalletHttpAPI
+from gateio_nt.common.constants import GATEIO_HTTP_MAINNET
+from gateio_nt.common.enums import GateioProductType, GateioSpotAccountMode
+from gateio_nt.common.errors import GateioClientError
+from gateio_nt.http.client import GateioHttpClient, RateLimiter
+from gateio_nt.http.futures import GateioFuturesHttpAPI
+from gateio_nt.http.margin import GateioMarginHttpAPI
+from gateio_nt.http.options import GateioOptionsHttpAPI
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.http.wallet import GateioWalletHttpAPI
 
 try:  # pytest inserts the tests directory on the path; support both layouts
     from tests.test_execution_orders import (
@@ -553,7 +553,7 @@ class TestFillOnClosedOrder:
         """
         from nautilus_trader.core.fsm import InvalidStateTrigger
 
-        from nautilus_gateio.execution import FILLABLE_TERMINAL_STATUSES
+        from gateio_nt.execution import FILLABLE_TERMINAL_STATUSES
 
         accepted_from = set()
         for finish_as, status in (
@@ -1576,7 +1576,7 @@ class TestReconnectReconciliation:
         from nautilus_trader.core.uuid import UUID4
         from nautilus_trader.model.events import OrderAccepted
 
-        from nautilus_gateio.execution import RESTATABLE_ORDER_STATUSES
+        from gateio_nt.execution import RESTATABLE_ORDER_STATUSES
 
         def accepts_an_accepted_event(status: OrderStatus) -> bool:
             env = ExecHarness(products=(GateioProductType.PERP,))

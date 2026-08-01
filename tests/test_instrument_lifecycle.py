@@ -32,14 +32,14 @@ from nautilus_trader.model.data import InstrumentClose, InstrumentStatus
 from nautilus_trader.model.enums import InstrumentCloseType, MarketStatusAction
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
 
-from nautilus_gateio import data as data_module
-from nautilus_gateio.common.constants import GATEIO_CLIENT_ID, GATEIO_VENUE
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioClientError
-from nautilus_gateio.common.status import diff_and_emit_statuses, market_status_action
-from nautilus_gateio.config import GateioDataClientConfig
-from nautilus_gateio.data import GateioDataClient
-from nautilus_gateio.instruments import parse_delivery_instrument
+from gateio_nt import data as data_module
+from gateio_nt.common.constants import GATEIO_CLIENT_ID, GATEIO_VENUE
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioClientError
+from gateio_nt.common.status import diff_and_emit_statuses, market_status_action
+from gateio_nt.config import GateioDataClientConfig
+from gateio_nt.data import GateioDataClient
+from gateio_nt.instruments import parse_delivery_instrument
 from tests.test_data_client import (
     OPTION_ID,
     OPTION_SYMBOL,

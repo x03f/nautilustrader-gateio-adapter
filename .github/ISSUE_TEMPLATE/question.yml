@@ -42,7 +42,7 @@ body:
       description: >
         Output of `pip freeze | grep gateio`, if the question is about a version
         you have installed. On a git install it names the exact commit.
-      placeholder: "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter@0e0814f5818011..."
+      placeholder: "gateio-nt-community @ git+https://github.com/x03f/gateio-nt-community@0e0814f5818011..."
     validations:
       required: false
   - type: dropdown

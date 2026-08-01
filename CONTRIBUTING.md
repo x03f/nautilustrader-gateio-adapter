@@ -31,8 +31,8 @@ which goes stale.
 ## Development setup
 
 ```bash
-git clone https://github.com/x03f/nautilustrader-gateio-adapter.git
-cd nautilustrader-gateio-adapter
+git clone https://github.com/x03f/gateio-nt-community.git
+cd gateio-nt-community
 python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
@@ -81,11 +81,11 @@ Formatting and lint rules are configured in `pyproject.toml`: `ruff`, line
 length 100, rule sets `E`, `F`, `W`, `I`, `UP`, `B`. CI runs exactly:
 
 ```bash
-ruff check nautilus_gateio tests examples
-ruff format --check nautilus_gateio tests examples
+ruff check gateio_nt tests examples
+ruff format --check gateio_nt tests examples
 ```
 
-Use `ruff format nautilus_gateio tests examples` to apply the formatting.
+Use `ruff format gateio_nt tests examples` to apply the formatting.
 
 ## Pull requests
 
@@ -139,7 +139,7 @@ Security problems do not go in an issue: report them privately, as described in
 ## Asking a question
 
 Questions belong in the tracker, on the **Question** form
-([new issue](https://github.com/x03f/nautilustrader-gateio-adapter/issues/new/choose)).
+([new issue](https://github.com/x03f/gateio-nt-community/issues/new/choose)).
 Blank issues are turned off and Discussions are not enabled on this repository,
 so that form is the route — and a question that turns out to be a defect is
 relabeled rather than turned away.

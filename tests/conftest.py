@@ -22,8 +22,8 @@ from typing import Any
 
 import pytest
 
-from nautilus_gateio import factories
-from nautilus_gateio.common.credentials import (
+from gateio_nt import factories
+from gateio_nt.common.credentials import (
     ENV_API_KEY,
     ENV_API_SECRET,
     ENV_TESTNET_API_KEY,

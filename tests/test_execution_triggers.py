@@ -25,7 +25,7 @@ from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import TradeId, VenueOrderId
 from nautilus_trader.model.objects import Price, Quantity
 
-from nautilus_gateio.common.enums import GateioProductType
+from gateio_nt.common.enums import GateioProductType
 
 try:  # pytest inserts the tests directory on the path; support both layouts
     from tests.test_execution_orders import (

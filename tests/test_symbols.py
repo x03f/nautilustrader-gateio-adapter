@@ -1,6 +1,6 @@
 """Tests for the minimum-normalization symbology contract.
 
-The contract under test (``nautilus_gateio.common.symbols``):
+The contract under test (``gateio_nt.common.symbols``):
 
 ======================  ============================================  ============================
 Product                 Instrument id                                 ``raw_symbol``
@@ -21,9 +21,9 @@ from __future__ import annotations
 import pytest
 from nautilus_trader.model.identifiers import InstrumentId
 
-from nautilus_gateio.common.constants import GATEIO, GATEIO_VENUE
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.symbols import (
+from gateio_nt.common.constants import GATEIO, GATEIO_VENUE
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.symbols import (
     PERP_SUFFIX,
     gateio_to_instrument_id,
     instrument_id_to_gateio,

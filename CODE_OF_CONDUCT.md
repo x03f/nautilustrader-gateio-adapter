@@ -60,10 +60,10 @@ representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement at
-[GitHub private reporting](https://github.com/x03f/nautilustrader-gateio-adapter/security/advisories/new),
+[GitHub private reporting](https://github.com/x03f/gateio-nt-community/security/advisories/new),
 which reaches the maintainers privately and is not visible to anyone else. A
 report that does not need to be private may instead be opened as an
-[issue](https://github.com/x03f/nautilustrader-gateio-adapter/issues/new/choose).
+[issue](https://github.com/x03f/gateio-nt-community/issues/new/choose).
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the

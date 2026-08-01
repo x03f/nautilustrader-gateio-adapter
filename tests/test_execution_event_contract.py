@@ -29,7 +29,7 @@ import pytest
 from nautilus_trader.execution.client import ExecutionClient
 from nautilus_trader.live.execution_client import LiveExecutionClient
 
-from nautilus_gateio.execution import GateioExecutionClient
+from gateio_nt.execution import GateioExecutionClient
 
 #: ``generate_*`` methods that build execution **reports** for reconciliation
 #: rather than publishing an event. They answer a request from the engine and

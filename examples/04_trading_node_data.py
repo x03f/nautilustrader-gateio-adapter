@@ -24,7 +24,7 @@ from nautilus_trader.model.data import Bar, BarType, QuoteTick, TradeTick
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-from nautilus_gateio import (
+from gateio_nt import (
     GATEIO,
     GateioDataClientConfig,
     GateioLiveDataClientFactory,

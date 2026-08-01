@@ -34,9 +34,9 @@ from nautilus_trader.model.events import OrderCanceled, OrderFilled, OrderUpdate
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Quantity
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.execution import is_cash_buy_payload
-from nautilus_gateio.instruments import parse_spot_instrument
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.execution import is_cash_buy_payload
+from gateio_nt.instruments import parse_spot_instrument
 from tests.test_execution_orders import SPOT_BTC_USDT, ExecHarness, build_instruments
 
 # A cheap pair, where the base number is the larger of the two denominations.

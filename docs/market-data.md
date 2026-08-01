@@ -120,7 +120,7 @@ strategy, that configuration is the first thing to check.
 ```python
 from nautilus_trader.common.config import InstrumentProviderConfig
 
-from nautilus_gateio import GateioDataClientConfig, GateioProductType
+from gateio_nt import GateioDataClientConfig, GateioProductType
 
 config = GateioDataClientConfig(
     products=(GateioProductType.SPOT, GateioProductType.PERP),
@@ -263,7 +263,7 @@ with an explicit log message rather than approximated.
 Gate.io publishes depth as a REST snapshot plus an incremental WebSocket stream.
 The snapshot carries an `id`; every incremental notification carries the range of
 update ids it covers, `U` (first) to `u` (last).
-`nautilus_gateio.books.GateioOrderBook` implements the venue's documented
+`gateio_nt.books.GateioOrderBook` implements the venue's documented
 synchronization algorithm and is deliberately free of framework dependencies — it
 deals in `Decimal` prices and sizes, so it can be tested without a trading
 environment:
@@ -378,7 +378,7 @@ venue. Levels dropped this way are counted in `book_levels_not_representable`.
 
 Book limits differ per product. The table below is
 `BOOK_INTERVALS_MS`, `BOOK_LEVELS` and `BOOK_SNAPSHOT_LIMITS` in
-`nautilus_gateio/websocket/public.py`, which are the single source of truth: the
+`gateio_nt/websocket/public.py`, which are the single source of truth: the
 data client imports them rather than restating the numbers.
 
 | Product                        | `order_book_update` intervals | Stream depth levels                                    | Snapshot depths       |
@@ -596,7 +596,7 @@ in-tree adapters do with the same problem (`BinanceTicker`, `BetfairTicker`).
 ```python
 from nautilus_trader.model.data import DataType
 
-from nautilus_gateio import GATEIO_CLIENT_ID, GateioTicker
+from gateio_nt import GATEIO_CLIENT_ID, GateioTicker
 
 self.subscribe_data(
     DataType(GateioTicker, metadata={"instrument_id": instrument_id}),
@@ -634,7 +634,7 @@ declaration order, so a consumer can iterate the row instead of hard-coding a
 list that the venue may extend:
 
 ```python
-from nautilus_gateio import TICKER_FIELDS, GateioTicker
+from gateio_nt import TICKER_FIELDS, GateioTicker
 
 
 def on_data(self, data) -> None:
@@ -646,7 +646,7 @@ def on_data(self, data) -> None:
 The tuple is the definition, not a copy of one: `GateioTicker.from_payload` reads
 exactly these keys out of the venue row, and the type's fields are exactly these
 plus `instrument_id`, `ts_event` and `ts_init`. Which product populates which is
-grouped in the tuple's own source (`nautilus_gateio/types.py`) and follows the
+grouped in the tuple's own source (`gateio_nt/types.py`) and follows the
 channel: `last`, `change_percentage`, `high_24h` and `low_24h` come from every
 product; `highest_bid`, `lowest_ask`, `base_volume` and `quote_volume` from
 `spot.tickers` alone; the `volume_24h*` family, `total_size` and
@@ -764,7 +764,7 @@ right:
 ```python
 import asyncio
 
-from nautilus_gateio import GateioProductType, GateioPublicWebSocket
+from gateio_nt import GateioProductType, GateioPublicWebSocket
 
 
 async def main() -> None:
@@ -788,14 +788,14 @@ Channels without a typed helper remain reachable through the underlying client:
 The book assembly is equally standalone, and takes plain payload dictionaries:
 
 ```python
-from nautilus_gateio.books import GateioOrderBook, OrderBookSequenceError, SnapshotStaleError
+from gateio_nt.books import GateioOrderBook, OrderBookSequenceError, SnapshotStaleError
 ```
 
 The authoritative limit tables can be read the same way, so a tool does not have
 to hard-code them:
 
 ```python
-from nautilus_gateio.websocket.public import (
+from gateio_nt.websocket.public import (
     BOOK_INTERVALS_MS,
     BOOK_LEVELS,
     BOOK_SNAPSHOT_LIMITS,

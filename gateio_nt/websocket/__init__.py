@@ -8,9 +8,9 @@
 
 from __future__ import annotations
 
-from nautilus_gateio.websocket.client import GateioWebSocketClient
-from nautilus_gateio.websocket.private import GateioPrivateWebSocket
-from nautilus_gateio.websocket.public import GateioPublicWebSocket
+from gateio_nt.websocket.client import GateioWebSocketClient
+from gateio_nt.websocket.private import GateioPrivateWebSocket
+from gateio_nt.websocket.public import GateioPublicWebSocket
 
 __all__ = [
     "GateioPrivateWebSocket",

@@ -56,7 +56,7 @@ deployment can stay where it is:
 To stay on it, pin the tag:
 
 ```bash
-pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter@v0.1.0"
+pip install "gateio-nt-community @ git+https://github.com/x03f/gateio-nt-community@v0.1.0"
 ```
 
 To move off it, see the README's
@@ -107,7 +107,7 @@ same configuration under 0.2.0a1 talks to **mainnet, with real funds**.
 If you want the testnet, say so:
 
 ```python
-from nautilus_gateio import GateioExecClientConfig
+from gateio_nt import GateioExecClientConfig
 
 config = GateioExecClientConfig(environment="testnet")
 ```
@@ -181,7 +181,7 @@ the mistake is not caught downstream either. Check every hard-coded id.
 ## 4. Venue: `GATEIO` -> `GATE_IO`
 
 ```python
-from nautilus_gateio import GATEIO
+from gateio_nt import GATEIO
 
 GATEIO  # 0.1.0: "GATEIO"     0.2.0a1: "GATE_IO"
 ```
@@ -203,7 +203,7 @@ migration.
 
 The venue is no longer configurable. 0.1.0 exposed a `venue` field on both
 config classes and on `GateioInstrumentProvider`; 0.2.0a1 takes the venue from
-`nautilus_gateio.common.constants` and the clients register themselves against
+`gateio_nt.common.constants` and the clients register themselves against
 it unconditionally. A venue that can differ between the instrument provider, the
 data client and the execution client is a routing failure waiting to happen, and
 nothing about this exchange needed the flexibility.
@@ -213,7 +213,7 @@ key you use in `TradingNodeConfig`, so a hard-coded `"GATEIO"` key now produces
 a client whose id does not match the venue it registers for:
 
 ```python
-from nautilus_gateio import GATEIO, GateioDataClientConfig
+from gateio_nt import GATEIO, GateioDataClientConfig
 
 data_clients = {GATEIO: GateioDataClientConfig()}  # use the constant, not a literal
 ```
@@ -313,10 +313,10 @@ config.py                 config.py, with credential resolution in common/creden
 ```
 
 The top-level `__init__` re-exports the public API, so
-`from nautilus_gateio import GateioDataClient, GateioHttpClient` still works.
+`from gateio_nt import GateioDataClient, GateioHttpClient` still works.
 Deep imports of the old flat modules must be updated — including
-`from nautilus_gateio.config import resolve_credentials`, which now lives in
-`nautilus_gateio.common.credentials` (and remains available from the top level).
+`from gateio_nt.config import resolve_credentials`, which now lives in
+`gateio_nt.common.credentials` (and remains available from the top level).
 
 Renamed public symbols:
 
@@ -339,9 +339,9 @@ Withdrawn from the public API entirely:
 | `RateLimiter`                                      | no longer exported; it is an internal detail of the HTTP transport                             |
 | `validate_order` (in `schemas.py`)                 | removed — order validation happens in the execution client, which rejects with a stated reason |
 
-`RateLimiter` is the one that catches people out: `from nautilus_gateio import
+`RateLimiter` is the one that catches people out: `from gateio_nt import
 RateLimiter` used to work and now raises `ImportError`. The class still exists
-inside `nautilus_gateio.http.client`, but it is not part of the supported
+inside `gateio_nt.http.client`, but it is not part of the supported
 surface and its constructor arguments have changed.
 
 ## 10. The REST client is async, namespaced, and returns venue payloads unchanged
@@ -361,7 +361,7 @@ with GateioHttpClient() as client:
 ```python
 import asyncio
 
-from nautilus_gateio import GateioHttpClient, GateioSpotHttpAPI
+from gateio_nt import GateioHttpClient, GateioSpotHttpAPI
 
 
 async def main() -> None:
@@ -386,7 +386,7 @@ return the decoded venue payload unchanged, which for candlesticks means Gate's
 positional array `[timestamp_s, quote_volume, close, high, low, open,
 base_volume, closed]` — note that the close precedes high, low and open. The
 adapter translates into NautilusTrader objects one layer up, in
-`nautilus_gateio.instruments` and the data client, so the namespaces stay a
+`gateio_nt.instruments` and the data client, so the namespaces stay a
 faithful, auditable view of the API. Code that consumed the old parsed
 dictionaries has to be rewritten against the venue's own schema.
 
@@ -425,7 +425,7 @@ channel names differ per product. The client constructor therefore requires
 both:
 
 ```python
-from nautilus_gateio import GateioProductType, GateioWebSocketClient
+from gateio_nt import GateioProductType, GateioWebSocketClient
 
 ws = GateioWebSocketClient(
     url="wss://api.gateio.ws/ws/v4/",
@@ -441,7 +441,7 @@ Prefer `GateioPublicWebSocket` and `GateioPrivateWebSocket`, which pick the
 endpoint and the channel names for a product themselves:
 
 ```python
-from nautilus_gateio import GateioProductType, GateioPublicWebSocket
+from gateio_nt import GateioProductType, GateioPublicWebSocket
 
 ws = GateioPublicWebSocket(product=GateioProductType.PERP, handler=print)
 ```
@@ -491,7 +491,7 @@ you if you passed nothing), drops the `venue` argument, and gains `products` and
 `options_underlyings`:
 
 ```python
-from nautilus_gateio import GateioHttpClient, GateioInstrumentProvider, GateioProductType
+from gateio_nt import GateioHttpClient, GateioInstrumentProvider, GateioProductType
 
 provider = GateioInstrumentProvider(
     GateioHttpClient(),
@@ -566,7 +566,7 @@ product.
    review the key's permissions on the Gate.io side instead.
 6. Convert direct REST usage to `await` plus the product namespace, and rewrite
    whatever consumed the old parsed payloads against the venue schema.
-7. Replace `from nautilus_gateio import RateLimiter` and any other withdrawn
+7. Replace `from gateio_nt import RateLimiter` and any other withdrawn
    top-level import (§9).
 8. Subscribe to quotes explicitly if you were relying on synthetic ones.
 9. Replace paper-trading usage with NautilusTrader sandbox or backtest

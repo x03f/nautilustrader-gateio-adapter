@@ -18,7 +18,7 @@ from nautilus_trader.model.enums import (
     TimeInForce,
 )
 
-from nautilus_gateio.common.enums import (
+from gateio_nt.common.enums import (
     GATEIO_ALL_PRODUCTS,
     GateioFinishAs,
     GateioOrderStatus,

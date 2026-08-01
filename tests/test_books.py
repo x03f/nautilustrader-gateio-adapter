@@ -1,4 +1,4 @@
-"""Regression tests for the local order book assembly in ``nautilus_gateio.books``.
+"""Regression tests for the local order book assembly in ``gateio_nt.books``.
 
 Everything here is synthetic: no sockets are opened, no credentials are read and
 no venue is contacted. The payload shapes mirror what Gate.io actually pushes,
@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from nautilus_gateio.books import (
+from gateio_nt.books import (
     ASK,
     BID,
     GateioOrderBook,

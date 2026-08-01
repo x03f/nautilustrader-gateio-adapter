@@ -1,7 +1,7 @@
 """Typed REST namespace for Gate.io margin ledgers: isolated, cross and unified.
 
 Margin is not a separate market on Gate.io. Orders are still placed through the
-spot endpoints (:mod:`nautilus_gateio.http.spot`) with the ``account`` field set
+spot endpoints (:mod:`gateio_nt.http.spot`) with the ``account`` field set
 to ``margin``, ``cross_margin`` or ``unified``; what lives here are the balance,
 borrow, repay and account-mode endpoints backing those ledgers.
 
@@ -25,9 +25,9 @@ The endpoints in this module are the ones most likely to fail for reasons that
 are *configuration*, not error: an unprovisioned wallet, an account still in
 classic mode, or an API key without unified permission. :func:`require_wallet`
 turns those responses into
-:class:`~nautilus_gateio.common.errors.WalletNotProvisionedError` — or, where the
+:class:`~gateio_nt.common.errors.WalletNotProvisionedError` — or, where the
 venue refused the query rather than reporting an empty ledger, its subclass
-:class:`~nautilus_gateio.common.errors.WalletQueryRefusedError` — with an
+:class:`~gateio_nt.common.errors.WalletQueryRefusedError` — with an
 actionable message, so a caller trading only spot can degrade gracefully instead
 of failing to start.
 """
@@ -37,14 +37,14 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from typing import Any
 
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.errors import (
     ACCOUNT_MODE_LABELS,
     WALLET_NOT_PROVISIONED_LABELS,
     GateioClientError,
     WalletNotProvisionedError,
     WalletQueryRefusedError,
 )
-from nautilus_gateio.http.client import GateioHttpClient
+from gateio_nt.http.client import GateioHttpClient
 
 #: What a caller can actually do about each capability-gating error label.
 _REMEDIES: dict[str, str] = {

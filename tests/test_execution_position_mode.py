@@ -43,8 +43,8 @@ from typing import Any
 
 import pytest
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import (
     GateioClientError,
     GateioServerError,
     WalletNotProvisionedError,

@@ -8,7 +8,7 @@ permission for that product) is logged and skipped rather than aborting the
 whole load.
 
 Every request goes through the typed REST namespaces in
-:mod:`nautilus_gateio.http`, so the venue's path layout — in particular the
+:mod:`gateio_nt.http`, so the venue's path layout — in particular the
 ``/futures/{settle}`` versus ``/delivery/{settle}`` split — is expressed in
 exactly one place:
 
@@ -47,22 +47,22 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 
-from nautilus_gateio.common.constants import GATEIO_VENUE
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.constants import GATEIO_VENUE
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import (
     ACCOUNT_MODE_LABELS,
     WALLET_NOT_PROVISIONED_LABELS,
     GateioError,
     WalletNotProvisionedError,
 )
-from nautilus_gateio.common.parsing import to_decimal
-from nautilus_gateio.common.symbols import instrument_id_to_gateio
-from nautilus_gateio.http.client import GateioHttpClient
-from nautilus_gateio.http.futures import GateioFuturesHttpAPI
-from nautilus_gateio.http.options import GateioOptionsHttpAPI
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.http.wallet import GateioWalletHttpAPI
-from nautilus_gateio.instruments import (
+from gateio_nt.common.parsing import to_decimal
+from gateio_nt.common.symbols import instrument_id_to_gateio
+from gateio_nt.http.client import GateioHttpClient
+from gateio_nt.http.futures import GateioFuturesHttpAPI
+from gateio_nt.http.options import GateioOptionsHttpAPI
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.http.wallet import GateioWalletHttpAPI
+from gateio_nt.instruments import (
     parse_delivery_instrument,
     parse_option_instrument,
     parse_perpetual_instrument,

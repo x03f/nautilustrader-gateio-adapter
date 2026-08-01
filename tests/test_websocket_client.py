@@ -1,4 +1,4 @@
-"""Regression tests for ``nautilus_gateio.websocket.client.GateioWebSocketClient``.
+"""Regression tests for ``gateio_nt.websocket.client.GateioWebSocketClient``.
 
 No sockets are opened: the ``websockets`` connect function is replaced with a
 stub that records the handshake and echoes acknowledgements. No credentials are
@@ -14,10 +14,10 @@ from typing import Any
 
 import pytest
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioError
-from nautilus_gateio.websocket import client as ws_client_module
-from nautilus_gateio.websocket.client import (
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioError
+from gateio_nt.websocket import client as ws_client_module
+from gateio_nt.websocket.client import (
     SIZE_DECIMAL_HEADER,
     GateioWebSocketClient,
     is_transient_ws_error,
@@ -287,7 +287,7 @@ def test_the_transport_logs_through_the_platform_logger(
 
     client._dispatch("this is not json")
 
-    leaked = [record.getMessage() for record in caplog.records if "nautilus_gateio" in record.name]
+    leaked = [record.getMessage() for record in caplog.records if "gateio_nt" in record.name]
     assert leaked == [], f"logged through the standard library: {leaked}"
     assert recording_logger, "the transport built no platform Logger"
     assert recording_logger[0].levels("malformed frame") == ["WARNING"]
@@ -330,7 +330,7 @@ async def test_a_failed_replay_is_reported_through_the_platform_logger(
     await client._after_reconnect()
 
     assert client.subscribe_failures == 1
-    leaked = [record.getMessage() for record in caplog.records if "nautilus_gateio" in record.name]
+    leaked = [record.getMessage() for record in caplog.records if "gateio_nt" in record.name]
     assert leaked == [], f"logged through the standard library: {leaked}"
     assert recording_logger, "the transport built no platform Logger"
     assert recording_logger[0].levels("Failed to replay subscription") == ["ERROR"]

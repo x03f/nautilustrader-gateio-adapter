@@ -92,8 +92,8 @@ jobs:
           files = sorted(p.name for p in pathlib.Path("dist").iterdir())
           expected = sorted(
               [
-                  f"nautilustrader_gateio_adapter-{version}-py3-none-any.whl",
-                  f"nautilustrader_gateio_adapter-{version}.tar.gz",
+                  f"gateio_nt_community-{version}-py3-none-any.whl",
+                  f"gateio_nt_community-{version}.tar.gz",
               ]
           )
           assert files == expected, f"dist/ holds {files}, expected {expected}"
@@ -113,8 +113,8 @@ jobs:
           /tmp/relcheck/bin/python - <<'PY'
           import os
 
-          import nautilus_gateio
-          from nautilus_gateio import (
+          import gateio_nt
+          from gateio_nt import (
               GATEIO,
               GateioDataClient,
               GateioDataClientConfig,
@@ -125,15 +125,15 @@ jobs:
               GateioLiveExecClientFactory,
               instrument_id_to_gateio,
           )
-          from nautilus_gateio.http.spot import GateioSpotHttpAPI
-          from nautilus_gateio.websocket.public import GateioPublicWebSocket
+          from gateio_nt.http.spot import GateioSpotHttpAPI
+          from gateio_nt.websocket.public import GateioPublicWebSocket
 
           tag = os.environ["GITHUB_REF_NAME"]
-          assert nautilus_gateio.__version__ == tag.removeprefix("v"), (
-              f"installed wheel reports {nautilus_gateio.__version__}, tag is {tag}"
+          assert gateio_nt.__version__ == tag.removeprefix("v"), (
+              f"installed wheel reports {gateio_nt.__version__}, tag is {tag}"
           )
           assert GATEIO == "GATE_IO", GATEIO
-          print("wheel verified:", nautilus_gateio.__version__, nautilus_gateio.__file__)
+          print("wheel verified:", gateio_nt.__version__, gateio_nt.__file__)
           PY
 
       # A checksum file lets anyone who downloads an asset confirm they received
@@ -142,7 +142,7 @@ jobs:
       - name: Compute SHA256 checksums
         run: |
           cd dist
-          sha256sum nautilustrader_gateio_adapter-*.whl nautilustrader_gateio_adapter-*.tar.gz \
+          sha256sum gateio_nt_community-*.whl gateio_nt_community-*.tar.gz \
             > SHA256SUMS
           cat SHA256SUMS
 
@@ -184,7 +184,7 @@ jobs:
       # PyPI publication is deliberately absent, and Trusted Publishing is
       # deliberately not configured.
       #
-      # The distribution name on this branch — `nautilustrader-gateio-adapter` —
+      # The distribution name on this branch — `gateio-nt-community` —
       # leads with the NautilusTrader mark, which their trademark policy does not
       # permit for a project that is neither official nor affiliated. The name
       # becomes `gateio-nt-community` before anything is uploaded to an index,

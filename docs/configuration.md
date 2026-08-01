@@ -1,6 +1,6 @@
 # Configuration
 
-Every configuration class lives in `nautilus_gateio.config`. Both are frozen
+Every configuration class lives in `gateio_nt.config`. Both are frozen
 `msgspec` structs extending the standard NautilusTrader live-client configs
 (`LiveDataClientConfig` / `LiveExecClientConfig`), so they can be embedded
 directly in a `TradingNodeConfig`.
@@ -54,7 +54,7 @@ One consequence worth stating plainly: only the exact string `"testnet"`
 typo in this field is not an error; it is the live exchange.
 
 ```python
-from nautilus_gateio.config import MAINNET, TESTNET
+from gateio_nt.config import MAINNET, TESTNET
 
 MAINNET  # "mainnet"
 TESTNET  # "testnet"
@@ -96,7 +96,7 @@ Environment selection, URL resolution and this validation are **unit-tested**
 ### The endpoint addresses are named constants
 
 Every address the adapter can dial is a constant in
-`nautilus_gateio.common.constants`, so a tool that needs one can read it instead
+`gateio_nt.common.constants`, so a tool that needs one can read it instead
 of copying a string that may move. `resolve_http_url()` and
 `resolve_ws_url(product)` pick from these tables; `base_url_http` and
 `base_url_ws` replace what they picked.
@@ -138,20 +138,20 @@ publishes no testnet endpoint for, which is the same refusal
 [described above](#which-products-exist-on-the-testnet), reached one layer down.
 
 ```python
-from nautilus_gateio.common.constants import WS_URLS, ws_url
-from nautilus_gateio import GATEIO_HTTP_MAINNET, GATEIO_HTTP_TESTNET, GateioProductType
+from gateio_nt.common.constants import WS_URLS, ws_url
+from gateio_nt import GATEIO_HTTP_MAINNET, GATEIO_HTTP_TESTNET, GateioProductType
 
 ws_url(GateioProductType.PERP, testnet=True)  # wss://fx-ws-testnet.gateio.ws/v4/ws/usdt
 ```
 
 Four of these — `GATEIO_HTTP_MAINNET`, `GATEIO_HTTP_TESTNET`, `GATEIO_WS_SPOT`
 and `GATEIO_WS_OPTIONS` — are also re-exported from the package root. The rest
-are reached through `nautilus_gateio.common.constants`, as shown above.
+are reached through `gateio_nt.common.constants`, as shown above.
 
 ## The venue string is `GATE_IO`
 
 The venue is `GATE_IO`, exported as the `GATEIO` constant from
-`nautilus_gateio` (defined in `nautilus_gateio.common.constants`). Instrument
+`gateio_nt` (defined in `gateio_nt.common.constants`). Instrument
 ids therefore read `BTC_USDT.GATE_IO`, `BTC_USDT-PERP.GATE_IO` and so on; see
 [symbology.md](symbology.md).
 
@@ -168,7 +168,7 @@ keeping the two identical avoids a client id that names something the engine
 does not route by:
 
 ```python
-from nautilus_gateio import GATEIO, GateioLiveDataClientFactory, GateioLiveExecClientFactory
+from gateio_nt import GATEIO, GateioLiveDataClientFactory, GateioLiveExecClientFactory
 
 node.add_data_client_factory(GATEIO, GateioLiveDataClientFactory)
 node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)
@@ -178,7 +178,7 @@ node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)
 
 `api_key` / `api_secret` default to `None`, in which case they are resolved from
 the environment when the client is created
-(`nautilus_gateio.common.credentials.resolve_credentials`):
+(`gateio_nt.common.credentials.resolve_credentials`):
 
 | Variable                                           | Used when                                               |
 |----------------------------------------------------|---------------------------------------------------------|
@@ -296,7 +296,7 @@ GateioExecClientConfig(max_retries=0)
 #             Expected `int` >= 1, was 0
 
 ImportableConfig(
-    path="nautilus_gateio.config:GateioExecClientConfig",
+    path="gateio_nt.config:GateioExecClientConfig",
     config={"max_retries": 0},
 ).create()
 # msgspec.ValidationError: Expected `int` >= 1 - at `$.max_retries`
@@ -559,7 +559,7 @@ the fields it compares live in different places: `products` against
 functions are public, so a configuration can be checked up front:
 
 ```python
-from nautilus_gateio.config import (
+from gateio_nt.config import (
     validate_book_interval_ms,
     validate_products,
     validate_snapshot_limit,
@@ -698,7 +698,7 @@ environment while watching prices from another.
 from nautilus_trader.common.config import InstrumentProviderConfig
 from nautilus_trader.config import TradingNodeConfig
 
-from nautilus_gateio import (
+from gateio_nt import (
     GATEIO,
     GateioDataClientConfig,
     GateioExecClientConfig,
@@ -748,20 +748,20 @@ config = TradingNodeConfig(
     trader_id="GATEIO-001",
     data_clients={
         "GATE_IO": ImportableConfig(
-            path="nautilus_gateio.config:GateioDataClientConfig",
+            path="gateio_nt.config:GateioDataClientConfig",
             config={
                 "environment": "testnet",  # state it on BOTH clients, see below
                 "products": ["SPOT", "PERP"],
                 "instrument_provider": {"load_all": True},
             },
             factory=ImportableFactoryConfig(
-                path="nautilus_gateio.factories:GateioLiveDataClientFactory",
+                path="gateio_nt.factories:GateioLiveDataClientFactory",
             ),
         ),
     },
     exec_clients={
         "GATE_IO": ImportableConfig(
-            path="nautilus_gateio.config:GateioExecClientConfig",
+            path="gateio_nt.config:GateioExecClientConfig",
             config={"environment": "testnet", "products": ["SPOT"], "spot_account_mode": "spot"},
         ),
     },

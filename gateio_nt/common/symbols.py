@@ -36,8 +36,8 @@ import re
 
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
-from nautilus_gateio.common.constants import GATEIO_VENUE
-from nautilus_gateio.common.enums import GateioProductType
+from gateio_nt.common.constants import GATEIO_VENUE
+from gateio_nt.common.enums import GateioProductType
 
 #: Suffix marking a perpetual contract (NautilusTrader convention).
 PERP_SUFFIX = "-PERP"

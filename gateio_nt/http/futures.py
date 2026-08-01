@@ -58,8 +58,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from nautilus_gateio.common.errors import UnsupportedOrderError
-from nautilus_gateio.http.client import GateioHttpClient
+from gateio_nt.common.errors import UnsupportedOrderError
+from gateio_nt.http.client import GateioHttpClient
 
 
 class GateioFuturesHttpAPI:
@@ -281,7 +281,7 @@ class GateioFuturesHttpAPI:
         The wallet does not exist until funds are first transferred into it;
         until then Gate.io answers ``USER_NOT_FOUND``. That is a provisioning
         state, not an authentication failure — see
-        :class:`nautilus_gateio.common.errors.WalletNotProvisionedError`.
+        :class:`gateio_nt.common.errors.WalletNotProvisionedError`.
         """
         return await self._client.get(f"{self._base}/accounts", signed=True)
 
@@ -490,7 +490,7 @@ class GateioFuturesHttpAPI:
 
         **This request is never replayed.** A retry could open the position
         twice. If the transport raises
-        :class:`~nautilus_gateio.http.client.GateioRequestAmbiguousError` the
+        :class:`~gateio_nt.http.client.GateioRequestAmbiguousError` the
         submission outcome is unknown: resolve it with :meth:`list_orders` or
         :meth:`get_order` on the client id rather than resubmitting.
         """
@@ -551,7 +551,7 @@ class GateioFuturesHttpAPI:
 
         Delivery futures have no amend endpoint; calling this on a delivery
         namespace raises
-        :class:`nautilus_gateio.common.errors.UnsupportedOrderError` so the
+        :class:`gateio_nt.common.errors.UnsupportedOrderError` so the
         execution client can reject the modification explicitly.
         """
         if self._delivery:

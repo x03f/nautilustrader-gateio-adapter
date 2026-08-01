@@ -1,6 +1,6 @@
 # Releasing
 
-Checklist for cutting a release of `nautilustrader-gateio-adapter`.
+Checklist for cutting a release of `gateio-nt-community`.
 
 **A release is published by pushing a tag, and by nothing else.**
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) runs on any
@@ -18,7 +18,7 @@ Two things follow, and both matter:
   stops with a message if one already exists, because a release it did not build
   carries no provenance. Delete the hand-made release and re-run the workflow.
 * **Do not upload anything to a package index.** Not by hand, not from a
-  workflow. The distribution name `nautilustrader-gateio-adapter` leads with the
+  workflow. The distribution name `gateio-nt-community` leads with the
   NautilusTrader mark, which their trademark policy does not permit for a project
   that is neither official nor affiliated, and it is being renamed to
   `gateio-nt-community` before anything is published to an index. A name claimed
@@ -49,7 +49,7 @@ Steps 1 and 6 below are what keep that true.
 * [ ] **Drop the `.dev` segment** in the two places that hold the version, and
       nowhere else:
       * `pyproject.toml` — `version`
-      * `nautilus_gateio/__init__.py` — `__version__`
+      * `gateio_nt/__init__.py` — `__version__`
 
       They must be identical strings: `tests/test_package.py` fails if they are
       not, and the `build` job compares the `pyproject.toml` value against the
@@ -63,8 +63,8 @@ Steps 1 and 6 below are what keep that true.
       then additions and fixes.
 * [ ] `CHANGELOG.md` link definitions at the foot of the file:
       ```
-      [Unreleased]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v<version>...HEAD
-      [<version>]: https://github.com/x03f/nautilustrader-gateio-adapter/compare/v<previous>...v<version>
+      [Unreleased]: https://github.com/x03f/gateio-nt-community/compare/v<version>...HEAD
+      [<version>]: https://github.com/x03f/gateio-nt-community/compare/v<previous>...v<version>
       ```
 * [ ] Every page that states the version this branch **is** now names the release
       being cut: the `README.md` Status line, its requirements table and its
@@ -82,8 +82,8 @@ Steps 1 and 6 below are what keep that true.
 
 ```bash
 pip install -e '.[dev]'
-ruff check nautilus_gateio tests examples
-ruff format --check nautilus_gateio tests examples
+ruff check gateio_nt tests examples
+ruff format --check gateio_nt tests examples
 pytest
 ```
 
@@ -114,8 +114,8 @@ ls dist/
 ```
 
 `ls dist/` must show exactly two files, both carrying the version being
-released: `nautilustrader_gateio_adapter-<version>-py3-none-any.whl` and
-`nautilustrader_gateio_adapter-<version>.tar.gz`.
+released: `gateio_nt_community-<version>-py3-none-any.whl` and
+`gateio_nt_community-<version>.tar.gz`.
 
 Both filenames must carry the version from `pyproject.toml` with no `.dev`
 segment. A `.dev` in a filename here means step 1 was skipped, and the artifact
@@ -130,12 +130,12 @@ environment **outside the source tree** and import from there:
 ```bash
 python -m venv /tmp/relcheck && /tmp/relcheck/bin/pip install -q dist/*.whl
 cd /tmp && /tmp/relcheck/bin/python -c "
-import nautilus_gateio
-from nautilus_gateio import GATEIO, GateioDataClient, GateioExecutionClient
-from nautilus_gateio.common.symbols import instrument_id_to_gateio
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.websocket.public import GateioPublicWebSocket
-print(nautilus_gateio.__version__, GATEIO)
+import gateio_nt
+from gateio_nt import GATEIO, GateioDataClient, GateioExecutionClient
+from gateio_nt.common.symbols import instrument_id_to_gateio
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.websocket.public import GateioPublicWebSocket
+print(gateio_nt.__version__, GATEIO)
 "
 ```
 
@@ -195,7 +195,7 @@ Set both version places to the next developmental release — the next pre-relea
 number with `.dev0`:
 
 * `pyproject.toml` — `version = "0.2.0a3.dev0"`
-* `nautilus_gateio/__init__.py` — `__version__ = "0.2.0a3.dev0"`
+* `gateio_nt/__init__.py` — `__version__ = "0.2.0a3.dev0"`
 
 PEP 440 orders `0.2.0a2 < 0.2.0a3.dev0 < 0.2.0a3`, which is what makes the string
 honest about which side of the release a build sits on. The number is a
@@ -226,8 +226,8 @@ git push origin main
       ```bash
       gh release download v<version> --dir /tmp/verify
       cd /tmp/verify && sha256sum -c SHA256SUMS
-      gh attestation verify nautilustrader_gateio_adapter-<version>-py3-none-any.whl \
-        --repo x03f/nautilustrader-gateio-adapter
+      gh attestation verify gateio_nt_community-<version>-py3-none-any.whl \
+        --repo x03f/gateio-nt-community
       ```
       The attestation names the workflow and the commit the bytes were built
       from. If it does not verify, the assets are not the ones the run produced.

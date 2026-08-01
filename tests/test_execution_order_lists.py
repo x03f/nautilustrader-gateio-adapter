@@ -53,10 +53,10 @@ from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders import LimitOrder
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioClientError, GateioServerError
-from nautilus_gateio.http.client import GateioRequestAmbiguousError
-from nautilus_gateio.instruments import parse_spot_instrument
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioClientError, GateioServerError
+from gateio_nt.http.client import GateioRequestAmbiguousError
+from gateio_nt.instruments import parse_spot_instrument
 from tests.test_execution_orders import (
     FUT_BTC_USDT,
     PERP_BTC_USDT,

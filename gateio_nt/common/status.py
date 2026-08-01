@@ -1,7 +1,7 @@
 """Derive ``MarketStatusAction`` from a Gate.io instrument listing payload.
 
 Gate.io publishes no instrument-status channel on any product: the recorded
-public channel inventory (:mod:`nautilus_gateio.websocket.public`) is trades,
+public channel inventory (:mod:`gateio_nt.websocket.public`) is trades,
 book ticker, depth, snapshots, candlesticks and tickers, and nothing
 status-shaped. The only evidence of a halt, a listing or a delisting is in the
 instrument listing endpoints, so the status feed is polled — which the
@@ -28,8 +28,8 @@ from typing import Any
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.identifiers import InstrumentId
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.parsing import to_int
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.parsing import to_int
 
 #: Venue ``status`` values that mean the contract is on its way off the board.
 _DELISTING_STATUSES: frozenset[str] = frozenset({"delisting", "delisted"})

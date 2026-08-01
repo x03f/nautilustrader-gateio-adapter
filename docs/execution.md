@@ -16,8 +16,9 @@ reasonable implementation silently loses fills.
 
 This is an external community adapter for NautilusTrader 1.230.0, implemented in
 pure Python ([why](architecture.md#the-deliberate-python-only-architecture)). It
-is not an official NautilusTrader integration, and it is not affiliated with
-Gate.io or Nautech Systems.
+is not an official NautilusTrader integration: this is an independent community
+project, not affiliated with, endorsed by, or supported by Nautech Systems Pty
+Ltd or the official NautilusTrader project, nor by Gate.io.
 
 **Live validation of the execution path covers spot, one USDT perpetual and one
 option contract.** Gate.io has accepted, filled, amended and canceled real spot
@@ -223,7 +224,7 @@ venue trade id that de-duplication depends on.
 Supported order types are exactly:
 
 ```python
-from nautilus_gateio.execution import CONDITIONAL_ORDER_TYPES, SUPPORTED_ORDER_TYPES
+from gateio_nt.execution import CONDITIONAL_ORDER_TYPES, SUPPORTED_ORDER_TYPES
 ```
 
 `SUPPORTED_ORDER_TYPES` = MARKET, LIMIT, STOP_MARKET, STOP_LIMIT,
@@ -249,8 +250,8 @@ the strings:
 | `POC`               | `poc`      | GTC with `post_only=True` — "pending or cancelled", maker-only, rests |
 
 ```python
-from nautilus_gateio import GateioTimeInForce
-from nautilus_gateio.common.enums import time_in_force_from_gateio, time_in_force_to_gateio
+from gateio_nt import GateioTimeInForce
+from gateio_nt.common.enums import time_in_force_from_gateio, time_in_force_to_gateio
 ```
 
 `time_in_force_to_gateio(time_in_force, post_only=False)` is the mapping used for
@@ -688,7 +689,7 @@ armed id  <->  client order id  <->  fired id
 ```
 
 ```python
-from nautilus_gateio.execution import GateioTriggerLink
+from gateio_nt.execution import GateioTriggerLink
 ```
 
 The live map is readable as `GateioExecutionClient.trigger_links` (a copy, keyed
@@ -720,7 +721,7 @@ The order of operations is:
    the rebasing update *is* the whole transition.
 
 Read `GateioTriggerLink` and `_maybe_swap_trigger_venue_order_id` in
-`nautilus_gateio/execution.py` if the ordering matters to you. The regression
+`gateio_nt/execution.py` if the ordering matters to you. The regression
 suite for the transition is `TestTriggerVenueOrderIdRebase` in
 `tests/test_execution_events.py`; the identity suites are in
 `tests/test_execution_triggers.py`.
@@ -1290,11 +1291,11 @@ seven-digit count.
 ### `generate_client_order_id` and `sanitize_client_order_id`
 
 Both are exported from the package root, out of
-`nautilus_gateio.common.signing`, and both are **unit-tested**
+`gateio_nt.common.signing`, and both are **unit-tested**
 (`tests/test_signing.py`).
 
 ```python
-from nautilus_gateio import generate_client_order_id, sanitize_client_order_id
+from gateio_nt import generate_client_order_id, sanitize_client_order_id
 ```
 
 `generate_client_order_id(tag="ng")` builds the replacement id described above:

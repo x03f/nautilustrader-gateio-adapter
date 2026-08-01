@@ -31,7 +31,7 @@ import asyncio
 import os
 import sys
 
-from nautilus_gateio import (
+from gateio_nt import (
     GateioFuturesHttpAPI,
     GateioHttpClient,
     GateioOptionsHttpAPI,
@@ -40,8 +40,8 @@ from nautilus_gateio import (
     WalletNotProvisionedError,
     resolve_credentials,
 )
-from nautilus_gateio.config import resolve_http_url
-from nautilus_gateio.http.margin import require_wallet
+from gateio_nt.config import resolve_http_url
+from gateio_nt.http.margin import require_wallet
 
 ENVIRONMENT = os.environ.get("GATEIO_ENVIRONMENT", "testnet").strip().lower()
 

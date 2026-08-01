@@ -1,4 +1,4 @@
-"""Unit tests for :class:`nautilus_gateio.http.client.GateioHttpClient`.
+"""Unit tests for :class:`gateio_nt.http.client.GateioHttpClient`.
 
 All HTTP traffic is served by ``httpx.MockTransport`` — no network access and no
 credentials are involved. Placeholder key/secret strings exercise the signing
@@ -24,18 +24,18 @@ from typing import Any
 import httpx
 import pytest
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     GATEIO_API_PREFIX,
     GATEIO_HTTP_MAINNET,
     GATEIO_HTTP_TESTNET,
 )
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.errors import (
     GateioClientError,
     GateioError,
     GateioServerError,
 )
-from nautilus_gateio.common.signing import sign_request
-from nautilus_gateio.http.client import (
+from gateio_nt.common.signing import sign_request
+from gateio_nt.http.client import (
     EXPIRY_HEADER,
     IDEMPOTENT_METHODS,
     GateioAmbiguousServerError,
@@ -919,7 +919,7 @@ async def test_a_gate_closed_between_attempts_reports_an_unknown_outcome():
     cancel Gate.io may already have applied would be answered with
     ``OrderCancelRejected``.
     """
-    from nautilus_gateio.execution import is_ambiguous_outcome
+    from gateio_nt.execution import is_ambiguous_outcome
 
     log: list[httpx.Request] = []
     client = make_client(
@@ -1252,7 +1252,7 @@ async def test_the_factory_replaces_a_gated_transport_that_still_has_owners():
     factory that checks only ``is_closed`` hands the next node in the process a
     live-looking transport that refuses every request.
     """
-    from nautilus_gateio import factories
+    from gateio_nt import factories
 
     first = factories.get_cached_gateio_http_client(base_url=GATEIO_HTTP_MAINNET)
     first.acquire()  # data client

@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from nautilus_gateio import (
+from gateio_nt import (
     GateioFuturesHttpAPI,
     GateioHttpClient,
     GateioOptionsHttpAPI,

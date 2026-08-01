@@ -21,7 +21,7 @@ perpetual and one option contract and stops there
 ([validation status](validation.md)).
 
 ```python
-from nautilus_gateio import GateioProductType, GateioSpotAccountMode
+from gateio_nt import GateioProductType, GateioSpotAccountMode
 
 GateioProductType.SPOT      # spot pairs
 GateioProductType.PERP      # USDT-margined perpetual futures (linear)
@@ -572,7 +572,7 @@ for every product, including a delivery contract, so `_watch_instrument_close`
 does run for delivery futures and options. What no offline test drives through
 the client is the subscription path for an **inverse** perpetual: there the
 suite asserts the instrument parser and the per-product channel names, depth
-limits and push intervals in `nautilus_gateio.websocket.public`, and stops
+limits and push intervals in `gateio_nt.websocket.public`, and stops
 there. The [validation status](validation.md) page grades each behavior on the
 [evidence ladder](validation.md#the-evidence-ladder) rather than by product.
 
@@ -600,7 +600,7 @@ publish no bar-closed flag, so the client infers the close from the bucket
 advancing or from the clock passing the bucket's end.
 
 Per-product order book limits are the tables in
-`nautilus_gateio.websocket.public` — spot and perpetuals push at 20 ms or 100 ms,
+`gateio_nt.websocket.public` — spot and perpetuals push at 20 ms or 100 ms,
 delivery and options at 100 ms or 1000 ms; snapshot depth reaches 100 everywhere
 except options, which stop at 50.
 

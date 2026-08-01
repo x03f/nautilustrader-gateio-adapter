@@ -17,7 +17,7 @@ about the code rather than about the exchange.
 ## Reporting a vulnerability
 
 Report privately through
-[GitHub private vulnerability reporting](https://github.com/x03f/nautilustrader-gateio-adapter/security/advisories/new).
+[GitHub private vulnerability reporting](https://github.com/x03f/gateio-nt-community/security/advisories/new).
 Do **not** open a public issue for a security problem.
 
 A useful report states the adapter build — the line `pip freeze | grep gateio`
@@ -49,7 +49,7 @@ patched release.
 Each statement below describes the code as it currently stands, and names the
 module so you can check it rather than take it on trust.
 
-* **Resolution happens once, in `nautilus_gateio/common/credentials.py`.** An
+* **Resolution happens once, in `gateio_nt/common/credentials.py`.** An
   `api_key` / `api_secret` set explicitly on the config wins. When either is
   `None`, the environment is read: `GATE_API_KEY` and `GATE_API_SECRET` on
   mainnet, `GATE_TESTNET_API_KEY` and `GATE_TESTNET_API_SECRET` on the testnet.
@@ -95,7 +95,7 @@ Scrub logs before sharing them. For values you print yourself, the package
 provides a fingerprint helper:
 
 ```python
-from nautilus_gateio.common.credentials import mask
+from gateio_nt.common.credentials import mask
 
 mask(api_key)  # 'abcd...wxyz'; '<empty>' when empty; '***' up to 8 characters
 ```

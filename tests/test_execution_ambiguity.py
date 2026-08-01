@@ -32,16 +32,16 @@ from nautilus_trader.model.events import (
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Price, Quantity
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import (
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import (
     GateioClientError,
     GateioError,
     GateioServerError,
     OrderValidationError,
     UnsupportedOrderError,
 )
-from nautilus_gateio.execution import is_ambiguous_outcome
-from nautilus_gateio.http.client import (
+from gateio_nt.execution import is_ambiguous_outcome
+from gateio_nt.http.client import (
     GateioAmbiguousServerError,
     GateioRequestAmbiguousError,
 )

@@ -35,10 +35,10 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Lint (ruff check)
-        run: ruff check nautilus_gateio tests examples
+        run: ruff check gateio_nt tests examples
 
       - name: Format check (ruff format)
-        run: ruff format --check nautilus_gateio tests examples
+        run: ruff format --check gateio_nt tests examples
 
       # Both invocations, deliberately. `pytest` and `python -m pytest` do not
       # build the same `sys.path`: the module form prepends the working
@@ -57,11 +57,11 @@ jobs:
       - name: Import smoke test
         run: |
           python -c "
-          import nautilus_gateio
-          from nautilus_gateio.common.symbols import instrument_id_to_gateio
-          from nautilus_gateio.http.spot import GateioSpotHttpAPI
-          from nautilus_gateio.websocket.public import GateioPublicWebSocket
-          print(nautilus_gateio.__version__, instrument_id_to_gateio('BTC_USDT-PERP.GATE_IO'))
+          import gateio_nt
+          from gateio_nt.common.symbols import instrument_id_to_gateio
+          from gateio_nt.http.spot import GateioSpotHttpAPI
+          from gateio_nt.websocket.public import GateioPublicWebSocket
+          print(gateio_nt.__version__, instrument_id_to_gateio('BTC_USDT-PERP.GATE_IO'))
           "
 
   minimum-platform:
@@ -144,8 +144,8 @@ jobs:
           version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
           files = sorted(p.name for p in pathlib.Path("dist").iterdir())
           expected = [
-              f"nautilustrader_gateio_adapter-{version}-py3-none-any.whl",
-              f"nautilustrader_gateio_adapter-{version}.tar.gz",
+              f"gateio_nt_community-{version}-py3-none-any.whl",
+              f"gateio_nt_community-{version}.tar.gz",
           ]
           assert files == sorted(expected), f"dist/ holds {files}, expected {sorted(expected)}"
           print("dist/ is clean:", files)
@@ -163,41 +163,41 @@ jobs:
           /tmp/wheelcheck/bin/python - <<'PY'
           import importlib
 
-          import nautilus_gateio
+          import gateio_nt
 
           # Every sub-package must be present in the distribution.
           for name in (
-              "nautilus_gateio.common",
-              "nautilus_gateio.common.constants",
-              "nautilus_gateio.common.credentials",
-              "nautilus_gateio.common.enums",
-              "nautilus_gateio.common.errors",
-              "nautilus_gateio.common.parsing",
-              "nautilus_gateio.common.signing",
-              "nautilus_gateio.common.symbols",
-              "nautilus_gateio.http",
-              "nautilus_gateio.http.client",
-              "nautilus_gateio.http.futures",
-              "nautilus_gateio.http.margin",
-              "nautilus_gateio.http.options",
-              "nautilus_gateio.http.spot",
-              "nautilus_gateio.http.wallet",
-              "nautilus_gateio.websocket",
-              "nautilus_gateio.websocket.client",
-              "nautilus_gateio.websocket.private",
-              "nautilus_gateio.websocket.public",
-              "nautilus_gateio.books",
-              "nautilus_gateio.config",
-              "nautilus_gateio.data",
-              "nautilus_gateio.execution",
-              "nautilus_gateio.factories",
-              "nautilus_gateio.instruments",
-              "nautilus_gateio.providers",
+              "gateio_nt.common",
+              "gateio_nt.common.constants",
+              "gateio_nt.common.credentials",
+              "gateio_nt.common.enums",
+              "gateio_nt.common.errors",
+              "gateio_nt.common.parsing",
+              "gateio_nt.common.signing",
+              "gateio_nt.common.symbols",
+              "gateio_nt.http",
+              "gateio_nt.http.client",
+              "gateio_nt.http.futures",
+              "gateio_nt.http.margin",
+              "gateio_nt.http.options",
+              "gateio_nt.http.spot",
+              "gateio_nt.http.wallet",
+              "gateio_nt.websocket",
+              "gateio_nt.websocket.client",
+              "gateio_nt.websocket.private",
+              "gateio_nt.websocket.public",
+              "gateio_nt.books",
+              "gateio_nt.config",
+              "gateio_nt.data",
+              "gateio_nt.execution",
+              "gateio_nt.factories",
+              "gateio_nt.instruments",
+              "gateio_nt.providers",
           ):
               importlib.import_module(name)
 
           # Every name the README and docs tell users to import must resolve.
-          from nautilus_gateio import (
+          from gateio_nt import (
               GATEIO,
               GateioDataClient,
               GateioDataClientConfig,
@@ -225,7 +225,7 @@ jobs:
               "BTC_USDT",
           )
           assert GateioExecClientConfig().environment == "mainnet"
-          print("wheel verified:", nautilus_gateio.__version__, nautilus_gateio.__file__)
+          print("wheel verified:", gateio_nt.__version__, gateio_nt.__file__)
           PY
 
   examples:

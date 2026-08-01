@@ -1,6 +1,6 @@
 # Gate.io Adapter for NautilusTrader
 
-[![CI](https://github.com/x03f/nautilustrader-gateio-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/x03f/nautilustrader-gateio-adapter/actions/workflows/ci.yml)
+[![CI](https://github.com/x03f/gateio-nt-community/actions/workflows/ci.yml/badge.svg)](https://github.com/x03f/gateio-nt-community/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![NautilusTrader 1.230+](https://img.shields.io/badge/nautilus__trader-1.230%2B-orange)](https://github.com/nautechsystems/nautilus_trader)
@@ -10,7 +10,8 @@ A community-maintained adapter connecting
 [Gate.io](https://www.gate.io/): market data and order execution across spot, margin, perpetual
 futures (linear and inverse), delivery futures and options, over the Gate.io v4 REST and WebSocket
 API. It is an external pip-installable package rather than part of the NautilusTrader repository,
-and it is not affiliated with, maintained by or endorsed by Gate.io or Nautech Systems.
+This is an independent community project: it is not affiliated with, endorsed by, or supported
+by Nautech Systems Pty Ltd or the official NautilusTrader project, nor by Gate.io.
 
 - Market data comes from the venue's own streams and listings: trades, best bid and offer,
   sequence-validated book deltas, ten-level depth from the periodic snapshot channel, closed bars,
@@ -34,7 +35,7 @@ Public market data needs no account, so the shortest path from install to data i
 credentials at all.
 
 ```bash
-pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter"
+pip install "gateio-nt-community @ git+https://github.com/x03f/gateio-nt-community"
 ```
 
 That line installs the default branch, which is ahead of the published release; pinning the release
@@ -44,7 +45,7 @@ tag instead, and everything else about versions, is under
 ```python
 import asyncio
 
-from nautilus_gateio import GateioFuturesHttpAPI, GateioHttpClient, GateioSpotHttpAPI
+from gateio_nt import GateioFuturesHttpAPI, GateioHttpClient, GateioSpotHttpAPI
 
 
 async def main() -> None:
@@ -122,18 +123,18 @@ string, the instrument ids and the execution environment default all changed.
 | `v0.2.0a1` (the released tag) | `>=1.230.0,<2`  | `>=3.12,<3.15` | v4          |
 
 ```bash
-pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter"
+pip install "gateio-nt-community @ git+https://github.com/x03f/gateio-nt-community"
 ```
 
 That line installs the **default branch**, which is ahead of the published release, reports
 `0.2.0a2.dev0`, and is what the pages here describe. To install the release instead, pin the tag:
 
 ```bash
-pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter@v0.2.0a1"
+pip install "gateio-nt-community @ git+https://github.com/x03f/gateio-nt-community@v0.2.0a1"
 ```
 
-The package is not on PyPI, so a bare `pip install nautilustrader-gateio-adapter` finds nothing, and
-neither does `nautilustrader-gateio-adapter==0.2.0a1`: the name is an install name rather than a
+The package is not on PyPI, so a bare `pip install gateio-nt-community` finds nothing, and
+neither does `gateio-nt-community==0.2.0a1`: the name is an install name rather than a
 PyPI name, and that version is a git tag rather than a PyPI release. The two builds report different
 versions — `0.2.0a2.dev0` from the branch, `0.2.0a1` from the tag. A development release sorts after
 the release it followed and before the release it is working toward
@@ -144,7 +145,7 @@ and the release commit is `0e0814f`:
 
 ```bash
 pip freeze | grep gateio
-# nautilustrader-gateio-adapter @ git+https://github.com/x03f/...@0e0814f5818011...
+# gateio-nt-community @ git+https://github.com/x03f/...@0e0814f5818011...
 ```
 
 `nautilus_trader` is a declared dependency, so pip will pull it in. It is a large wheel, and on a
@@ -154,15 +155,15 @@ makes any failure there easier to read.
 Check that the two versions line up before anything else:
 
 ```bash
-python -c "import nautilus_gateio, nautilus_trader; print(nautilus_gateio.__version__, nautilus_trader.__version__)"
+python -c "import gateio_nt, nautilus_trader; print(gateio_nt.__version__, nautilus_trader.__version__)"
 # 0.2.0a2.dev0 1.230.0        (0.2.0a1 if you pinned the tag)
 ```
 
 For development:
 
 ```bash
-git clone https://github.com/x03f/nautilustrader-gateio-adapter
-cd nautilustrader-gateio-adapter
+git clone https://github.com/x03f/gateio-nt-community
+cd gateio-nt-community
 pip install -e '.[dev]'
 ```
 
@@ -183,13 +184,13 @@ export GATE_TESTNET_API_SECRET=...
 | `GATE_TESTNET_API_KEY` / `GATE_TESTNET_API_SECRET` | `environment="testnet"`, in preference to the pair above. |
 
 The credential names drop the "IO". The switches in the example scripts keep it
-(`GATEIO_ENVIRONMENT`, `GATEIO_ALLOW_ORDERS`), the package is `nautilus_gateio`, the venue string is
+(`GATEIO_ENVIRONMENT`, `GATEIO_ALLOW_ORDERS`), the package is `gateio_nt`, the venue string is
 `GATE_IO`, and every constant in the code is `GATEIO_*`. `GATEIO_API_KEY` is read by nothing.
 
 Nothing checks at startup that credentials are present, because their absence is a valid state:
 public market data needs none. A data client without a key runs and looks healthy. An execution
 client without a key also builds and reaches `READY`, and then fails at its first signed request
-with `MISSING_CREDENTIALS` (`nautilus_gateio/http/client.py`). A misspelled variable name produces
+with `MISSING_CREDENTIALS` (`gateio_nt/http/client.py`). A misspelled variable name produces
 exactly that failure, and what you see is a node that waits a minute and then reports
 `Timed out (60.0s) waiting for engines to connect and initialize`, with the real cause one `[ERROR]`
 line above it ([troubleshooting.md](docs/troubleshooting.md#the-node-hangs-for-a-minute-and-then-reports-a-timeout)).
@@ -273,7 +274,7 @@ from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-from nautilus_gateio import (
+from gateio_nt import (
     GATEIO,
     GateioDataClientConfig,
     GateioLiveDataClientFactory,
@@ -350,7 +351,7 @@ This type is on the branch only. A build pinned to `v0.2.0a1` — anything whose
 ```python
 from nautilus_trader.model.data import DataType
 
-from nautilus_gateio import GATEIO_CLIENT_ID, GateioTicker
+from gateio_nt import GATEIO_CLIENT_ID, GateioTicker
 
 self.subscribe_data(
     DataType(GateioTicker, metadata={"instrument_id": instrument_id}),
@@ -426,7 +427,7 @@ from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-from nautilus_gateio import (
+from gateio_nt import (
     GATEIO,
     GateioDataClientConfig,
     GateioExecClientConfig,
@@ -528,7 +529,7 @@ Both client dictionaries and both factory registrations are keyed by the venue s
 which the package exports as `GATEIO`:
 
 ```python
-from nautilus_gateio import GATEIO, GateioLiveDataClientFactory, GateioLiveExecClientFactory
+from gateio_nt import GATEIO, GateioLiveDataClientFactory, GateioLiveExecClientFactory
 
 node.add_data_client_factory(GATEIO, GateioLiveDataClientFactory)
 node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)
@@ -549,7 +550,7 @@ each of the two enums takes, and the one field a declarative config cannot expre
 The factories share one HTTP transport and one instrument provider between clients configured alike,
 so a data client and an execution client in the same node use one connection pool and one instrument
 load. Each cache holds exactly one entry — `functools.lru_cache(1)` in
-[`nautilus_gateio/factories.py`](nautilus_gateio/factories.py), matching the adapters bundled with
+[`gateio_nt/factories.py`](gateio_nt/factories.py), matching the adapters bundled with
 NautilusTrader. The transport is keyed by credentials, base URL, timeout and retry count; `products`
 is not part of that key, and the instrument provider is keyed separately, by transport, products,
 option underlyings and provider config. A second, differently configured transport therefore evicts
@@ -832,8 +833,9 @@ contains no NautilusTrader source code; it imports the library through its publi
 
 ## Disclaimer
 
-This is an unofficial, community-maintained project. It is not affiliated with, maintained by or
-endorsed by Gate.io or Nautech Systems. All trademarks belong to their respective owners.
+This is an independent community project. It is not affiliated with, endorsed by, or supported by
+Nautech Systems Pty Ltd or the official NautilusTrader project, and it is not affiliated with,
+endorsed by, or supported by Gate.io. All trademarks belong to their respective owners.
 
 Trading cryptocurrencies involves substantial risk of loss and is not suitable for everyone. This
 software is provided "as is", without warranty of any kind; see the [LICENSE](LICENSE) for the full

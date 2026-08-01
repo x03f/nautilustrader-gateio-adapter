@@ -34,11 +34,11 @@ as stable or production ready, because nothing has earned either word yet.
 ## Package layout
 
 The package is sub-packaged by concern. The top-level `__init__` re-exports the
-public API, so `from nautilus_gateio import GateioDataClient` works regardless of
+public API, so `from gateio_nt import GateioDataClient` works regardless of
 where a symbol physically lives.
 
 ```text
-nautilus_gateio/
+gateio_nt/
   __init__.py            public API re-exports, __version__
   common/
     constants.py         venue id, REST/WS endpoints, interval maps, limits
@@ -100,7 +100,7 @@ the data client's job.
 Both factories are registered with a `TradingNode` under the venue's client id:
 
 ```python
-from nautilus_gateio import (
+from gateio_nt import (
     GATEIO,
     GateioLiveDataClientFactory,
     GateioLiveExecClientFactory,
@@ -393,7 +393,7 @@ rather than the deprecated per-pair percentage.
 ## Symbology
 
 All conversion between NautilusTrader instrument ids and Gate.io symbols lives in
-`nautilus_gateio/common/symbols.py`. No other module builds or takes apart an
+`gateio_nt/common/symbols.py`. No other module builds or takes apart an
 instrument id. Three decisions define it; [symbology.md](symbology.md) is the
 full reference.
 

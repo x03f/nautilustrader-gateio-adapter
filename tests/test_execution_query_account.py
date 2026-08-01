@@ -34,8 +34,8 @@ import pytest
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import QueryAccount
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioClientError, GateioServerError
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioClientError, GateioServerError
 from tests.test_execution_orders import ExecHarness
 
 SPOT_WALLET = [{"currency": "USDT", "available": "1000", "locked": "0"}]

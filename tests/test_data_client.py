@@ -1,4 +1,4 @@
-"""Regression tests for :class:`nautilus_gateio.data.GateioDataClient`.
+"""Regression tests for :class:`gateio_nt.data.GateioDataClient`.
 
 The client is built with real NautilusTrader components (message bus, cache,
 clock) and a stub instrument provider. Every REST call is stubbed and no socket
@@ -42,27 +42,27 @@ from nautilus_trader.model.enums import BookAction, BookType, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
 from nautilus_trader.model.instruments import Instrument
 
-from nautilus_gateio import data as data_module
-from nautilus_gateio.books import GateioOrderBook
-from nautilus_gateio.common.constants import (
+from gateio_nt import data as data_module
+from gateio_nt.books import GateioOrderBook
+from gateio_nt.common.constants import (
     GATEIO_CLIENT_ID,
     GATEIO_HTTP_MAINNET,
     GATEIO_VENUE,
 )
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioClientError
-from nautilus_gateio.config import ORDER_BOOK_UPDATE_INTERVALS_MS, GateioDataClientConfig
-from nautilus_gateio.data import GateioDataClient, venue_quantity
-from nautilus_gateio.http.client import GateioHttpClient, RateLimiter
-from nautilus_gateio.http.futures import GateioFuturesHttpAPI
-from nautilus_gateio.http.options import GateioOptionsHttpAPI
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.instruments import (
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioClientError
+from gateio_nt.config import ORDER_BOOK_UPDATE_INTERVALS_MS, GateioDataClientConfig
+from gateio_nt.data import GateioDataClient, venue_quantity
+from gateio_nt.http.client import GateioHttpClient, RateLimiter
+from gateio_nt.http.futures import GateioFuturesHttpAPI
+from gateio_nt.http.options import GateioOptionsHttpAPI
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.instruments import (
     parse_option_instrument,
     parse_perpetual_instrument,
     parse_spot_instrument,
 )
-from nautilus_gateio.websocket import public as public_module
+from gateio_nt.websocket import public as public_module
 
 SPOT_ID = InstrumentId.from_str("BTC_USDT.GATE_IO")
 PERP_ID = InstrumentId.from_str("BTC_USDT-PERP.GATE_IO")

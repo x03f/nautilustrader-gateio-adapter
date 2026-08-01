@@ -24,18 +24,18 @@ from nautilus_trader.model.events import AccountState
 from nautilus_trader.model.identifiers import AccountId, TraderId
 from nautilus_trader.model.objects import AccountBalance, Money
 
-from nautilus_gateio.common.constants import (
+from gateio_nt.common.constants import (
     GATEIO,
     GATEIO_HTTP_MAINNET,
     GATEIO_HTTP_TESTNET,
     GATEIO_VENUE,
 )
-from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
-from nautilus_gateio.common.errors import GateioServerError
-from nautilus_gateio.config import GateioDataClientConfig, GateioExecClientConfig
-from nautilus_gateio.data import GateioDataClient
-from nautilus_gateio.execution import GateioExecutionClient
-from nautilus_gateio.factories import (
+from gateio_nt.common.enums import GateioProductType, GateioSpotAccountMode
+from gateio_nt.common.errors import GateioServerError
+from gateio_nt.config import GateioDataClientConfig, GateioExecClientConfig
+from gateio_nt.data import GateioDataClient
+from gateio_nt.execution import GateioExecutionClient
+from gateio_nt.factories import (
     GateioLiveDataClientFactory,
     GateioLiveExecClientFactory,
     get_cached_gateio_http_client,
@@ -326,7 +326,7 @@ class TestSharedTransportLifecycle:
     """
 
     def test_the_factory_registers_one_owner_per_client(self, block_network):
-        from nautilus_gateio.factories import _build_http_client
+        from gateio_nt.factories import _build_http_client
 
         transport = _build_http_client(GateioDataClientConfig()).acquire()
         try:
@@ -337,7 +337,7 @@ class TestSharedTransportLifecycle:
             get_cached_gateio_http_client.cache_clear()
 
     def test_the_last_release_closes_the_transport(self, block_network):
-        from nautilus_gateio.factories import _build_http_client
+        from gateio_nt.factories import _build_http_client
 
         transport = _build_http_client(GateioDataClientConfig()).acquire()
         transport.acquire()

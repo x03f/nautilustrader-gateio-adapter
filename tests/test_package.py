@@ -33,10 +33,10 @@ from pathlib import Path
 
 import pytest
 
-import nautilus_gateio
+import gateio_nt
 
-PACKAGE_NAME = "nautilus_gateio"
-PACKAGE_DIR = Path(nautilus_gateio.__file__).resolve().parent
+PACKAGE_NAME = "gateio_nt"
+PACKAGE_DIR = Path(gateio_nt.__file__).resolve().parent
 
 
 def find_repo_root() -> Path:
@@ -81,7 +81,7 @@ def walk_module_names() -> list[str]:
     names += [
         name
         for _, name, _ in pkgutil.walk_packages(
-            nautilus_gateio.__path__,
+            gateio_nt.__path__,
             prefix=f"{PACKAGE_NAME}.",
         )
     ]
@@ -98,7 +98,7 @@ MODULE_NAMES = walk_module_names()
 
 class TestImports:
     def test_package_imports(self):
-        assert nautilus_gateio is not None
+        assert gateio_nt is not None
 
     def test_the_module_walk_finds_the_whole_tree(self):
         """Regression: the module list must be derived, not hand-maintained."""
@@ -232,7 +232,7 @@ class TestSuiteTargetsTheCurrentLayout:
 class TestPublicApi:
     def test_version_matches_pyproject(self):
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        assert nautilus_gateio.__version__ == pyproject["project"]["version"]
+        assert gateio_nt.__version__ == pyproject["project"]["version"]
 
     def test_version_is_canonical_pep440(self):
         """The version must be spelled in PEP 440 canonical form.
@@ -249,26 +249,26 @@ class TestPublicApi:
             r"^([1-9][0-9]*!)?(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))*"
             r"((a|b|rc)(0|[1-9][0-9]*))?(\.post(0|[1-9][0-9]*))?(\.dev(0|[1-9][0-9]*))?$",
         )
-        version = nautilus_gateio.__version__
+        version = gateio_nt.__version__
         assert canonical.match(version), (
             f"{version!r} is not a canonical PEP 440 version; the wheel and sdist "
             "filenames would not match the string in pyproject.toml"
         )
 
     def test_version_is_exported(self):
-        assert "__version__" in nautilus_gateio.__all__
+        assert "__version__" in gateio_nt.__all__
 
     def test_all_is_a_sorted_unique_list(self):
-        names = nautilus_gateio.__all__
+        names = gateio_nt.__all__
         assert names
         assert len(names) == len(set(names)), "duplicate names in __all__"
         assert names == sorted(names), "__all__ is not sorted"
 
-    @pytest.mark.parametrize("name", sorted(nautilus_gateio.__all__))
+    @pytest.mark.parametrize("name", sorted(gateio_nt.__all__))
     def test_every_exported_name_resolves(self, name):
-        assert getattr(nautilus_gateio, name, None) is not None
+        assert getattr(gateio_nt, name, None) is not None
 
-    @pytest.mark.parametrize("name", sorted(nautilus_gateio.__all__))
+    @pytest.mark.parametrize("name", sorted(gateio_nt.__all__))
     def test_every_exported_name_is_importable_from_the_package(self, name):
         namespace: dict[str, object] = {}
         exec(f"from {PACKAGE_NAME} import {name}", namespace)  # noqa: S102
@@ -293,7 +293,7 @@ class TestPublicApi:
         ],
     )
     def test_documented_entry_points_are_exported(self, name):
-        assert name in nautilus_gateio.__all__
+        assert name in gateio_nt.__all__
 
     @pytest.mark.parametrize("name", ["paper", "reconcile", "schemas", "constants", "symbols"])
     def test_removed_v0_1_0_modules_are_gone(self, name):
@@ -355,7 +355,7 @@ class TestVersionControlCoverage:
     """Every source file must reach a fresh clone.
 
     Regression for `.gitignore` carrying a bare `credentials*` secrets rule,
-    which silently excluded `nautilus_gateio/common/credentials.py`. The module
+    which silently excluded `gateio_nt/common/credentials.py`. The module
     existed on disk, so imports, tests and even the locally built wheel were all
     green; only a clean checkout was missing it, and it failed there at import
     time. Building the wheel from the working tree cannot catch this class of
@@ -401,7 +401,7 @@ class TestVersionControlCoverage:
 # -- packaging regression ------------------------------------------------------
 #
 # The v0.2.0 sub-package split broke the wheel once already: an explicit,
-# non-recursive `packages = ["nautilus_gateio"]` shipped only the top-level
+# non-recursive `packages = ["gateio_nt"]` shipped only the top-level
 # modules, so the installed package could not import at all while the source
 # tree on PYTHONPATH kept every test green. These tests build the wheel from a
 # clean copy of the repo and exercise the public API from the INSTALLED artefact.
@@ -548,7 +548,7 @@ class TestWheelContents:
             assert f"{PACKAGE_NAME}/py.typed" in archive.namelist()
 
     def test_the_wheel_version_matches_the_package_version(self, built_wheel):
-        assert nautilus_gateio.__version__ in built_wheel.name
+        assert gateio_nt.__version__ in built_wheel.name
 
 
 class TestInstalledWheel:
@@ -580,15 +580,13 @@ class TestInstalledWheel:
         self,
         installed_wheel_env,
     ):
-        names = ", ".join(sorted(nautilus_gateio.__all__))
+        names = ", ".join(sorted(gateio_nt.__all__))
         script = (
             f"from {PACKAGE_NAME} import {names}\n"
             f"import {PACKAGE_NAME} as pkg\n"
             "print(pkg.__version__)\n"
         )
-        assert run_in_installed_env(installed_wheel_env, script).strip() == (
-            nautilus_gateio.__version__
-        )
+        assert run_in_installed_env(installed_wheel_env, script).strip() == (gateio_nt.__version__)
 
     def test_the_documented_quick_start_imports_work_from_the_installed_wheel(
         self,

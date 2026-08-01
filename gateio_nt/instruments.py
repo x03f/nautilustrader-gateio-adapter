@@ -4,7 +4,7 @@ Every function here is a pure payload transformation: it takes the JSON object
 Gate.io returns for one instrument and produces the matching NautilusTrader
 instrument. Nothing performs I/O, and a payload that cannot be represented
 faithfully yields ``None`` rather than an exception, so a single malformed entry
-never aborts a batch load (see :mod:`nautilus_gateio.providers`).
+never aborts a batch load (see :mod:`gateio_nt.providers`).
 
 Quantity semantics
 ------------------
@@ -128,13 +128,13 @@ from nautilus_trader.model.tick_scheme import (
 )
 from nautilus_trader.model.tick_scheme.base import list_tick_schemes
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.parsing import (
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.parsing import (
     precision_from_increment,
     secs_to_nanos,
     to_decimal,
 )
-from nautilus_gateio.common.symbols import (
+from gateio_nt.common.symbols import (
     gateio_to_instrument_id,
     parse_delivery_symbol,
     parse_option_symbol,

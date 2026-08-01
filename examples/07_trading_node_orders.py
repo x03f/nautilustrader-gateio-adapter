@@ -55,7 +55,7 @@ from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-from nautilus_gateio import (
+from gateio_nt import (
     GATEIO,
     GATEIO_CLIENT_ID,
     GATEIO_VENUE,

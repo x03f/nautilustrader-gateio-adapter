@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from nautilus_gateio.http.client import GateioHttpClient
+from gateio_nt.http.client import GateioHttpClient
 
 
 class GateioOptionsHttpAPI:
@@ -387,7 +387,7 @@ class GateioOptionsHttpAPI:
         twice, and Gate.io documents no submission-deadline header for the
         options endpoints, so the transport cannot even bound how late a
         delayed request may land. On
-        :class:`~nautilus_gateio.http.client.GateioRequestAmbiguousError`,
+        :class:`~gateio_nt.http.client.GateioRequestAmbiguousError`,
         resolve the outcome with :meth:`list_orders` before resubmitting.
         """
         return await self._client.post("/options/orders", body=body)
@@ -414,8 +414,8 @@ class GateioOptionsHttpAPI:
         optional and cancels *every* resting option order in the account when
         they are omitted, which no caller of this adapter ever wants
         implicitly. This matches the scope policy of
-        :meth:`nautilus_gateio.http.spot.GateioSpotHttpAPI.cancel_all` and of
-        :meth:`nautilus_gateio.http.futures.GateioFuturesHttpAPI.cancel_all`.
+        :meth:`gateio_nt.http.spot.GateioSpotHttpAPI.cancel_all` and of
+        :meth:`gateio_nt.http.futures.GateioFuturesHttpAPI.cancel_all`.
         To cancel the whole account, iterate the underlyings explicitly.
 
         ``side`` is documented only as "all bids or all asks" with no published

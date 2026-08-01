@@ -25,23 +25,23 @@ handles them for you.
 
 | Exception                     | Import from                   | Says                                                                                       | Your move                                                          |
 |-------------------------------|-------------------------------|--------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
-| `GateioError`                 | `nautilus_gateio`             | Base of every venue/transport failure; carries `status`, `label`, `message`                | Branch on the subclass or the label                                |
-| `GateioClientError`           | `nautilus_gateio`             | 4xx — Gate.io refused this request (bad params, auth, limits)                              | Fix the request; retrying unchanged repeats the refusal            |
-| `GateioServerError`           | `nautilus_gateio`             | 5xx — Gate.io reported an internal failure                                                 | Usually retryable; on a mutating call see the ambiguity section    |
-| `GateioRequestAmbiguousError` | `nautilus_gateio.http.client` | The request may have reached the venue; the outcome is unknown                             | Reconcile (query the order, poll the transfer) before resubmitting |
-| `GateioAmbiguousServerError`  | `nautilus_gateio.http.client` | 5xx on a mutating request — both of the above at once                                      | Same as ambiguous; server-error handlers still catch it            |
-| `OrderValidationError`        | `nautilus_gateio`             | The order violates an exchange constraint (tick grid, whole contracts, expiry in the past) | Correct the order; nothing was sent                                |
-| `UnsupportedOrderError`       | `nautilus_gateio`             | Gate.io cannot express this order without changing its meaning                             | Submit what the venue can express, or emulate locally              |
-| `WalletNotProvisionedError`   | `nautilus_gateio`             | This wallet does not exist yet on the account — a definite absence                         | Ignorable until you fund/transfer into the wallet                  |
-| `WalletQueryRefusedError`     | `nautilus_gateio`             | Gate.io refused to answer the query — nothing is known about the ledger                    | Fix the key permission or account mode; do not read as "empty"     |
-| `PositionStatusUnavailable`   | `nautilus_gateio.execution`   | A position query got no usable answer                                                      | Handled by the engine; fix the underlying refusal it names         |
-| `FillReportsUnavailable`      | `nautilus_gateio.execution`   | A trade listing did not answer in full; carries what did answer readably                   | Handled by the engine; fix what the message names                  |
-| `OrderReportsUnavailable`     | `nautilus_gateio.execution`   | An order listing did not answer in full; carries what did parse                            | Handled by the engine; at startup the node refuses to start        |
+| `GateioError`                 | `gateio_nt`             | Base of every venue/transport failure; carries `status`, `label`, `message`                | Branch on the subclass or the label                                |
+| `GateioClientError`           | `gateio_nt`             | 4xx — Gate.io refused this request (bad params, auth, limits)                              | Fix the request; retrying unchanged repeats the refusal            |
+| `GateioServerError`           | `gateio_nt`             | 5xx — Gate.io reported an internal failure                                                 | Usually retryable; on a mutating call see the ambiguity section    |
+| `GateioRequestAmbiguousError` | `gateio_nt.http.client` | The request may have reached the venue; the outcome is unknown                             | Reconcile (query the order, poll the transfer) before resubmitting |
+| `GateioAmbiguousServerError`  | `gateio_nt.http.client` | 5xx on a mutating request — both of the above at once                                      | Same as ambiguous; server-error handlers still catch it            |
+| `OrderValidationError`        | `gateio_nt`             | The order violates an exchange constraint (tick grid, whole contracts, expiry in the past) | Correct the order; nothing was sent                                |
+| `UnsupportedOrderError`       | `gateio_nt`             | Gate.io cannot express this order without changing its meaning                             | Submit what the venue can express, or emulate locally              |
+| `WalletNotProvisionedError`   | `gateio_nt`             | This wallet does not exist yet on the account — a definite absence                         | Ignorable until you fund/transfer into the wallet                  |
+| `WalletQueryRefusedError`     | `gateio_nt`             | Gate.io refused to answer the query — nothing is known about the ledger                    | Fix the key permission or account mode; do not read as "empty"     |
+| `PositionStatusUnavailable`   | `gateio_nt.execution`   | A position query got no usable answer                                                      | Handled by the engine; fix the underlying refusal it names         |
+| `FillReportsUnavailable`      | `gateio_nt.execution`   | A trade listing did not answer in full; carries what did answer readably                   | Handled by the engine; fix what the message names                  |
+| `OrderReportsUnavailable`     | `gateio_nt.execution`   | An order listing did not answer in full; carries what did parse                            | Handled by the engine; at startup the node refuses to start        |
 
 `should_retry(error)` is also exported at the package root: it answers "is this
 failure worth retrying" the same way the transport answers it internally.
 `error_from_response(status, label, message)`, which builds the right subclass
-from a raw response, lives in `nautilus_gateio.common.errors`.
+from a raw response, lives in `gateio_nt.common.errors`.
 
 ## The response hierarchy: `GateioError`
 
@@ -110,7 +110,7 @@ The caller's obligation is to **reconcile, not resubmit**: query the order by
 its client order id, or poll the transfer status. Resubmitting on ambiguity is
 how an order gets executed twice.
 
-Both classes live in `nautilus_gateio.http.client`, not in the package root:
+Both classes live in `gateio_nt.http.client`, not in the package root:
 you only need their names when driving the HTTP layer yourself, and
 `GateioRequestAmbiguousError` *is* a `GateioError`, so existing handlers catch
 it without knowing the name.
@@ -195,7 +195,7 @@ What you observe as a user depends on where the refusal lands:
 ## Wallet states: `WalletNotProvisionedError` and `WalletQueryRefusedError`
 
 Gate.io reports two very different facts through the same 4xx error shape, and
-`require_wallet` (in `nautilus_gateio.http.margin`, applied to every wallet,
+`require_wallet` (in `gateio_nt.http.margin`, applied to every wallet,
 balance and position read) separates them by label:
 
 * **`WalletNotProvisionedError`** — label `USER_NOT_FOUND`. Gate.io creates the
@@ -233,7 +233,7 @@ a position's size:
   drift is a live possibility, and the forgiving readers turned unreadable
   bytes into confident claims — an unreadable position size read as FLAT, an
   unreadable `left` read as fully filled. The strict readers (`to_lot_count`
-  and `to_exact_decimal` in `nautilus_gateio.common.parsing`) refuse instead,
+  and `to_exact_decimal` in `gateio_nt.common.parsing`) refuse instead,
   naming the field and the value.
 * **A value the venue did not state makes no claim.** Absence takes the
   documented smaller meaning where one exists — an absent fee is a fee of zero,
@@ -262,7 +262,7 @@ it.
 ## Reconciliation signals: the `*Unavailable` exceptions
 
 `PositionStatusUnavailable`, `FillReportsUnavailable` and
-`OrderReportsUnavailable` live in `nautilus_gateio.execution` and are **raised
+`OrderReportsUnavailable` live in `gateio_nt.execution` and are **raised
 at NautilusTrader**, not at you. All three exist because a returned list cannot
 say "I was not answered" — to the engine, a missing report and a report of
 absence are the same thing, and the only channel an execution client has for

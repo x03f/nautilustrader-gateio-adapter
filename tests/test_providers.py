@@ -14,13 +14,13 @@ from typing import Any
 import pytest
 from nautilus_trader.model.identifiers import InstrumentId
 
-from nautilus_gateio.common.enums import GateioProductType
-from nautilus_gateio.common.errors import GateioError, WalletNotProvisionedError
-from nautilus_gateio.http.futures import GateioFuturesHttpAPI
-from nautilus_gateio.http.options import GateioOptionsHttpAPI
-from nautilus_gateio.http.spot import GateioSpotHttpAPI
-from nautilus_gateio.http.wallet import GateioWalletHttpAPI
-from nautilus_gateio.providers import GateioInstrumentProvider
+from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.errors import GateioError, WalletNotProvisionedError
+from gateio_nt.http.futures import GateioFuturesHttpAPI
+from gateio_nt.http.options import GateioOptionsHttpAPI
+from gateio_nt.http.spot import GateioSpotHttpAPI
+from gateio_nt.http.wallet import GateioWalletHttpAPI
+from gateio_nt.providers import GateioInstrumentProvider
 
 FAR_FUTURE = 4_102_444_800  # 2100-01-01, comfortably beyond any test clock
 LONG_PAST = 1_500_000_000  # 2017-07-14
@@ -171,7 +171,7 @@ ALL_ROUTES: dict[str, Any] = {
 
 
 class TestUsesTypedHttpNamespaces:
-    """The venue's path layout lives in ``nautilus_gateio.http``, not here.
+    """The venue's path layout lives in ``gateio_nt.http``, not here.
 
     In particular the ``/futures/{settle}`` versus ``/delivery/{settle}`` split
     is what ``GateioFuturesHttpAPI(settle=..., delivery=...)`` exists to

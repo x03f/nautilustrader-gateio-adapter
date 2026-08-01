@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-from nautilus_gateio.http.client import GateioHttpClient
+from gateio_nt.http.client import GateioHttpClient
 
 #: The account names accepted on either end of an internal transfer.
 #:
@@ -144,7 +144,7 @@ class GateioWalletHttpAPI:
         for transfers — the ``tx_id`` is assigned by the venue, not supplied by
         the caller — so a transparent retry could move the funds twice. A
         failure whose outcome is unknown surfaces as
-        :class:`~nautilus_gateio.http.client.GateioRequestAmbiguousError`;
+        :class:`~gateio_nt.http.client.GateioRequestAmbiguousError`;
         resolve it by listing the wallet ledger rather than transferring again.
         """
         source = self._validate_account(from_, "source")
