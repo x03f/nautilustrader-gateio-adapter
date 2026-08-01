@@ -168,13 +168,28 @@ clock that has not been checked, since an unsynchronized clock would expire vali
 requests.
 
 The execution client makes that call as the first act of `_connect`, before
-anything is signed, so a node running one signs against the venue clock and
-carries a deadline on every spot and futures order it sends. A reading that fails
-is logged and the client connects anyway: the deadline is a protection, not a
+anything is signed, so a node running one signs against the venue clock and puts
+a deadline on the order calls Gate.io accepts one for. A reading that fails is
+logged and the client connects anyway: the deadline is a protection, not a
 precondition. The data client never calls it — the transport is shared and
 reference counted, so a data client that sits beside an execution client inherits
 the offset once the execution client has connected, while a data-only node signs
 with the local clock and sends no deadline.
+
+Which calls those are is Gate.io's decision, not this adapter's: the venue
+declares `x-gate-exptime` per endpoint, and of the endpoints this adapter calls
+it declares the header on the eleven plain spot and futures order ones — submit,
+batch submit, cancel, cancel-all, amend, plus the spot batch cancel — and on
+nothing else. So the deadline is *absent* from three groups of calls the
+execution client does make — the price-triggered order endpoints on both spot
+and futures, which is how this adapter arms and disarms stop orders; the
+countdown dead-man switch; and every options endpoint. Arming a
+stop is as money-significant as submitting a plain order, and a late disarm is
+worse than either, so this is a real gap in the protection rather than a tidy
+boundary — it is simply not ours to close, and the honest thing is to name it.
+[configuration.md](configuration.md) carries the endpoint-by-endpoint list, and
+`tests/test_http_namespaces.py` drives every one of those calls and reads the
+header off the wire, so the list cannot drift away from the code unnoticed.
 
 Perpetual and delivery futures share one namespace class, because Gate.io serves
 them from paths that differ only in two segments. The `/futures/{settle}` versus

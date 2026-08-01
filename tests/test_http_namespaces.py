@@ -8,8 +8,12 @@ stop an unscoped call from cancelling or moving more than the caller asked for.
 
 from __future__ import annotations
 
+import ast
+import dataclasses
+import inspect
 import json
 from collections.abc import Callable
+from types import ModuleType
 from typing import Any
 
 import httpx
@@ -17,6 +21,9 @@ import pytest
 
 from nautilus_gateio.common.constants import GATEIO_API_PREFIX, GATEIO_HTTP_MAINNET
 from nautilus_gateio.common.errors import GateioClientError, GateioServerError
+from nautilus_gateio.http import futures as futures_module
+from nautilus_gateio.http import options as options_module
+from nautilus_gateio.http import spot as spot_module
 from nautilus_gateio.http.client import (
     EXPIRY_HEADER,
     GateioHttpClient,
@@ -509,3 +516,301 @@ async def test_namespace_client_error_keeps_the_gateio_label():
 
     assert excinfo.value.label == "INVALID_CURRENCY_PAIR"
     assert not isinstance(excinfo.value, GateioRequestAmbiguousError)
+
+
+# -- the submission deadline, on every mutating path -------------------------
+#
+# `tests/test_http_client.py` proves the transport emits `x-gate-exptime` when
+# it is asked to, and `tests/test_docs.py` proves the execution client measures
+# the clock offset that unlocks it. Neither says anything about who *asks*: both
+# hand `expiring=True` to the transport themselves. The tests below are the
+# missing half — they drive the namespace methods the execution client actually
+# calls and read the header off the wire, so removing `expiring=True` from any
+# one of them fails here even though the transport still works perfectly.
+
+
+@dataclasses.dataclass(frozen=True)
+class _MutatingCall:
+    """One state-changing REST call, with the deadline Gate.io declares for it.
+
+    ``deadline`` is not this package's preference. It is whether Gate.io's own
+    API specification lists the ``x-gate-exptime`` parameter on that operation,
+    read from the generated ``gate-api`` client (7.2.100, "Version of the API:
+    v4.106.100"), which Gate publishes from the same source as the reference
+    documentation. The venue declares it on the plain spot and futures order
+    endpoints — submit, batch submit, cancel, cancel-all, amend, and the spot
+    batch cancel — and on nothing else this package calls.
+
+    The one entry that is behaviour rather than venue documentation is the
+    delivery product line: Gate.io declares the header under ``/futures`` and
+    not under ``/delivery``, while :class:`GateioFuturesHttpAPI` serves both
+    from one set of methods and therefore sends it on both. That is recorded
+    here as it is, and said as such in ``docs/configuration.md``.
+    """
+
+    namespace: str
+    module: str
+    method: str
+    deadline: bool
+    invoke: Callable[[Any], Any]
+
+
+def _spot(client: GateioHttpClient) -> GateioSpotHttpAPI:
+    return GateioSpotHttpAPI(client)
+
+
+def _futures(client: GateioHttpClient) -> GateioFuturesHttpAPI:
+    return GateioFuturesHttpAPI(client, settle="usdt")
+
+
+def _delivery(client: GateioHttpClient) -> GateioFuturesHttpAPI:
+    return GateioFuturesHttpAPI(client, settle="usdt", delivery=True)
+
+
+def _options(client: GateioHttpClient) -> GateioOptionsHttpAPI:
+    return GateioOptionsHttpAPI(client)
+
+
+NAMESPACE_FACTORIES: dict[str, Callable[[GateioHttpClient], Any]] = {
+    "spot": _spot,
+    "futures": _futures,
+    "delivery": _delivery,
+    "options": _options,
+}
+
+ORDER = {"currency_pair": "BTC_USDT", "side": "buy", "amount": "1", "text": "t-ng-1"}
+FUTURES_ORDER = {"contract": "BTC_USDT", "size": 500, "price": "60000", "text": "t-ng-1"}
+
+MUTATING_CALLS: tuple[_MutatingCall, ...] = (
+    # -- spot: the venue declares the deadline on all six order endpoints
+    _MutatingCall("spot", "spot", "create_order", True, lambda ns: ns.create_order(ORDER)),
+    _MutatingCall(
+        "spot", "spot", "create_batch_orders", True, lambda ns: ns.create_batch_orders([ORDER])
+    ),
+    _MutatingCall(
+        "spot", "spot", "cancel_order", True, lambda ns: ns.cancel_order("1001", "BTC_USDT")
+    ),
+    _MutatingCall("spot", "spot", "cancel_all", True, lambda ns: ns.cancel_all("BTC_USDT")),
+    _MutatingCall(
+        "spot",
+        "spot",
+        "cancel_batch",
+        True,
+        lambda ns: ns.cancel_batch([{"currency_pair": "BTC_USDT", "id": "1001"}]),
+    ),
+    _MutatingCall(
+        "spot",
+        "spot",
+        "amend_order",
+        True,
+        lambda ns: ns.amend_order("1001", "BTC_USDT", {"amount": "2"}),
+    ),
+    # -- spot: the venue declares it on none of these
+    _MutatingCall(
+        "spot", "spot", "countdown_cancel_all", False, lambda ns: ns.countdown_cancel_all(30)
+    ),
+    _MutatingCall(
+        "spot",
+        "spot",
+        "create_price_order",
+        False,
+        lambda ns: ns.create_price_order({"market": "BTC_USDT"}),
+    ),
+    _MutatingCall(
+        "spot", "spot", "cancel_price_order", False, lambda ns: ns.cancel_price_order("77")
+    ),
+    _MutatingCall(
+        "spot",
+        "spot",
+        "cancel_price_orders",
+        False,
+        lambda ns: ns.cancel_price_orders(market="BTC_USDT"),
+    ),
+    # -- perpetual futures: declared on the five order endpoints
+    _MutatingCall(
+        "futures", "futures", "create_order", True, lambda ns: ns.create_order(FUTURES_ORDER)
+    ),
+    _MutatingCall(
+        "futures",
+        "futures",
+        "create_batch_orders",
+        True,
+        lambda ns: ns.create_batch_orders([FUTURES_ORDER]),
+    ),
+    _MutatingCall("futures", "futures", "cancel_order", True, lambda ns: ns.cancel_order("1001")),
+    _MutatingCall("futures", "futures", "cancel_all", True, lambda ns: ns.cancel_all("BTC_USDT")),
+    _MutatingCall(
+        "futures",
+        "futures",
+        "amend_order",
+        True,
+        lambda ns: ns.amend_order("1001", {"size": 400}),
+    ),
+    # -- perpetual futures: declared on none of these
+    _MutatingCall(
+        "futures", "futures", "countdown_cancel_all", False, lambda ns: ns.countdown_cancel_all(30)
+    ),
+    _MutatingCall(
+        "futures",
+        "futures",
+        "create_price_order",
+        False,
+        lambda ns: ns.create_price_order({"initial": {"contract": "BTC_USDT"}}),
+    ),
+    _MutatingCall(
+        "futures", "futures", "cancel_price_order", False, lambda ns: ns.cancel_price_order("77")
+    ),
+    _MutatingCall(
+        "futures",
+        "futures",
+        "cancel_price_orders",
+        False,
+        lambda ns: ns.cancel_price_orders(contract="BTC_USDT"),
+    ),
+    # -- futures account settings: not order endpoints, and none declare it
+    _MutatingCall(
+        "futures",
+        "futures",
+        "update_position_leverage",
+        False,
+        lambda ns: ns.update_position_leverage("BTC_USDT", "5"),
+    ),
+    _MutatingCall(
+        "futures",
+        "futures",
+        "update_position_margin",
+        False,
+        lambda ns: ns.update_position_margin("BTC_USDT", "10"),
+    ),
+    _MutatingCall(
+        "futures",
+        "futures",
+        "update_position_risk_limit",
+        False,
+        lambda ns: ns.update_position_risk_limit("BTC_USDT", "1000000"),
+    ),
+    _MutatingCall(
+        "futures",
+        "futures",
+        "set_position_cross_mode",
+        False,
+        lambda ns: ns.set_position_cross_mode("BTC_USDT", "CROSS"),
+    ),
+    _MutatingCall("futures", "futures", "set_dual_mode", False, lambda ns: ns.set_dual_mode(False)),
+    # -- delivery: same methods, a path Gate.io does not document the header for
+    _MutatingCall(
+        "delivery", "futures", "create_order", True, lambda ns: ns.create_order(FUTURES_ORDER)
+    ),
+    _MutatingCall("delivery", "futures", "cancel_order", True, lambda ns: ns.cancel_order("1001")),
+    _MutatingCall("delivery", "futures", "cancel_all", True, lambda ns: ns.cancel_all("BTC_USDT")),
+    # -- options: the venue declares the header nowhere in this API
+    _MutatingCall(
+        "options",
+        "options",
+        "create_order",
+        False,
+        lambda ns: ns.create_order({"contract": "BTC-1", "size": 1, "price": "10"}),
+    ),
+    _MutatingCall("options", "options", "cancel_order", False, lambda ns: ns.cancel_order("1001")),
+    _MutatingCall(
+        "options", "options", "cancel_all", False, lambda ns: ns.cancel_all(contract="BTC-1")
+    ),
+    _MutatingCall(
+        "options", "options", "countdown_cancel_all", False, lambda ns: ns.countdown_cancel_all(30)
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "call",
+    MUTATING_CALLS,
+    ids=[f"{c.namespace}.{c.method}" for c in MUTATING_CALLS],
+)
+async def test_mutating_call_sends_the_deadline_gateio_declares_for_it(call: _MutatingCall):
+    """Drive each call and read `x-gate-exptime` off the request it produced.
+
+    Fails on ``expiring=True`` being dropped from any single namespace method:
+    delete it from ``GateioSpotHttpAPI.cancel_batch`` and the ``spot.cancel_batch``
+    case fails, from ``GateioFuturesHttpAPI.amend_order`` and ``futures.amend_order``
+    and ``delivery.amend_order`` fail. It fails the other way too — adding
+    ``expiring=True`` to ``create_price_order`` fails ``spot.create_price_order``,
+    because the pages that now name the price orders as an exception would be
+    describing a request the client no longer sends.
+    """
+    rec = Recorder()
+    client = make_client(rec)
+    client._clock_synced = True  # what the execution client's connect achieves
+
+    await call.invoke(NAMESPACE_FACTORIES[call.namespace](client))
+
+    sent = EXPIRY_HEADER in rec.last.headers
+    assert sent is call.deadline, (
+        f"{call.namespace}.{call.method} sent {'a' if sent else 'no'} {EXPIRY_HEADER} deadline "
+        f"on {rec.last.method} {rec.path}, and Gate.io's specification says it should send "
+        f"{'one' if call.deadline else 'none'}"
+    )
+
+
+def _transport_mutations(module: ModuleType) -> set[str]:
+    """Namespace methods in ``module`` that change state through the transport.
+
+    Found by reading the module's own source rather than by listing them here,
+    so that a namespace method added later cannot escape the table above: an
+    order endpoint nobody classified is an order endpoint nobody decided the
+    deadline for.
+    """
+    tree = ast.parse(inspect.getsource(module))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            func = call.func
+            if not isinstance(func, ast.Attribute) or func.attr not in (
+                "post",
+                "delete",
+                "put",
+                "patch",
+            ):
+                continue
+            target = func.value
+            if isinstance(target, ast.Attribute) and target.attr == "_client":
+                found.add(node.name)
+    return found
+
+
+@pytest.mark.parametrize(
+    ("module", "expected"),
+    [(spot_module, 10), (futures_module, 14), (options_module, 4)],
+    ids=["spot", "futures", "options"],
+)
+def test_every_mutating_namespace_method_is_classified(module: ModuleType, expected: int):
+    """No state-changing call in an order namespace may skip the table above.
+
+    Fails on a new endpoint arriving unclassified: add
+    ``async def create_tpsl_order(self, body): return await
+    self._client.post("/spot/tpsl_orders", body=body)`` to ``spot.py`` and this
+    fails with ``create_tpsl_order``, which is the moment to look up whether
+    Gate.io declares ``x-gate-exptime`` for it. Fails too if a method loses its
+    entry while keeping its endpoint.
+
+    The counts are asserted so that the comparison cannot pass by both sides
+    going empty — a source scan that matched nothing would otherwise agree with
+    a table that listed nothing.
+    """
+    in_source = _transport_mutations(module)
+    classified = {
+        c.method for c in MUTATING_CALLS if c.module == module.__name__.rsplit(".", 1)[-1]
+    }
+
+    assert len(in_source) == expected, (
+        f"{module.__name__} makes {len(in_source)} mutating transport calls, not {expected}; "
+        f"update the deadline table and this count together: {sorted(in_source)}"
+    )
+    assert in_source == classified, (
+        "these mutating methods carry no entry in MUTATING_CALLS, so nothing checks whether "
+        f"they send a submission deadline: {sorted(in_source - classified)}; and these entries "
+        f"name methods that no longer mutate anything: {sorted(classified - in_source)}"
+    )

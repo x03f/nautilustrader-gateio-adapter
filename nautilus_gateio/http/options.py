@@ -393,7 +393,12 @@ class GateioOptionsHttpAPI:
         return await self._client.post("/options/orders", body=body)
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
-        """``DELETE /options/orders/{order_id}`` — cancel one order."""
+        """``DELETE /options/orders/{order_id}`` — cancel one order.
+
+        Gate.io documents no ``x-gate-exptime`` header anywhere in the options
+        API, so this cancel carries no submission deadline: delayed in flight,
+        it still applies whenever it lands.
+        """
         return await self._client.delete(f"/options/orders/{order_id}")
 
     async def cancel_all(

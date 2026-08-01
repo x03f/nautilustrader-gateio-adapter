@@ -187,18 +187,35 @@ and **Changed**.
   The execution client reads the venue clock (`GET /spot/time`) as the first act
   of connecting, which is the precondition the transport withholds the
   `x-gate-exptime` header on. So in the default configuration every spot and
-  futures submit, batch submit, cancel, cancel-all and amend now leaves with a
-  deadline ten seconds ahead of the venue clock, and the venue rejects it if it
-  arrives later. Before this nothing in the package called `sync_time()`, so no
-  deployment ever sent one: an order held up in the network stayed acceptable
-  indefinitely and could execute against a price it was never meant to see.
-  Signed requests are timestamped against the same offset, which is the other
-  reason the reference adapter reads the venue clock while connecting. A clock
-  reading that fails is logged and the client connects anyway — the deadline is a
-  protection, not a precondition — and the options endpoints still carry no
-  deadline, because Gate.io documents none for them. The ten seconds are not
+  futures submit, batch submit, cancel, cancel-all, batch cancel and amend now
+  leaves with a deadline ten seconds ahead of the venue clock, and the venue
+  rejects it if it arrives later. Before this nothing in the package called
+  `sync_time()`, so no deployment ever sent one: an order held up in the network
+  stayed acceptable indefinitely and could execute against a price it was never
+  meant to see. Signed requests are timestamped against the same offset, which is
+  the other reason the reference adapter reads the venue clock while connecting.
+  A clock reading that fails is logged and the client connects anyway — the
+  deadline is a protection, not a precondition. The ten seconds are not
   configurable from either client config. `docs/configuration.md` and
   `docs/architecture.md` follow.
+
+  **The coverage is Gate.io's, and it has holes.** The venue declares
+  `x-gate-exptime` per endpoint, not API-wide, and it declares it on the eleven
+  plain order endpoints listed in `docs/configuration.md` and on nothing else
+  this adapter calls. `POST /spot/cancel_batch_orders` is one of the eleven and
+  was missed on this branch until now: the multi-order cancel the execution
+  client uses for a batched `cancel_orders` went out without a deadline while
+  the single-order cancel beside it carried one. It carries one now. The
+  endpoints Gate.io declares no header for still send none, and that is a real
+  gap rather than a boundary worth glossing: it covers the price-triggered order
+  endpoints on both spot and futures — which is how this adapter arms and
+  disarms every stop and if-touched order — the countdown dead-man switch, and
+  the whole options API. Earlier text in this section said only the options
+  endpoints were uncovered, which understated it. `tests/test_http_namespaces.py`
+  now drives every mutating call in the spot, futures and options namespaces and
+  reads the header off the request each one produced, so neither the omissions
+  nor the coverage can drift from the documentation unnoticed, and a namespace
+  that gains an order endpoint nobody classified fails the suite.
 
 - **The branch no longer reports the released version.** `pyproject.toml` and
   `nautilus_gateio.__version__` carry `0.2.0a2.dev0`: a

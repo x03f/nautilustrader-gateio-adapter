@@ -465,13 +465,55 @@ configuring the adapter honestly:
   The deadline is ten seconds ahead of the venue clock, and that figure is what
   is not configurable — `GateioHttpClient` takes an `order_expiry_ms` argument
   (`0` disables the header), but no configuration field reaches it and the
-  factory always builds the transport with the default. It rides on the spot and
-  futures order endpoints — submit, batch submit, cancel, cancel-all, amend —
-  and not on the options ones, for which Gate.io documents no such header. If
-  the clock reading fails, the client logs it and connects anyway with the
-  deadline off. The header logic itself is *implemented and mock-tested*
+  factory always builds the transport with the default. If the clock reading
+  fails, the client logs it and connects anyway with the deadline off. The
+  header logic itself is *implemented and mock-tested*
   (`tests/test_http_client.py`), and the connect-time reading in
   `tests/test_factories.py`.
+
+  **Which calls carry it, and which do not.** Gate.io declares
+  `x-gate-exptime` per endpoint rather than API-wide, so the coverage is the
+  venue's list, not a choice made here. It is sent on:
+
+  | Call | Endpoint |
+  |------|----------|
+  | `spot.create_order` | `POST /spot/orders` |
+  | `spot.create_batch_orders` | `POST /spot/batch_orders` |
+  | `spot.cancel_order` | `DELETE /spot/orders/{id}` |
+  | `spot.cancel_all` | `DELETE /spot/orders` |
+  | `spot.cancel_batch` | `POST /spot/cancel_batch_orders` |
+  | `spot.amend_order` | `PATCH /spot/orders/{id}` |
+  | `futures.create_order` | `POST /futures/{settle}/orders` |
+  | `futures.create_batch_orders` | `POST /futures/{settle}/batch_orders` |
+  | `futures.cancel_order` | `DELETE /futures/{settle}/orders/{id}` |
+  | `futures.cancel_all` | `DELETE /futures/{settle}/orders` |
+  | `futures.amend_order` | `PUT /futures/{settle}/orders/{id}` |
+
+  It is **not** sent on any other call the adapter makes, and three of those
+  omissions matter to a running strategy:
+
+  * **Price-triggered orders**, on both spot and futures — `POST` and the two
+    `DELETE` forms of `/spot/price_orders` and `/futures/{settle}/price_orders`.
+    This is how the adapter arms and disarms `STOP_MARKET`, `STOP_LIMIT` and
+    the if-touched types, so a stop that is submitted or cancelled through a
+    stalled connection is applied whenever it arrives, however stale the price
+    that motivated it. Gate.io declares no deadline header for these endpoints,
+    and the adapter does not invent one.
+  * **Every options endpoint** — submit, cancel, cancel-all — for the same
+    reason.
+  * **The countdown dead-man switch** on all three product lines, which is the
+    one place where lateness is self-correcting: a countdown that lands late
+    simply re-arms from that moment.
+
+  One case is behavior rather than venue documentation. Delivery (dated)
+  futures are served by the same namespace methods as perpetuals, so the
+  deadline goes out on `/delivery/{settle}/orders` too, while Gate.io declares
+  the header only under `/futures/{settle}`. The request is identical in shape
+  and an undeclared header cannot make it worse, so it is left in place — but
+  read the protection as guaranteed on perpetuals and best-effort on dated
+  contracts. Every row and every exception above is driven and asserted against
+  the wire in `tests/test_http_namespaces.py`, which also fails if a namespace
+  gains a new order endpoint that nobody classified.
 * **Per-endpoint rate-limit budgets**, request-weight accounting and local order
   throttling are *unsupported*: none is implemented, and none is planned for
   this release.
