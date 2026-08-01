@@ -17,6 +17,7 @@ and proved nothing.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.data.messages import SubscribeOptionGreeks
+from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import OrderBookDelta, OrderBookDepth10
 from nautilus_trader.model.enums import BookType, OrderSide, RecordFlag
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
@@ -632,37 +633,60 @@ async def test_a_reconnect_schedules_no_resnapshot_for_a_depth_only_instrument(
 # -- the platform behaviour this feature replaced ----------------------------
 
 
-async def test_an_unimplemented_hook_still_leaves_a_phantom_subscription(
-    harness: Harness,
-) -> None:
-    """The platform fact the depth hook used to demonstrate, pinned elsewhere.
+def test_no_data_hook_is_left_for_the_base_class_to_raise_from() -> None:
+    """What the phantom-subscription test pinned, now that it has no subject.
 
-    ``LiveMarketDataClient`` records a subscription before creating the task
-    that raises, and ``DataEngine`` then skips anything already recorded, so an
-    unimplemented hook is logged exactly once and reported as subscribed
-    forever. ``subscribe_option_greeks`` is still unimplemented here, so it is
-    where that claim stays checkable now that depth is served.
+    ``LiveMarketDataClient`` records a subscription *before* creating the task
+    that raises ``NotImplementedError``, and ``DataEngine`` then skips anything
+    already recorded, so a hook left to the base class is logged exactly once
+    and reported as subscribed forever after. This test used to demonstrate that
+    through ``subscribe_option_greeks``, the last hook this client did not
+    implement; the greeks now come from ``options.contract_tickers``, so the
+    demonstration has nowhere left to stand and the claim worth pinning is that
+    it has nowhere left to stand.
+
+    The damage this catches is a *new* silence, not the old one: adding a hook
+    to the platform, or dropping an override here, brings back an instrument
+    whose subscription reports held forever and delivers nothing.
     """
-    client = harness.client
-    client._loop = asyncio.get_running_loop()
+    base_hooks = {
+        name
+        for name, member in inspect.getmembers(LiveMarketDataClient, inspect.isfunction)
+        if name.startswith(("_subscribe", "_unsubscribe")) and inspect.iscoroutinefunction(member)
+    }
+    # The sweep is only worth as much as what it enumerates, so the set it found
+    # is checked before it is used: an `inspect` filter that matched nothing
+    # would make every assertion below true of an empty set.
+    assert "_subscribe_option_greeks" in base_hooks
+    assert "_unsubscribe_option_greeks" in base_hooks
+    assert len(base_hooks) >= 20, base_hooks
 
-    client.subscribe_option_greeks(
-        SubscribeOptionGreeks(OPTION_ID, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0),
+    inherited = sorted(
+        name
+        for name in base_hooks
+        if getattr(GateioDataClient, name) is getattr(LiveMarketDataClient, name)
     )
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
 
-    assert client.subscribed_option_greeks() == [OPTION_ID]
+    assert inherited == []
 
-    # The claim is also a documented one, and the page has to keep saying it
-    # while any hook on this client is left to the base class. The page is read
-    # with its line wrapping collapsed, so re-flowing a paragraph does not fail
-    # a test about what the paragraph says.
-    page = (Path(__file__).resolve().parent.parent / "docs" / "market-data.md").read_text(
-        encoding="utf-8",
-    )
-    prose = " ".join(page.split())
-    assert "Read the log line, not the subscription list." in prose
+
+def test_the_page_no_longer_sends_a_reader_looking_for_greeks_elsewhere() -> None:
+    """A stale page is the same silence in a different medium.
+
+    While the hook was unimplemented the page had to say so, and it did. Now
+    that it is served, a page still saying it is unimplemented costs a reader the
+    subscription entirely: they never call it. The page is read with its line
+    wrapping collapsed, so re-flowing a paragraph does not fail a test about what
+    the paragraph says.
+    """
+    docs = Path(__file__).resolve().parent.parent / "docs"
+    for name in ("market-data.md", "products.md"):
+        prose = " ".join((docs / name).read_text(encoding="utf-8").split())
+        assert "`subscribe_option_greeks` is unimplemented" not in prose, name
+        assert "so `subscribe_option_greeks` is unimplemented" not in prose, name
+        assert "not mapped onto the platform's `OptionGreeks`" not in prose, name
+        assert "not yet mapped onto the platform's `OptionGreeks`" not in prose, name
+    prose = " ".join((docs / "market-data.md").read_text(encoding="utf-8").split())
     assert "`subscribe_order_book_depth` (`OrderBookDepth10`) is not implemented" not in prose
 
 

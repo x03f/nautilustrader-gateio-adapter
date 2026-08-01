@@ -1,12 +1,13 @@
 """Venue-native data types Gate.io publishes that NautilusTrader has no type for.
 
-The platform models mark prices, index prices and funding rates as first-class
-data (``MarkPriceUpdate``, ``IndexPriceUpdate``, ``FundingRateUpdate``) and this
-client publishes all three from the venue's ticker channel. What the ticker
-carries *besides* those — 24-hour statistics, implied volatilities, the greeks,
-the delivery basis — has no platform type, and the in-tree answer for that is a
-``Data`` subclass routed through the generic ``_subscribe`` hook, exactly as
-``BinanceTicker`` (``adapters/binance/common/types.py``) and ``BetfairTicker``
+The platform models mark prices, index prices, funding rates and option greeks
+as first-class data (``MarkPriceUpdate``, ``IndexPriceUpdate``,
+``FundingRateUpdate``, ``OptionGreeks``) and this client publishes all four from
+the venue's ticker channel. What the ticker carries *besides* those — 24-hour
+statistics, the delivery basis, the indicative next funding rate — has no
+platform type, and the in-tree answer for that is a ``Data`` subclass routed
+through the generic ``_subscribe`` hook, exactly as ``BinanceTicker``
+(``adapters/binance/common/types.py``) and ``BetfairTicker``
 (``adapters/betfair/data_types.py``) do for their venues.
 
 This module deliberately does **not** use ``from __future__ import annotations``,
@@ -55,16 +56,6 @@ TICKER_FIELDS: tuple[str, ...] = (
     "basis_rate",
     "basis_value",
     "settle_price",
-    # Options only (`options.contract_tickers`)
-    "mark_iv",
-    "bid_iv",
-    "ask_iv",
-    "delta",
-    "gamma",
-    "vega",
-    "theta",
-    "rho",
-    "position_size",
 )
 
 
@@ -72,11 +63,18 @@ TICKER_FIELDS: tuple[str, ...] = (
 class GateioTicker(Data):
     """One Gate.io ticker row, published as the venue sent it.
 
-    Mark price, index price and funding rate are deliberately **absent**. The
-    platform has ``MarkPriceUpdate``, ``IndexPriceUpdate`` and
-    ``FundingRateUpdate`` for those three and this client publishes them from
-    the same venue message, so carrying them here as well would give a strategy
-    two sources for one number and no rule for which to believe.
+    Mark price, index price, funding rate and the option greeks are deliberately
+    **absent**. The platform has ``MarkPriceUpdate``, ``IndexPriceUpdate``,
+    ``FundingRateUpdate`` and ``OptionGreeks`` for them and this client publishes
+    all four from the same venue message, so carrying them here as well would
+    give a strategy two sources for one number and no rule for which to believe.
+
+    "The option greeks" means everything ``OptionGreeks`` declares: the five
+    standard greeks, the three implied volatilities, and the open interest
+    Gate.io names ``position_size``. Those are the platform's canonical schema
+    for an option quote, so they are subscribed to as ``OptionGreeks`` and not
+    read off this row. What is left here for options is what the canonical
+    schema has no field for — the row's 24-hour statistics.
 
     Every field is the venue's own string rather than a ``Price`` or a
     ``Quantity``. One ticker row mixes scales — an order-tick price, a contract
@@ -130,24 +128,6 @@ class GateioTicker(Data):
         Basis value against the index (delivery futures only).
     settle_price : str
         Settlement price; ``"0"`` until the contract settles (delivery futures only).
-    mark_iv : str
-        Implied volatility of the mark price (options only).
-    bid_iv : str
-        Implied volatility of the best bid (options only).
-    ask_iv : str
-        Implied volatility of the best ask (options only).
-    delta : str
-        Option delta (options only).
-    gamma : str
-        Option gamma (options only).
-    vega : str
-        Option vega (options only).
-    theta : str
-        Option theta (options only).
-    rho : str
-        Option rho (options only).
-    position_size : str
-        Open interest in contracts (options only).
     ts_event : int
         UNIX timestamp (nanoseconds) when the venue published the row.
     ts_init : int
@@ -174,15 +154,6 @@ class GateioTicker(Data):
     basis_rate: str = ""
     basis_value: str = ""
     settle_price: str = ""
-    mark_iv: str = ""
-    bid_iv: str = ""
-    ask_iv: str = ""
-    delta: str = ""
-    gamma: str = ""
-    vega: str = ""
-    theta: str = ""
-    rho: str = ""
-    position_size: str = ""
 
     @classmethod
     def from_payload(

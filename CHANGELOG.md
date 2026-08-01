@@ -92,12 +92,33 @@ and **Changed**.
   multiplier), cross-checked against the intrinsic value implied by the row's
   settle price and strike, and never the underlying's settlement price.
 
+- **`subscribe_option_greeks` publishes the platform's `OptionGreeks`** on
+  options, from the same `options.contract_tickers` row that serves mark and
+  index prices and under the same reference count. It was the one data hook this
+  adapter left to the base class, so a strategy written against Deribit's, OKX's
+  or Bybit's greeks subscription got nothing here and got it silently. Gate.io
+  states all five standard greeks, all three implied volatilities and the
+  contract's open interest (`position_size`); `underlying_price` comes from the
+  row's `index_price`, the only underlying quote it carries. Gate.io names no
+  numeraire convention, so `convention` takes the platform's `BLACK_SCHOLES`
+  default — the one published field the venue did not supply — and `vega` and
+  `theta` keep the venue's own magnitudes rather than being rescaled onto the
+  platform calculator's conventions on a guess. A row that does not state all
+  five greeks publishes nothing rather than a fabricated zero, and is counted in
+  the new `option_greeks_incomplete` health counter. The subscription is refused,
+  with the reason, on every product that has no greeks.
+
 - **`GateioTicker`**, the venue ticker row as adapter-specific custom data,
   reachable through `subscribe_data` and exported from the package. It carries
   the fields NautilusTrader has no type for — 24-hour statistics, the delivery
-  basis, implied volatilities and greeks, the indicative next funding rate — and
-  deliberately not mark price, index price or funding rate, which are published
-  from the same message as the platform's own types. Subscribe with
+  basis, the indicative next funding rate — and deliberately not mark price,
+  index price, funding rate or the option greeks, which are published from the
+  same message as the platform's own types. The greeks, the three implied
+  volatilities and `position_size` were on this type earlier in this same
+  unreleased round; they left it when `OptionGreeks` gained them, because they
+  are the platform's canonical option schema and carrying them in both places
+  would give a strategy two readings of one number. `TICKER_FIELDS` is 18 names
+  rather than 27 as a result. Subscribe with
   `DataType(GateioTicker, metadata={"instrument_id": instrument_id})`: that is
   the topic the rows are addressed to. The type registers itself with the
   platform's msgpack and Arrow serializers on import.

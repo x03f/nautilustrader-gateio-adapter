@@ -555,11 +555,12 @@ the link from the venue's own listing.
 | `MarkPriceUpdate`                 | -    | ✓         | ✓       | ✓        | ✓       | `futures.tickers`; `options.contract_tickers` on options. Spot has no mark price.                                          | Implemented                                                                                                         |
 | `IndexPriceUpdate`                | -    | ✓         | ✓       | ✓        | ✓       | `futures.tickers`; `options.contract_tickers` on options. Spot has no index price.                                         | Implemented                                                                                                         |
 | `FundingRateUpdate`               | -    | ✓         | ✓       | -        | -       | `futures.tickers`. Only perpetual contracts fund.                                                                          | Implemented                                                                                                         |
+| `OptionGreeks`                    | -    | -         | -       | -        | ✓       | `options.contract_tickers`. No other product states a greek, and the subscription is refused with that reason.             | Unit-tested                                                                                                         |
 | Historical `FundingRateUpdate`    | -    | ✓         | ✓       | -        | -       | REST `/futures/{settle}/funding_rate`. Only perpetual contracts fund.                                                      | Implemented                                                                                                         |
 | Instrument updates                | ✓    | ✓         | ✓       | ✓        | ✓       | Periodic REST reload; Gate.io has no instrument channel.                                                                   | Unit-tested (loading and filtering); implemented (the reload timer)                                                 |
 | `InstrumentStatus`                | ✓    | ✓         | ✓       | ✓        | ✓       | Polled instrument listings; Gate.io has no status channel.                                                                 | Unit-tested                                                                                                         |
 | `InstrumentClose`                 | -    | -         | -       | ✓        | ✓       | REST settlement after expiry. The three continuous products never settle, and the subscription is refused with the reason. | Unit-tested                                                                                                         |
-| `GateioTicker` (venue ticker row) | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.tickers`, published as adapter-specific custom data.                                                             | Unit-tested                                                                                                         |
+| `GateioTicker` (venue ticker row) | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.tickers`, the row's fields that have no platform type, as adapter-specific custom data.                          | Unit-tested                                                                                                         |
 | Historical `QuoteTick`            | -    | -         | -       | -        | -       | Gate.io publishes no quote history; the request is refused rather than answered from the current ticker row.               | Unsupported                                                                                                         |
 | Book types other than `L2_MBP`    | -    | -         | -       | -        | -       | Only `L2_MBP` is assembled; any other book type is refused.                                                                | Unsupported                                                                                                         |
 | Options underlying streams        | -    | -         | -       | -        | ✓       | `options.ul_*` through `GateioPublicWebSocket.client`, not routed into the data engine.                                    | Not wired into the data client; the transport's generic `GateioWebSocketClient.subscribe` underneath is unit-tested |
@@ -577,9 +578,15 @@ there. The [validation status](validation.md) page grades each behavior on the
 [evidence ladder](validation.md#the-evidence-ladder) rather than by product.
 
 An option's greeks and implied volatilities arrive with the ticker row and reach
-a strategy as `GateioTicker` fields, which are the venue's own strings. They are
-not mapped onto the platform's `OptionGreeks` type, and `subscribe_option_greeks`
-is unimplemented.
+a strategy as the platform's own `OptionGreeks`, through `subscribe_option_greeks`
+— the same API Deribit, OKX and Bybit serve, so a strategy written against one of
+those runs here unchanged. Gate.io states all five standard greeks, all three
+implied volatilities and the contract's open interest; it states no numeraire
+convention, so that one field takes the platform's default. Because those fields
+are the platform's canonical option schema they are no longer `GateioTicker`
+fields: carrying them in both places would give a strategy two readings of one
+number. The mapping, the honest limits and what a row missing a greek does are in
+[market-data.md](market-data.md#option-greeks).
 
 Gate.io has no dedicated mark, index or funding channel: all three are fields of
 the ticker stream — `futures.tickers` on the futures products,

@@ -158,21 +158,25 @@ Which instruments exist per product, and what a `Quantity` means on each, is in
 | `subscribe_mark_prices`                          | `futures.tickers` / `options.contract_tickers`, `mark_price` field             | perpetual, inverse, delivery, options |
 | `subscribe_index_prices`                         | `futures.tickers` / `options.contract_tickers`, `index_price` field            | perpetual, inverse, delivery, options |
 | `subscribe_funding_rates`                        | `futures.tickers`, `funding_rate` field                                        | perpetual, inverse                    |
+| `subscribe_option_greeks`                        | `options.contract_tickers`, the greek, implied-volatility and size fields      | options                               |
 | `subscribe_data` (`GateioTicker`)                | `futures.tickers` / `options.contract_tickers` / `spot.tickers`, the whole row | all                                   |
 | `subscribe_instrument_status`                    | REST instrument listings, polled on the reload cadence                         | all                                   |
 | `subscribe_instrument_close`                     | REST settlement, polled after expiry                                           | delivery, options                     |
 | `subscribe_instruments` / `subscribe_instrument` | REST, refreshed by the reload task                                             | all                                   |
 
-A hook this client does not implement fails in a way worth knowing about, and
-`subscribe_option_greeks` is now the one that demonstrates it.
-`LiveMarketDataClient` records the subscription *before* it starts the task that
-raises `NotImplementedError`, so a caller gets both: one exception in the log,
-and a subscription the client then reports as held for the rest of its life. The
-data engine skips anything already in that list, so the subscription is never
-retried and no second message is ever logged. Read the log line, not the
-subscription list. (Verified against the installed NautilusTrader 1.230.0.) It is
-also why every refusal in this client is a log line and a return rather than a
-raise.
+Every market-data hook the platform defines is implemented here; none is left to
+the base class. That is worth stating rather than assuming, because of what the
+base class does with one that is not. `LiveMarketDataClient` records the
+subscription *before* it starts the task that raises `NotImplementedError`, so a
+caller would get both: one exception in the log, and a subscription the client
+then reports as held for the rest of its life. The data engine skips anything
+already in that list, so it is never retried and no second message is ever
+logged — for an unimplemented hook, the log line is the truth and the
+subscription list is not. (Verified against the installed NautilusTrader
+1.230.0.) It is also why every *refusal* in this client — funding on an option,
+greeks on a perpetual, a quote-history request — is a log line and a return
+rather than a raise: a refusal that raised would be indistinguishable from a
+hook nobody wrote.
 
 ## Requests
 
@@ -578,20 +582,77 @@ records carry only an application timestamp and a rate. Those updates therefore
 carry `interval` — a property of the contract — but no `next_funding_ns`, since
 the endpoint publishes nothing about the next application.
 
-**Not published from these channels.** `options.contract_tickers` also carries
-`mark_iv`, `bid_iv`, `ask_iv` and the full greek set, and Gate.io serves the same
-fields from `GET /options/tickers`. They are reachable through the transport and
-the REST namespaces but are not yet mapped onto the platform's `OptionGreeks`
-type, so `subscribe_option_greeks` is unimplemented — see the note under
-[Subscriptions](#subscriptions) for what an unimplemented subscribe hook does.
+**Also on the options row.** `options.contract_tickers` carries the greeks and
+implied volatilities too. Those are `OptionGreeks`, and they are the next
+section.
+
+## Option greeks
+
+`subscribe_option_greeks` is served on options and only on options, from the same
+`options.contract_tickers` row that serves mark and index prices — Gate.io has no
+separate greeks channel — under the same reference count, so holding greeks and a
+mark price costs one venue subscription.
+
+```python
+self.subscribe_option_greeks(instrument_id, client_id=GATEIO_CLIENT_ID)
+
+
+def on_option_greeks(self, greeks: OptionGreeks) -> None:
+    self.log.info(f"delta={greeks.delta:.4f} iv={greeks.mark_iv}")
+```
+
+**What Gate.io states, field by field.** All five standard greeks — `delta`,
+`gamma`, `vega`, `theta`, `rho` — are fields of the row, so nothing here is
+computed locally and nothing is left at a placeholder. So are all three implied
+volatilities (`mark_iv`, `bid_iv`, `ask_iv`). Open interest is the row's
+`position_size` (`total_size` is the futures spelling and never appears on an
+option row). `underlying_price` comes from the row's `index_price`: a Gate.io
+option settles against the index of its underlying pair, and that index is the
+only underlying quote the row carries.
+
+**What Gate.io does not state.** The row names no numeraire convention, so
+`convention` is left unset and takes the platform's `GreeksConvention.BLACK_SCHOLES`
+default. That default is the platform's answer to an unstated convention, not a
+Gate.io statement, and it is the one field on the published object that the venue
+did not supply.
+
+**Magnitudes are the venue's own.** Gate.io documents no normalization for `vega`
+or `theta`, so neither is rescaled onto a one-point volatility move or onto a
+daily decay the way the platform's local `GreeksCalculator` defines them.
+Comparing a Gate.io `theta` against a Deribit one is therefore not safe without
+checking what each venue means by it. Rescaling on a guess would change numbers
+the venue published.
+
+**A row that does not state all five greeks publishes nothing.** The five are
+non-optional on the platform type, so there is no way to publish four of them,
+and `0.0` is a real, tradeable statement about a far out-of-the-money contract —
+it cannot double as "absent". Such a row is counted in the
+`option_greeks_incomplete` health counter and dropped whole, which means its
+open interest and implied volatilities are dropped with it. The five nullable
+fields behave the other way round: one the venue omits is `None`, never a zero.
+
+`underlying_price` is the one number this client deliberately publishes twice —
+it also arrives as `IndexPriceUpdate`. The platform's option chain aggregation
+reads `underlying_price` off the greeks object itself to seed at-the-money, and a
+chain cannot join it back from a separate stream. Every other field appears in
+exactly one type.
+
+Venue- or model-specific sensitivities (`vanna`, `volga`, `charm`, surface
+metadata) would belong in adapter-specific custom data rather than the native
+type. Gate.io publishes none of them, so there are none to carry.
+
+**Status:** *unit-tested* on the
+[evidence ladder](validation.md#the-evidence-ladder) — the offline suite asserts
+the mapping, the refusals and the reference count against synthetic
+`options.contract_tickers` rows. Gate.io has never seen this path.
 
 ## The venue ticker row (`GateioTicker`)
 
-The three types above are what NautilusTrader models. The rest of the ticker row —
-24-hour statistics, the delivery basis, the implied volatilities and greeks, the
-*indicative* next funding rate, the open interest — has no platform type, and
-this client publishes it as an adapter-specific data type, which is what the
-in-tree adapters do with the same problem (`BinanceTicker`, `BetfairTicker`).
+The four types above are what NautilusTrader models. The rest of the ticker row —
+24-hour statistics, the delivery basis, the *indicative* next funding rate, the
+futures open interest — has no platform type, and this client publishes it as an
+adapter-specific data type, which is what the in-tree adapters do with the same
+problem (`BinanceTicker`, `BetfairTicker`).
 
 ```python
 from nautilus_trader.model.data import DataType
@@ -611,17 +672,22 @@ different topic from the one the rows are published on.
 
 * Every field is the venue's own string, kept under the venue's own name. One row
   mixes an order-tick price, a contract count, a base-currency turnover and a
-  dimensionless implied volatility, and quantizing them all onto one precision
-  would change values.
-* Mark price, index price and funding rate are deliberately **absent** from the
-  type: they are published from the same message as the platform's own types, and
-  carrying them twice would give a strategy two sources for one number.
+  settlement price, and quantizing them all onto one precision would change
+  values.
+* Mark price, index price, funding rate and the option greeks are deliberately
+  **absent** from the type: they are published from the same message as the
+  platform's own types, and carrying them twice would give a strategy two sources
+  for one number. For the greeks that means the whole canonical schema — the five
+  standard greeks, the three implied volatilities, and the `position_size` the
+  platform calls `open_interest` — is subscribed to as `OptionGreeks` and is not
+  a `GateioTicker` field. What an option row leaves here is its 24-hour
+  statistics.
 * A field the venue did not send for this product is the empty string. The
   platform's Arrow schema builder for custom data accepts no optional field, so
   "absent" has to be a value of the field's own type.
-* Ticker subscribers share the one venue channel with mark, index and funding
-  subscribers, and the reference count means canceling one does not stop the
-  others.
+* Ticker subscribers share the one venue channel with mark, index, funding and
+  greeks subscribers, and the reference count means canceling one does not stop
+  the others.
 * The type registers itself with the platform's msgpack and Arrow serializers on
   import, so it can be persisted to a catalog or sent over an external message
   bus. If a node uses an external message bus and should not publish it, name it
@@ -629,7 +695,7 @@ different topic from the one the rows are published on.
 
 ### `TICKER_FIELDS`
 
-The 27 venue field names the type carries are also exported as a tuple, in
+The 18 venue field names the type carries are also exported as a tuple, in
 declaration order, so a consumer can iterate the row instead of hard-coding a
 list that the venue may extend:
 
@@ -651,12 +717,14 @@ channel: `last`, `change_percentage`, `high_24h` and `low_24h` come from every
 product; `highest_bid`, `lowest_ask`, `base_volume` and `quote_volume` from
 `spot.tickers` alone; the `volume_24h*` family, `total_size` and
 `quanto_base_rate` from the contract products; `funding_rate_indicative` from
-perpetuals; `basis_rate`, `basis_value` and `settle_price` from delivery futures;
-and the implied volatilities, the greeks and `position_size` from
-`options.contract_tickers`. Every other field of a row is the empty string, which
-is the same value a field the venue omitted takes — the type cannot distinguish
-the two, because the platform's Arrow schema builder for custom data has no
-optional field.
+perpetuals; and `basis_rate`, `basis_value` and `settle_price` from delivery
+futures. No field on the tuple is options-only any more: everything an
+`options.contract_tickers` row states that the platform has a type for now
+reaches a strategy as that type, so on options this subscription is worth taking
+only for the fields it shares with the other products. Every field of a row the
+venue did not populate is the empty string, which is the same value a field the
+venue omitted takes — the type cannot distinguish the two, because the platform's
+Arrow schema builder for custom data has no optional field.
 
 ## Instrument status and instrument close
 
@@ -745,9 +813,10 @@ What is deduplicated, and what is not, is worth stating precisely:
 `GateioDataClient.metrics()` returns cumulative counters. Per product:
 `reconnects`, `gaps`, `resyncs`, `snapshot_retries`, `snapshot_errors` and
 `messages`. Alongside them: `published` counted per data type (including the
-skip counters named above), `candles_dropped` per bar type, `book_gaps` per
-instrument, how many local books exist and how many of them are currently
-synchronized, and the underlying connection statistics for each socket.
+skip counters named above and `option_greeks_incomplete`), `candles_dropped` per
+bar type, `book_gaps` per instrument, how many local books exist and how many of
+them are currently synchronized, and the underlying connection statistics for
+each socket.
 
 The distinction that matters when reading them: `gaps` counts sequence breaks in a
 live stream, each of which forces a resync and means data was genuinely lost.

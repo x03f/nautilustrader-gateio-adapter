@@ -3,8 +3,15 @@
 ``GateioTicker`` is what the in-tree adapters call an adapter-specific data type:
 a ``Data`` subclass carrying the venue fields the platform has no type for,
 routed through the generic ``_subscribe`` / ``_unsubscribe`` hooks. Mark prices,
-index prices and funding rates are *not* on it — the platform has its own types
-for those and this client publishes them from the same message.
+index prices, funding rates and the option greeks are *not* on it — the platform
+has its own types for those and this client publishes them from the same message.
+
+The greeks are also tested here rather than beside the other ticker-derived
+types, because what they demonstrate is the boundary this module is about: the
+five standard greeks, the implied volatilities and the open interest are the
+platform's canonical option schema and left the custom type when they gained a
+native home, while a venue-specific sensitivity Gate.io does not publish at all
+would have stayed on it.
 """
 
 from __future__ import annotations
@@ -28,10 +35,18 @@ from nautilus_trader.data.messages import (
     RequestQuoteTicks,
     SubscribeData,
     SubscribeMarkPrices,
+    SubscribeOptionGreeks,
     UnsubscribeData,
     UnsubscribeMarkPrices,
+    UnsubscribeOptionGreeks,
 )
-from nautilus_trader.model.data import CustomData, DataType, MarkPriceUpdate, QuoteTick
+from nautilus_trader.model.data import (
+    CustomData,
+    DataType,
+    MarkPriceUpdate,
+    OptionGreeks,
+    QuoteTick,
+)
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer, get_schema
@@ -47,6 +62,7 @@ from gateio_nt.websocket.public import GateioPublicWebSocket
 from tests.test_data_book_depth import RecordingTransport, attach_ws, build_harness
 from tests.test_data_client import (
     OPTION_ID,
+    OPTION_SYMBOL,
     PERP_ID,
     SPOT_ID,
     Harness,
@@ -124,12 +140,60 @@ def tickers(harness: Harness) -> list[GateioTicker]:
     return [item.data for item in published_tickers(harness)]
 
 
+#: Sentinel for a field ``options_ticker_message`` should leave out of the row
+#: entirely, which is not the same payload as one carrying an empty string.
+ABSENT: Any = object()
+
+#: The nine values the greek row states, all distinct, so a test asserting that
+#: one of them landed on one field cannot pass with two of them transposed.
+GREEK_ROW: dict[str, str] = {
+    "delta": "0.5512",
+    "gamma": "0.000031",
+    "vega": "51.77",
+    "theta": "-13.9",
+    "rho": "22.4",
+    "mark_iv": "0.6231",
+    "bid_iv": "0.6109",
+    "ask_iv": "0.6402",
+    "position_size": "1234",
+}
+
+
+def options_ticker_message(**overrides: Any) -> dict[str, Any]:
+    """One ``options.contract_tickers`` row; that channel keys on ``name``.
+
+    A field passed as :data:`ABSENT` is dropped from the row, which is how the
+    venue says nothing about it.
+    """
+    row: dict[str, Any] = {
+        "name": OPTION_SYMBOL,
+        "last": "5800",
+        "mark_price": "5797.7",
+        "index_price": "64123.45",
+        **GREEK_ROW,
+    }
+    row.update(overrides)
+    return {
+        "channel": "options.contract_tickers",
+        "event": "update",
+        "result": [{key: value for key, value in row.items() if value is not ABSENT}],
+    }
+
+
+def greeks(harness: Harness) -> list[OptionGreeks]:
+    return [item for item in harness.published if isinstance(item, OptionGreeks)]
+
+
+def greeks_command(instrument_id: InstrumentId) -> SubscribeOptionGreeks:
+    return SubscribeOptionGreeks(instrument_id, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0)
+
+
 # -- the type ----------------------------------------------------------------
 
 
-def test_the_ticker_carries_no_mark_index_or_funding_field() -> None:
+def test_the_ticker_carries_nothing_the_platform_has_a_type_for() -> None:
     """Two sources for one number is how a strategy reads two different values."""
-    forbidden = {"mark_price", "index_price", "funding_rate"}
+    forbidden = {"mark_price", "index_price", "funding_rate", *GREEK_ROW}
 
     assert forbidden.isdisjoint(GateioTicker.__annotations__)
     assert forbidden.isdisjoint(TICKER_FIELDS)
@@ -423,6 +487,9 @@ class _Listener(Actor):
     def on_funding_rate(self, funding_rate: Any) -> None:
         self.received.append(funding_rate)
 
+    def on_option_greeks(self, option_greeks: Any) -> None:
+        self.received.append(option_greeks)
+
 
 def build_engine_rig() -> tuple[DataEngine, GateioDataClient, _Listener]:
     """A data client registered with a real ``DataEngine`` and a started actor."""
@@ -522,6 +589,252 @@ async def test_every_object_from_one_ticker_message_reaches_its_subscriber() -> 
         "IndexPriceUpdate",
         "MarkPriceUpdate",
     ]
+
+
+# -- option greeks -----------------------------------------------------------
+#
+# Gate.io states the five standard greeks, three implied volatilities and the
+# contract's open interest on every `options.contract_tickers` row. They used to
+# reach a strategy only as `GateioTicker` strings, so a strategy written against
+# the platform's `subscribe_option_greeks` — the API Deribit, OKX and Bybit all
+# serve — got nothing at all here, and got it silently.
+
+
+async def test_a_platform_greeks_subscription_now_delivers_on_gateio() -> None:
+    """The finding: this was the one unimplemented data hook on the client.
+
+    Driven through a real ``DataEngine`` and a real subscribing actor rather
+    than through the client's seam, because the seam is not where the damage
+    was: on the pre-change tree the base class recorded the subscription and
+    raised inside its own task, so ``subscribed_option_greeks()`` answered
+    ``[OPTION_ID]`` there too and only the actor noticed the silence. The
+    assertion that fails on that tree is the arrival, not the registration.
+    """
+    engine, client, listener = build_engine_rig()
+    client._loop = asyncio.get_running_loop()
+    ws = GateioPublicWebSocket(product=GateioProductType.OPT, handler=lambda msg: None)
+    ws.client = RecordingTransport()  # type: ignore[assignment]
+    client._ws_clients[GateioProductType.OPT] = ws
+
+    listener.subscribe_option_greeks(OPTION_ID, client_id=GATEIO_CLIENT_ID)
+    engine.execute(greeks_command(OPTION_ID))
+    for _ in range(6):
+        await asyncio.sleep(0)
+    assert client.subscribed_option_greeks() == [OPTION_ID]
+
+    client._handle_ws_message(GateioProductType.OPT, options_ticker_message())
+
+    received = [item for item in listener.received if isinstance(item, OptionGreeks)]
+    assert len(received) == 1, "no OptionGreeks reached the subscribing actor"
+    assert received[0].instrument_id == OPTION_ID
+    assert received[0].delta == 0.5512
+
+
+def test_each_venue_number_lands_on_the_field_that_names_it(harness: Harness) -> None:
+    """Nine distinct values, so no two of them can be transposed and still pass."""
+    harness.client._ticker_subs[OPTION_ID] = {"greeks"}
+
+    harness.client._handle_ws_message(GateioProductType.OPT, options_ticker_message())
+
+    (published,) = greeks(harness)
+    assert (published.delta, published.gamma, published.vega) == (0.5512, 0.000031, 51.77)
+    assert (published.theta, published.rho) == (-13.9, 22.4)
+    assert (published.mark_iv, published.bid_iv, published.ask_iv) == (0.6231, 0.6109, 0.6402)
+    assert published.open_interest == 1234.0
+
+
+def test_the_underlying_price_is_the_index_and_not_the_option_mark(
+    harness: Harness,
+) -> None:
+    """A Gate.io option settles against its underlying pair's index.
+
+    ``index_price`` is the only underlying quote the row carries, and the option
+    chain seeds at-the-money from ``underlying_price``. Seeding it from
+    ``mark_price`` instead — the option's own premium, 5797.7 against an
+    underlying near 64123.45 — would put every strike in the chain deep
+    out-of-the-money.
+    """
+    harness.client._ticker_subs[OPTION_ID] = {"greeks"}
+
+    harness.client._handle_ws_message(GateioProductType.OPT, options_ticker_message())
+
+    (published,) = greeks(harness)
+    assert published.underlying_price == 64123.45
+
+
+def test_open_interest_reads_the_option_spelling_of_the_field(harness: Harness) -> None:
+    """``position_size`` on an option row, ``total_size`` on a futures one.
+
+    A row carrying both is not something Gate.io sends; it is here so that
+    reading the futures spelling produces a different number rather than the
+    same one, which is the only way the mistake shows.
+    """
+    harness.client._ticker_subs[OPTION_ID] = {"greeks"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.OPT,
+        options_ticker_message(total_size="99"),
+    )
+
+    (published,) = greeks(harness)
+    assert published.open_interest == 1234.0
+
+
+@pytest.mark.parametrize("field", ["delta", "gamma", "vega", "theta", "rho"])
+def test_a_row_that_omits_one_greek_publishes_nothing_rather_than_a_zero(
+    harness: Harness,
+    field: str,
+) -> None:
+    """``0.0`` is a real delta, so it cannot also mean "the venue did not say".
+
+    The five are non-optional doubles on the platform type, so there is no way
+    to publish four of them. Filling the fifth from a parser's default would
+    hand a strategy a fabricated sensitivity — a hedge sized on a gamma of zero
+    is a hedge that is never rebalanced.
+    """
+    harness.client._ticker_subs[OPTION_ID] = {"greeks"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.OPT,
+        options_ticker_message(**{field: ABSENT}),
+    )
+
+    assert greeks(harness) == []
+    assert harness.client._published["option_greeks_incomplete"] == 1
+    assert harness.client._published["option_greeks"] == 0
+
+
+@pytest.mark.parametrize("value", ["", "n/a", "nan", "inf", "-inf"])
+def test_a_greek_that_is_not_a_finite_number_publishes_nothing(
+    harness: Harness,
+    value: str,
+) -> None:
+    """``float`` accepts ``"nan"`` and ``"inf"``; a venue quoting them does not.
+
+    A NaN delta propagates through every portfolio aggregation that touches it
+    and turns the whole book's exposure into NaN, which is worse than the
+    missing update, so the row is dropped rather than passed on.
+    """
+    harness.client._ticker_subs[OPTION_ID] = {"greeks"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.OPT,
+        options_ticker_message(vega=value),
+    )
+
+    assert greeks(harness) == []
+    assert harness.client._published["option_greeks_incomplete"] == 1
+
+
+def test_an_absent_optional_field_is_none_rather_than_zero(harness: Harness) -> None:
+    """Zero implied volatility and zero open interest are both real statements.
+
+    ``mark_iv``, ``bid_iv``, ``ask_iv``, ``underlying_price`` and
+    ``open_interest`` are nullable on the platform type precisely so an adapter
+    can decline to guess. A row that states none of them still publishes, since
+    the five greeks it does state are the ones the type requires.
+    """
+    harness.client._ticker_subs[OPTION_ID] = {"greeks"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.OPT,
+        options_ticker_message(
+            mark_iv=ABSENT,
+            bid_iv="",
+            ask_iv="n/a",
+            index_price=ABSENT,
+            position_size="",
+        ),
+    )
+
+    (published,) = greeks(harness)
+    assert (published.mark_iv, published.bid_iv, published.ask_iv) == (None, None, None)
+    assert published.underlying_price is None
+    assert published.open_interest is None
+    assert published.delta == 0.5512
+
+
+def test_one_venue_number_reaches_a_strategy_from_one_type_only(
+    harness: Harness,
+) -> None:
+    """The nine canonical fields left ``GateioTicker`` when they gained a home.
+
+    Both subscriptions are held here, which is exactly the case where a
+    duplicated field gives a strategy two readings of one number and no rule for
+    which to believe. The check is on the published values, not on the class, so
+    restoring any one of the nine fields fails it.
+    """
+    harness.client._ticker_subs[OPTION_ID] = {"greeks", "ticker"}
+
+    harness.client._handle_ws_message(GateioProductType.OPT, options_ticker_message())
+
+    (published,) = greeks(harness)
+    (row,) = tickers(harness)
+    assert published.gamma == 0.000031
+    assert row.last == "5800", "the row still carries what has no platform type"
+    carried = {getattr(row, name) for name in TICKER_FIELDS}
+    assert carried.isdisjoint(set(GREEK_ROW.values())), sorted(carried & set(GREEK_ROW.values()))
+
+
+async def test_greeks_and_a_mark_price_share_the_one_option_ticker_channel(
+    harness: Harness,
+) -> None:
+    """Gate.io has no greeks channel: both come off ``options.contract_tickers``.
+
+    So canceling greeks must not stop the mark price, and the mark price must
+    not keep greeks flowing after they were canceled — the second is the quieter
+    failure, because the data still looks fine.
+    """
+    client = harness.client
+    transport = attach_ws(harness, GateioProductType.OPT)
+
+    await client._subscribe_option_greeks(greeks_command(OPTION_ID))
+    await client._subscribe_mark_prices(
+        SubscribeMarkPrices(OPTION_ID, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0),
+    )
+    assert len(transport.subscribed) == 1, transport.subscribed
+    assert client._ticker_subs[OPTION_ID] == {"greeks", "mark"}
+
+    await client._unsubscribe_option_greeks(
+        UnsubscribeOptionGreeks(OPTION_ID, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0),
+    )
+    assert transport.unsubscribed == [], "canceling greeks stopped the mark price too"
+
+    client._handle_ws_message(GateioProductType.OPT, options_ticker_message())
+    assert greeks(harness) == [], "greeks kept arriving after they were canceled"
+    assert [item for item in harness.published if isinstance(item, MarkPriceUpdate)]
+
+    await client._unsubscribe_mark_prices(
+        UnsubscribeMarkPrices(OPTION_ID, GATEIO_CLIENT_ID, GATEIO_VENUE, UUID4(), 0),
+    )
+    assert len(transport.unsubscribed) == 1
+
+
+@pytest.mark.parametrize(
+    ("instrument_id", "product"),
+    [
+        (PERP_ID, GateioProductType.PERP),
+        (SPOT_ID, GateioProductType.SPOT),
+    ],
+)
+async def test_greeks_are_refused_on_a_product_that_has_no_greeks(
+    harness: Harness,
+    instrument_id: InstrumentId,
+    product: GateioProductType,
+) -> None:
+    """Refused rather than accepted and left silent.
+
+    A perpetual and a spot pair have no strike and no expiry, and their ticker
+    rows carry no greek fields. Accepting the subscription would take out a
+    venue subscription that can never answer it and leave the client reporting a
+    stream it will never publish.
+    """
+    transport = attach_ws(harness, product)
+
+    await harness.client._subscribe_option_greeks(greeks_command(instrument_id))
+
+    assert transport.subscribed == []
+    assert not harness.client._ticker_subs.get(instrument_id)
 
 
 # -- the helpers behind the hooks --------------------------------------------

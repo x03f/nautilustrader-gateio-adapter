@@ -23,6 +23,7 @@ Nautilus subscription                   Gate.io source
 ``_subscribe_mark_prices``              ``<ticker channel>.mark_price``
 ``_subscribe_index_prices``             ``<ticker channel>.index_price``
 ``_subscribe_funding_rates``            ``futures.tickers.funding_rate``
+``_subscribe_option_greeks``            ``options.contract_tickers`` greek fields
 ``_subscribe`` (``GateioTicker``)       ``<ticker channel>`` (the whole row)
 ``_subscribe_instrument_status``        polled instrument listings (no channel)
 ``_subscribe_instrument_close``         polled settlement (dated products only)
@@ -48,6 +49,11 @@ The ticker channel above is ``futures.tickers`` on the three futures products
 and ``options.contract_tickers`` on options (:func:`.public.tickers_channel`);
 Gate.io has no dedicated mark, index or funding channel, so one venue
 subscription serves whichever of the three a client asked for.
+
+On options that one channel also carries the five standard greeks, the three
+implied volatilities and the contract's open interest, which are published as
+the platform's own ``OptionGreeks``; see :meth:`GateioDataClient._option_greeks`
+for what Gate.io states and what it leaves for the platform's default.
 
 Mark and index prices are not order prices, so they are published on the scale
 Gate.io published them with rather than rounded onto the instrument's order
@@ -104,6 +110,7 @@ from nautilus_trader.data.messages import (
     SubscribeInstruments,
     SubscribeInstrumentStatus,
     SubscribeMarkPrices,
+    SubscribeOptionGreeks,
     SubscribeOrderBook,
     SubscribeQuoteTicks,
     SubscribeTradeTicks,
@@ -116,6 +123,7 @@ from nautilus_trader.data.messages import (
     UnsubscribeInstruments,
     UnsubscribeInstrumentStatus,
     UnsubscribeMarkPrices,
+    UnsubscribeOptionGreeks,
     UnsubscribeOrderBook,
     UnsubscribeQuoteTicks,
     UnsubscribeTradeTicks,
@@ -133,6 +141,7 @@ from nautilus_trader.model.data import (
     InstrumentClose,
     InstrumentStatus,
     MarkPriceUpdate,
+    OptionGreeks,
     OrderBookDelta,
     OrderBookDeltas,
     OrderBookDepth10,
@@ -250,10 +259,17 @@ OPTION_SETTLEMENT_WINDOW_SECS: Final[int] = 86_400
 _MARK: Final[str] = "mark"
 _INDEX: Final[str] = "index"
 _FUNDING: Final[str] = "funding"
+#: ``OptionGreeks``, carried by ``options.contract_tickers`` on options alone.
+_GREEKS: Final[str] = "greeks"
 #: The whole ticker row, published as :class:`GateioTicker`. It shares the same
 #: venue channel and the same reference count as the three above, so a strategy
 #: holding both a mark-price and a ticker subscription costs one subscription.
 _TICKER: Final[str] = "ticker"
+
+#: The five standard greeks, in the order ``OptionGreeks`` declares them. All
+#: five are non-optional doubles on the platform type, so a row that does not
+#: state every one of them publishes nothing rather than a zero.
+_GREEK_FIELDS: Final[tuple[str, ...]] = ("delta", "gamma", "vega", "theta", "rho")
 
 
 _NANOS_PER_SEC: Final[int] = 1_000_000_000
@@ -360,6 +376,33 @@ def venue_price(value: Any, floor_precision: int = 0) -> Price | None:
         return Price(number, precision)
     except (ValueError, OverflowError):  # pragma: no cover - implausible magnitude
         return None
+
+
+def venue_float(value: Any) -> float | None:
+    """Read a dimensionless Gate.io number, or refuse to read it.
+
+    Greeks and implied volatilities are not prices: they sit on no tick grid and
+    have no currency, so :func:`venue_price` is the wrong tool and the platform
+    takes them as plain doubles. What they share with a reference price is that
+    a value the venue did not state must not become a zero — a delta of ``0.0``
+    is a real, tradeable statement about a far out-of-the-money contract, so it
+    cannot double as "absent".
+
+    ``common.parsing.to_float`` is deliberately not used here: it answers with
+    its ``default`` (``0.0``) for a missing, empty or non-numeric field, which is
+    exactly the substitution this client must not make. ``float`` also accepts
+    ``"nan"`` and ``"inf"``, which no venue publishes and which would poison any
+    portfolio aggregation downstream, so they are refused too.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
 
 
 def _mark_price_precision(instrument: Instrument) -> int:
@@ -1144,6 +1187,15 @@ class GateioDataClient(LiveMarketDataClient):
         if resolved is None:
             return
         product, raw_symbol = resolved
+        if kind == _GREEKS and not product.is_option:
+            # A perpetual, a delivery future and a spot pair have no strike, no
+            # expiry and no greeks on their ticker row; accepting the
+            # subscription would hold a venue channel that can never answer it.
+            self._log.error(
+                f"Cannot subscribe to option greeks for {instrument_id}: Gate.io publishes "
+                f"greeks on option contracts only",
+            )
+            return
         if kind != _TICKER and product.is_spot:
             # A spot pair has no mark price, no index and no funding: the spot
             # ticker is 24-hour trade statistics and nothing else. The row
@@ -1225,6 +1277,12 @@ class GateioDataClient(LiveMarketDataClient):
 
     async def _unsubscribe_funding_rates(self, command: UnsubscribeFundingRates) -> None:
         await self._release_ticker_channel(command.instrument_id, _FUNDING)
+
+    async def _subscribe_option_greeks(self, command: SubscribeOptionGreeks) -> None:
+        await self._hold_ticker_channel(command.instrument_id, _GREEKS)
+
+    async def _unsubscribe_option_greeks(self, command: UnsubscribeOptionGreeks) -> None:
+        await self._release_ticker_channel(command.instrument_id, _GREEKS)
 
     # -- instrument lifecycle ----------------------------------------------
 
@@ -2149,11 +2207,19 @@ class GateioDataClient(LiveMarketDataClient):
                 )
                 self._published["funding_rates"] += 1
 
+            if _GREEKS in kinds:
+                greeks = self._option_greeks(instrument_id, item, ts_event, ts_init)
+                if greeks is not None:
+                    self._handle_data(greeks)
+                    self._published["option_greeks"] += 1
+                else:
+                    self._published["option_greeks_incomplete"] += 1
+
             if _TICKER in kinds:
-                # The venue fields the platform has no type for. Mark, index and
-                # funding are published above as the platform's own types and are
-                # deliberately absent from `GateioTicker`, so no consumer ever has
-                # two sources for one number.
+                # The venue fields the platform has no type for. Mark, index,
+                # funding and the greeks are published above as the platform's
+                # own types and are deliberately absent from `GateioTicker`, so
+                # no consumer ever has two sources for one number.
                 #
                 # The wrapper is not decoration. `DataEngine._handle_data`
                 # dispatches on the concrete type and reaches a venue-native type
@@ -2176,6 +2242,72 @@ class GateioDataClient(LiveMarketDataClient):
                     ),
                 )
                 self._published["tickers"] += 1
+
+    @staticmethod
+    def _option_greeks(
+        instrument_id: InstrumentId,
+        item: dict,
+        ts_event: int,
+        ts_init: int,
+    ) -> OptionGreeks | None:
+        """Build ``OptionGreeks`` from one ``options.contract_tickers`` row.
+
+        What Gate.io states on that row, and what it does not:
+
+        * **All five standard greeks.** ``delta``, ``gamma``, ``vega``, ``theta``
+          and ``rho`` are each a field of the row, so nothing here is computed
+          and nothing is left at a placeholder. They are also the five fields
+          the platform declares non-optional, which is why a row missing or
+          mangling any one of them publishes nothing at all: ``0.0`` is a real
+          statement about a far out-of-the-money contract and cannot double as
+          "the venue did not say".
+        * **All three implied volatilities.** ``mark_iv``, ``bid_iv`` and
+          ``ask_iv`` map onto the fields of the same names.
+        * **Open interest**, which Gate.io names ``position_size`` on the option
+          ticker (``total_size`` is the futures spelling and no option row
+          carries it).
+        * **The underlying price**, from ``index_price``. A Gate.io option
+          settles against the index of its underlying pair, and that index is
+          the only underlying quote the row carries; there is no separate
+          underlying-future price as there is on a venue with inverse options.
+          This is the one number deliberately published twice — it also reaches
+          a strategy as ``IndexPriceUpdate`` — because the platform's option
+          chain aggregation reads ``underlying_price`` off the greeks object
+          itself to seed at-the-money, and a chain cannot join it back from a
+          separate stream.
+        * **No convention.** Gate.io documents no numeraire for these values, so
+          ``convention`` is left unset and takes the platform's
+          ``GreeksConvention.BLACK_SCHOLES`` default. That default is the
+          platform's answer to an unstated convention, not a Gate.io statement,
+          and it is the one field on the published object that the venue did not
+          supply.
+
+        The magnitudes are the venue's own and are not rescaled. Gate.io states
+        no normalization for ``vega`` or ``theta``, so they are neither divided
+        onto a one-point vol move nor onto a daily decay the way the platform's
+        local Black-Scholes calculator defines them, and comparing a Gate.io
+        ``theta`` against a Deribit one is not safe without checking both venues.
+        Rescaling on a guess would change numbers the venue published.
+        """
+        values = [venue_float(item.get(field)) for field in _GREEK_FIELDS]
+        if any(value is None for value in values):
+            return None
+        delta, gamma, vega, theta, rho = values
+        return OptionGreeks(
+            instrument_id=instrument_id,
+            delta=delta,
+            gamma=gamma,
+            vega=vega,
+            theta=theta,
+            rho=rho,
+            mark_iv=venue_float(item.get("mark_iv")),
+            bid_iv=venue_float(item.get("bid_iv")),
+            ask_iv=venue_float(item.get("ask_iv")),
+            underlying_price=venue_float(item.get("index_price")),
+            open_interest=venue_float(item.get("position_size")),
+            ts_event=ts_event,
+            ts_init=ts_init,
+        )
 
     @staticmethod
     def _funding_interval_mins(instrument: Instrument) -> int | None:
@@ -3039,6 +3171,7 @@ __all__ = [
     "GateioTicker",
     "bar_type_to_interval",
     "timestamp_to_nanos",
+    "venue_float",
     "venue_price",
     "venue_quantity",
 ]
