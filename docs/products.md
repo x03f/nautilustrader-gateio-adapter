@@ -598,11 +598,20 @@ The naming asymmetry in the third column is Gate.io's own and is preserved
 verbatim, because the venue validates it: a price-triggered order names the
 plain spot ledger `normal` where a regular order says `spot`.
 
+`UNIFIED` additionally requires `SPOT` among the configured products: the unified
+ledger is read only while sweeping the spot wallet, so a client without spot
+could never publish a balance, and the execution client raises `ValueError` in
+its constructor instead of failing at start-up (*implemented and mock-tested*).
+`MARGIN` and `CROSS_MARGIN` without spot are inert and merely logged.
+
 Choosing any margin mode has two further consequences:
 
-* the Nautilus account becomes `AccountType.MARGIN` instead of `CASH`, and
-  `AccountFactory.register_cash_borrowing` is called for the venue so borrowed
-  (negative) balances can be held (*implemented and mock-tested*);
+* the Nautilus account becomes `AccountType.MARGIN` instead of `CASH`, which is
+  what lets borrowed (negative) balances be held — only a `CashAccount` refuses
+  one (*implemented and mock-tested*). Nothing registers cash borrowing for the
+  venue: `AccountFactory.register_cash_borrowing` sets a process-global flag the
+  platform reads in one place, when it builds a `CashAccount`, which a margin
+  mode guarantees this client is not;
 * balances are read from that ledger's own endpoints — `/margin/accounts`,
   `/margin/cross/accounts` or `/unified/accounts` — with borrowed principal and
   accrued interest subtracted from the total, instead of only `/spot/accounts`

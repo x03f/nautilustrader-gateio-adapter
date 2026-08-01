@@ -416,7 +416,9 @@ class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
     spot_account_mode : GateioSpotAccountMode, default ``SPOT``
         Ledger spot orders trade against: plain spot, isolated margin, cross
         margin or the unified account. The margin modes require the
-        corresponding account type to be provisioned on Gate.io.
+        corresponding account type to be provisioned on Gate.io, and select
+        nothing unless ``SPOT`` is among the products; ``UNIFIED`` without
+        ``SPOT`` is rejected outright (see Notes).
     client_order_id_tag : str, default "ng"
         Short tag embedded in generated Gate.io ``text`` client order ids.
     account_polling_interval_secs : NonNegativeFloat, default 30.0
@@ -431,8 +433,14 @@ class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
     -----
     A value outside the range its type declares is refused here, whether the
     configuration is written in Python or decoded from a declarative one.
-    Cross-field validation (products versus environment, spot account mode
-    versus configured products) runs in the client constructor.
+
+    Cross-field validation runs in the execution client constructor instead,
+    because it compares one field against another rather than checking a field
+    on its own. It rejects a product set that is empty or not served by
+    ``environment``, and ``spot_account_mode=UNIFIED`` without ``SPOT`` among the
+    products — a combination Gate.io accepts but this client cannot serve,
+    because it reads the unified ledger only while sweeping the spot wallet. The
+    other margin modes without ``SPOT`` are merely inert and are logged as such.
 
     """
 

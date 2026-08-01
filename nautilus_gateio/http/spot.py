@@ -355,9 +355,11 @@ class GateioSpotHttpAPI:
 
         Cancelling is idempotent at the venue, but this endpoint is a ``POST``,
         so the transport does not replay it; re-issue it explicitly if the
-        outcome is unknown.
+        outcome is unknown. Gate.io documents the ``x-gate-exptime`` submission
+        deadline here, so a re-issued batch that crawls to the venue is refused
+        rather than applied against a book that has moved on.
         """
-        return await self._client.post("/spot/cancel_batch_orders", body=orders)
+        return await self._client.post("/spot/cancel_batch_orders", body=orders, expiring=True)
 
     async def amend_order(
         self,
@@ -446,6 +448,14 @@ class GateioSpotHttpAPI:
         ``id_string`` to avoid 64-bit precision loss. The triggered order is a
         *separate* object with its own id, surfaced later as ``fired_order_id``
         on the price order, so callers need a two-stage identity map.
+
+        **No submission deadline.** Arming a stop is as money-significant as
+        submitting a plain order, but Gate.io declares ``x-gate-exptime`` only
+        for the endpoints listed in ``docs/configuration.md``, and the
+        price-order endpoints are not among them, so this request carries
+        none: a submission delayed in
+        flight is armed whenever it lands, at a price that may no longer be
+        the one the caller reasoned about.
         """
         return await self._client.post("/spot/price_orders", body=body)
 
@@ -481,7 +491,13 @@ class GateioSpotHttpAPI:
         return await self._client.get(f"/spot/price_orders/{order_id}", signed=True)
 
     async def cancel_price_order(self, order_id: str) -> dict[str, Any]:
-        """``DELETE /spot/price_orders/{order_id}`` — disarm one price order."""
+        """``DELETE /spot/price_orders/{order_id}`` — disarm one price order.
+
+        Like every price-order endpoint, this one carries no submission
+        deadline: Gate.io declares ``x-gate-exptime`` for the plain-order
+        cancels but not for these, so a disarm delayed in flight still applies
+        when it lands, however late.
+        """
         return await self._client.delete(f"/spot/price_orders/{order_id}")
 
     async def cancel_price_orders(
@@ -492,6 +508,8 @@ class GateioSpotHttpAPI:
         """``DELETE /spot/price_orders`` — disarm every price order in scope.
 
         Omitting ``market`` cancels the account's price orders on all markets.
+        Carries no submission deadline, for the same reason as
+        :meth:`cancel_price_order`.
         """
         params: dict[str, Any] = {"market": market, "account": account}
         return await self._client.delete("/spot/price_orders", params=params)

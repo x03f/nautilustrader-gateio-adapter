@@ -341,7 +341,9 @@ than code.
 - **`spot_account_mode` selects the ledger** spot orders trade against: `SPOT`, `MARGIN` (isolated),
   `CROSS_MARGIN` or `UNIFIED`. The margin ledgers need the corresponding account type provisioned at
   the venue, and cross margin and unified need the account upgraded out of classic mode, which only
-  the account owner can do. The adapter never changes an account setting for you.
+  the account owner can do. The adapter never changes an account setting for you. `UNIFIED` also
+  needs `SPOT` among `products` — the unified ledger is read only while sweeping the spot wallet, so
+  the execution client refuses to construct without it.
 - **The Nautilus account type follows the configuration.** Spot alone on the plain spot ledger is a
   `CASH` account. Any derivative product, or any margin ledger, makes it `MARGIN`, which changes what
   the platform's risk engine will let a strategy do. The execution client logs which one it built at

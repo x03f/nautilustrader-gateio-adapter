@@ -354,10 +354,22 @@ explicit reason. Regular spot orders and the plain-spot price-order encoding are
 
 Two boundaries are easy to trip over:
 
-* The mode only takes effect when `SPOT` is among `products`. With, say,
-  `products=(PERP,)` and `spot_account_mode=UNIFIED`, no spot order is ever sent
-  and no unified ledger is read; the only visible effect is that the account is
-  typed `MARGIN`.
+* The mode only selects anything when `SPOT` is among `products`, because every
+  use of it is on a spot path: the `account` field of a spot order, and the
+  margin ledger sweep. The two cases are not treated alike.
+  * **`UNIFIED` without `SPOT` is refused.** The execution client raises
+    `ValueError` in its constructor, before any network activity. The unified
+    ledger is read in exactly one place — while sweeping the spot wallet — so
+    such a client would never read a balance it could publish, and would instead
+    fail some thirty seconds into start-up with an error about the unified ledger
+    rather than about the configuration. Nothing that worked before is refused;
+    a delayed and misdirected failure is replaced by an immediate and accurate
+    one.
+  * **`MARGIN` and `CROSS_MARGIN` without `SPOT` are inert**, and the client logs
+    a warning at construction saying so, rather than letting the setting read as
+    margin trading being configured. Neither changes the account type in that
+    case: a client with a derivative product is `MARGIN` whatever the spot mode
+    says.
 * The margin modes require the corresponding account type to exist on Gate.io.
   Nothing in the configuration provisions one.
 
@@ -483,11 +495,14 @@ What each client validates on construction:
 | Client    | Checks                                                                                          |
 |-----------|-------------------------------------------------------------------------------------------------|
 | Data      | product set (non-empty, real members, served by the environment), book interval, snapshot depth |
-| Execution | product set only                                                                                |
+| Execution | product set (as above), and `spot_account_mode` against the product set                          |
 
-The execution client does not cross-check `spot_account_mode` against
-`products`, for the reason given above: a mode that names no configured ledger
-is inert rather than wrong.
+The execution client's cross-check is one-sided, for the reason given above:
+`spot_account_mode=UNIFIED` without `SPOT` among `products` raises `ValueError`,
+because that client can never state its account, while `MARGIN` and
+`CROSS_MARGIN` without `SPOT` are logged as having no effect and otherwise
+allowed — they are inert rather than unserviceable. See
+[Which ledger a spot order names](#which-ledger-a-spot-order-names).
 
 Module-level constants worth knowing:
 
@@ -504,13 +519,63 @@ configuring the adapter honestly:
 
 * **Request pacing.** The shared REST transport paces itself at 8 requests per
   second and backs off on HTTP 429. There is no configuration field for it.
-* **The submission-deadline header.** Gate.io accepts an `x-gate-exptime` header
-  bounding how late a delayed order may still be accepted. The transport
-  supports it and withholds it until the venue clock offset has been measured by
-  an explicit `sync_time()` call, because an unsynchronized clock would expire
-  valid requests. Neither client makes that call, so in the default
-  configuration the header is not sent. The header logic itself is *implemented
-  and mock-tested* (`tests/test_http_client.py`).
+* **The submission deadline.** Gate.io accepts an `x-gate-exptime` header
+  bounding how late a delayed order may still be accepted, and **in the default
+  configuration it is sent**: the execution client measures the venue clock
+  offset as the first act of connecting, which is what the transport withholds
+  the header until, since an unsynchronized clock would expire valid requests.
+  The deadline is ten seconds ahead of the venue clock, and that figure is what
+  is not configurable — `GateioHttpClient` takes an `order_expiry_ms` argument
+  (`0` disables the header), but no configuration field reaches it and the
+  factory always builds the transport with the default. If the clock reading
+  fails, the client logs it and connects anyway with the deadline off. The
+  header logic itself is *implemented and mock-tested*
+  (`tests/test_http_client.py`), and the connect-time reading in
+  `tests/test_factories.py`.
+
+  **Which calls carry it, and which do not.** Gate.io declares
+  `x-gate-exptime` per endpoint rather than API-wide, so the coverage is the
+  venue's list, not a choice made here. It is sent on:
+
+  | Call | Endpoint |
+  |------|----------|
+  | `spot.create_order` | `POST /spot/orders` |
+  | `spot.create_batch_orders` | `POST /spot/batch_orders` |
+  | `spot.cancel_order` | `DELETE /spot/orders/{id}` |
+  | `spot.cancel_all` | `DELETE /spot/orders` |
+  | `spot.cancel_batch` | `POST /spot/cancel_batch_orders` |
+  | `spot.amend_order` | `PATCH /spot/orders/{id}` |
+  | `futures.create_order` | `POST /futures/{settle}/orders` |
+  | `futures.create_batch_orders` | `POST /futures/{settle}/batch_orders` |
+  | `futures.cancel_order` | `DELETE /futures/{settle}/orders/{id}` |
+  | `futures.cancel_all` | `DELETE /futures/{settle}/orders` |
+  | `futures.amend_order` | `PUT /futures/{settle}/orders/{id}` |
+
+  It is **not** sent on any other call the adapter makes, and three of those
+  omissions matter to a running strategy:
+
+  * **Price-triggered orders**, on both spot and futures — `POST` and the two
+    `DELETE` forms of `/spot/price_orders` and `/futures/{settle}/price_orders`.
+    This is how the adapter arms and disarms `STOP_MARKET`, `STOP_LIMIT` and
+    the if-touched types, so a stop that is submitted or cancelled through a
+    stalled connection is applied whenever it arrives, however stale the price
+    that motivated it. Gate.io declares no deadline header for these endpoints,
+    and the adapter does not invent one.
+  * **Every options endpoint** — submit, cancel, cancel-all — for the same
+    reason.
+  * **The countdown dead-man switch** on all three product lines, which is the
+    one place where lateness is self-correcting: a countdown that lands late
+    simply re-arms from that moment.
+
+  One case is behavior rather than venue documentation. Delivery (dated)
+  futures are served by the same namespace methods as perpetuals, so the
+  deadline goes out on `/delivery/{settle}/orders` too, while Gate.io declares
+  the header only under `/futures/{settle}`. The request is identical in shape
+  and an undeclared header cannot make it worse, so it is left in place — but
+  read the protection as guaranteed on perpetuals and best-effort on dated
+  contracts. Every row and every exception above is driven and asserted against
+  the wire in `tests/test_http_namespaces.py`, which also fails if a namespace
+  gains a new order endpoint that nobody classified.
 * **Per-endpoint rate-limit budgets**, request-weight accounting and local order
   throttling are *unsupported*: none is implemented, and none is planned for
   this release.

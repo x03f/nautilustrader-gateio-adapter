@@ -17,6 +17,27 @@ leaves a subscription the client reports as held for the rest of its life and
 never retries. Everything below is implemented and mock-tested — the offline
 suite drives it against recorded venue payload shapes. None of it has been run
 against Gate.io: the mainnet column stays empty for every row this round adds.
+It also refuses one configuration it used to accept, and changes what the
+execution client puts on the wire — both are below, under **Changed (breaking)**
+and **Changed**.
+
+### Changed (breaking)
+
+- **`spot_account_mode=UNIFIED` without `GateioProductType.SPOT` among
+  `products` now raises `ValueError`** from `GateioExecutionClient.__init__`,
+  before any network activity. A node whose configuration file pairs `UNIFIED`
+  with a derivative-only product set constructed fine before this and will not
+  construct after it. Nothing that worked is refused: the unified ledger is read
+  in exactly one place — while sweeping the spot wallet — so without spot the
+  client never obtained a balance it was willing to publish, and it failed some
+  thirty seconds into start-up inside `_await_account_registered`, with a message
+  about the unified ledger rather than about the configuration. The refusal
+  replaces a delayed and misdirected failure with an immediate and accurate one.
+  Add `SPOT` to `products`, or set the spot account mode this key actually trades
+  under. `MARGIN` and `CROSS_MARGIN` without spot are unaffected: they select
+  nothing, and are now logged as having no effect rather than refused.
+  `docs/configuration.md`, `docs/products.md` and `docs/execution.md` state the
+  rule and where it comes from.
 
 ### Added
 
@@ -125,6 +146,22 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   The dict is now drained with `popitem()`, the body is wrapped, and the
   transport is released in a `finally`, so even a cancelled teardown gives it
   back.
+
+- **A spot-margin execution client no longer registers cash borrowing for the
+  whole venue.** `AccountFactory.register_cash_borrowing(GATE_IO)` was called
+  whenever `spot_account_mode` named a margin ledger, to let the account hold the
+  negative balance a borrowed position produces. It never did that: the flag is
+  read in one place, the `CashAccount` branch of `AccountFactory.create_c`, and a
+  margin spot mode makes this client a `MARGIN` account, which holds negative
+  balances anyway. What the call could do was the reverse of its intent, because
+  the registration is process-global and permanent — every *cash* Gate.io account
+  created afterwards in the same process accepted negative balances, and
+  NautilusTrader's risk engine skips the free-balance check entirely for such an
+  account, so a plain spot node sharing a process with a margin one could place
+  orders its balance does not cover. The call is gone; nothing about the margin
+  account's own behaviour changes. `docs/execution.md` and `docs/products.md` no
+  longer describe the registration, and no longer carry the *mock-tested* status
+  it stood on.
 
 - **A published `GateioTicker` reached no subscriber.** The row was handed to
   `_handle_data` unwrapped, and `DataEngine` dispatches a venue-native type only
@@ -254,6 +291,40 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   the one change that shows *more*, and `tests/test_config.py` pins the width so
   it cannot widen again silently. `SECURITY.md` and `docs/configuration.md` state
   the current behaviour.
+
+- **Orders now carry a submission deadline, which changes what Gate.io receives.**
+  The execution client reads the venue clock (`GET /spot/time`) as the first act
+  of connecting, which is the precondition the transport withholds the
+  `x-gate-exptime` header on. So in the default configuration every spot and
+  futures submit, batch submit, cancel, cancel-all, batch cancel and amend now
+  leaves with a deadline ten seconds ahead of the venue clock, and the venue
+  rejects it if it arrives later. Before this nothing in the package called
+  `sync_time()`, so no deployment ever sent one: an order held up in the network
+  stayed acceptable indefinitely and could execute against a price it was never
+  meant to see. Signed requests are timestamped against the same offset, which is
+  the other reason the reference adapter reads the venue clock while connecting.
+  A clock reading that fails is logged and the client connects anyway — the
+  deadline is a protection, not a precondition. The ten seconds are not
+  configurable from either client config. `docs/configuration.md` and
+  `docs/architecture.md` follow.
+
+  **The coverage is Gate.io's, and it has holes.** The venue declares
+  `x-gate-exptime` per endpoint, not API-wide, and it declares it on the eleven
+  plain order endpoints listed in `docs/configuration.md` and on nothing else
+  this adapter calls. `POST /spot/cancel_batch_orders` is one of the eleven and
+  was missed on this branch until now: the multi-order cancel the execution
+  client uses for a batched `cancel_orders` went out without a deadline while
+  the single-order cancel beside it carried one. It carries one now. The
+  endpoints Gate.io declares no header for still send none, and that is a real
+  gap rather than a boundary worth glossing: it covers the price-triggered order
+  endpoints on both spot and futures — which is how this adapter arms and
+  disarms every stop and if-touched order — the countdown dead-man switch, and
+  the whole options API. Earlier text in this section said only the options
+  endpoints were uncovered, which understated it. `tests/test_http_namespaces.py`
+  now drives every mutating call in the spot, futures and options namespaces and
+  reads the header off the request each one produced, so neither the omissions
+  nor the coverage can drift from the documentation unnoticed, and a namespace
+  that gains an order endpoint nobody classified fails the suite.
 
 - **The branch no longer reports the released version.** `pyproject.toml` and
   `nautilus_gateio.__version__` carry `0.2.0a2.dev0`: a

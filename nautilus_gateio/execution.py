@@ -110,7 +110,6 @@ from decimal import Decimal
 from functools import partial
 from typing import Any, Final
 
-from nautilus_trader.accounting.factory import AccountFactory
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor, LogLevel
@@ -210,7 +209,12 @@ from nautilus_gateio.common.symbols import (
     parse_option_symbol,
 )
 from nautilus_gateio.config import GateioExecClientConfig, validate_products
-from nautilus_gateio.http.client import GateioHttpClient, GateioRequestAmbiguousError
+from nautilus_gateio.http.client import (
+    CLOCK_DRIFT_WARNING_MS,
+    EXPIRY_HEADER,
+    GateioHttpClient,
+    GateioRequestAmbiguousError,
+)
 from nautilus_gateio.http.futures import GateioFuturesHttpAPI
 from nautilus_gateio.http.margin import GateioMarginHttpAPI, require_wallet
 from nautilus_gateio.http.options import GateioOptionsHttpAPI
@@ -894,9 +898,11 @@ class GateioExecutionClient(LiveExecutionClient):
     ------
     ValueError
         If the configured product set is empty or not served by the configured
-        environment. These compare one field against another, so they run here
-        rather than on the struct, whose ``__post_init__`` sees each field on
-        its own.
+        environment, or if ``spot_account_mode`` is ``UNIFIED`` while ``SPOT`` is
+        not among the products (the unified ledger is only ever read while
+        sweeping the spot wallet, so such a client can never state its account).
+        These compare one field against another, so they run here rather than on
+        the struct, whose ``__post_init__`` sees each field on its own.
 
     Warnings
     --------
@@ -920,16 +926,27 @@ class GateioExecutionClient(LiveExecutionClient):
         products = validate_products(config.products, config.environment)
         spot_mode = config.spot_account_mode
 
+        # Cross-field validation the frozen config struct cannot express. A
+        # Unified Account reports one cross-product balance that subsumes every
+        # wallet, and this client reads it in exactly one place: while sweeping
+        # the spot wallet (`_collect_spot_balances`). Without SPOT among the
+        # products that sweep never happens, so `_update_account_state` finds no
+        # unified snapshot, refuses to publish a per-wallet sum it knows would be
+        # inflated, and the client then fails to start thirty seconds later
+        # inside `_await_account_registered` with an error naming the unified
+        # ledger rather than the configuration. Nothing works today that this
+        # rejects; it only replaces a delayed, misdirected failure with an
+        # immediate and accurate one.
+        if spot_mode is GateioSpotAccountMode.UNIFIED and GateioProductType.SPOT not in products:
+            raise ValueError(
+                "`spot_account_mode=UNIFIED` requires GateioProductType.SPOT among `products`: "
+                "the unified ledger is read only while sweeping the spot wallet, so this client "
+                "would never read a balance it could publish. Add SPOT, or configure the spot "
+                "account mode this key trades under.",
+            )
+
         cash_account = set(products) == {GateioProductType.SPOT} and not spot_mode.is_margin
         account_type = AccountType.CASH if cash_account else AccountType.MARGIN
-
-        if spot_mode.is_margin:
-            # Spot margin ledgers settle borrowed balances, which a cash account
-            # otherwise refuses to hold as a negative balance.
-            try:
-                AccountFactory.register_cash_borrowing(GATEIO)
-            except KeyError:
-                pass  # Already registered by another client instance
 
         super().__init__(
             loop=loop,
@@ -951,6 +968,17 @@ class GateioExecutionClient(LiveExecutionClient):
         self._products: tuple[GateioProductType, ...] = products
         self._spot_mode = spot_mode
         self._account_type = account_type
+
+        if spot_mode.is_margin and GateioProductType.SPOT not in products:
+            # Every use of the mode is on a spot path: the `account` field of a
+            # spot order, and the margin ledger sweep. With no spot product
+            # enabled it selects nothing, so say so rather than let it read as
+            # margin trading being configured.
+            self._log.warning(
+                f"`spot_account_mode={spot_mode.value}` has no effect without "
+                f"GateioProductType.SPOT among the products; it selects the ledger spot orders "
+                f"trade against and this client places none",
+            )
 
         # REST namespaces
         self._http_client = http_client
@@ -1070,6 +1098,36 @@ class GateioExecutionClient(LiveExecutionClient):
     # -- lifecycle ---------------------------------------------------------
 
     async def _connect(self) -> None:
+        # Measure the venue clock before anything is signed. Two things depend on
+        # it: the timestamp carried by every signed request, which the venue
+        # rejects as `INVALID_SIGNATURE` when it drifts, and the `x-gate-exptime`
+        # submission deadline, which the transport withholds until the offset is
+        # known (http/client.py, `Retry safety`). Without this call the deadline
+        # is never sent, so an order delayed in flight can still be accepted long
+        # after its price is stale. The reference adapter reads the venue clock
+        # on connect for the same reason (binance/execution.py:350-355).
+        try:
+            offset_ms = await self._http_client.sync_time()
+        except Exception as e:  # noqa: BLE001 - a clock reading must not stop the client
+            # Fail open, not closed: the deadline header simply stays off, which
+            # is exactly how the client ran before, so a venue that will not
+            # answer `/spot/time` costs a protection rather than the session.
+            self._log.warning(
+                f"Cannot read the Gate.io server time ({e}); submission deadlines "
+                f"({EXPIRY_HEADER}) stay off and signed requests use the local clock",
+            )
+        else:
+            self._log.info(f"Gate.io clock offset {offset_ms} ms", LogColor.BLUE)
+            if abs(offset_ms) > CLOCK_DRIFT_WARNING_MS:
+                # The offset corrects what this adapter sends, but not what the
+                # platform records: every Nautilus event timestamp comes from the
+                # local clock, so a node this far out mistimes its own history.
+                self._log.warning(
+                    f"This host's clock differs from Gate.io by {offset_ms} ms; requests are "
+                    f"corrected, but Nautilus event timestamps are taken from the local clock "
+                    f"and will carry that error",
+                )
+
         await self._instrument_provider.initialize()
         self._cache_instruments()
 

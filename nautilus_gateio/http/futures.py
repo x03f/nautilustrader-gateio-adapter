@@ -40,6 +40,18 @@ docstring and every payload contract for no behavioural gain, so the product is
 a constructor flag and the handful of genuinely perpetual-only endpoints raise
 instead of silently returning something else. Those are: funding rates (delivery
 contracts have no funding at all), order amendment, and dual-position mode.
+
+One consequence is worth stating, because it is a promise this namespace cannot
+keep on both product lines. Gate.io declares the ``x-gate-exptime`` submission
+deadline on the *perpetual* order endpoints (``/futures/{settle}/orders`` and
+its batch, cancel, cancel-all and amend siblings) and declares it nowhere under
+``/delivery``. The methods below ask for the deadline unconditionally, so a
+delivery order does carry the header — the request is identical in shape and an
+undeclared header cannot make it worse — but whether the venue enforces it there
+is undocumented. Treat the deadline as guaranteed on perpetuals and best-effort
+on dated contracts. It is never attached to the price-order endpoints of either
+product, nor to the countdown switch, because Gate.io declares it for none of
+them; see ``docs/configuration.md`` for the complete list.
 """
 
 from __future__ import annotations
@@ -653,6 +665,11 @@ class GateioFuturesHttpAPI:
         The armed order has its own id space: the id returned here is not the
         eventual futures order id, which appears as ``trade_id`` on the price
         order once it fires.
+
+        **No submission deadline.** Gate.io declares ``x-gate-exptime`` on the
+        plain futures order endpoints and not on the price-order ones (see
+        ``docs/configuration.md`` for the full list), so this request carries
+        none: delayed in flight, it arms whenever it lands.
         """
         return await self._client.post(f"{self._base}/price_orders", body=body)
 
@@ -680,13 +697,19 @@ class GateioFuturesHttpAPI:
         return await self._client.get(f"{self._base}/price_orders/{order_id}", signed=True)
 
     async def cancel_price_order(self, order_id: str) -> dict[str, Any]:
-        """``DELETE {base}/price_orders/{order_id}`` — disarm one price order."""
+        """``DELETE {base}/price_orders/{order_id}`` — disarm one price order.
+
+        Carries no submission deadline: Gate.io declares ``x-gate-exptime`` for
+        the plain-order cancels but not for the price-order ones, so a disarm
+        delayed in flight still applies when it lands, however late.
+        """
         return await self._client.delete(f"{self._base}/price_orders/{order_id}")
 
     async def cancel_price_orders(self, contract: str | None = None) -> list[dict[str, Any]]:
         """``DELETE {base}/price_orders`` — disarm price orders.
 
-        ``contract`` is the only filter this endpoint accepts.
+        ``contract`` is the only filter this endpoint accepts. Carries no
+        submission deadline, for the same reason as :meth:`cancel_price_order`.
         """
         return await self._client.delete(
             f"{self._base}/price_orders",

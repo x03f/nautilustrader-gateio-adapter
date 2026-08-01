@@ -12,13 +12,26 @@ import asyncio
 from collections.abc import Iterator
 
 import pytest
+from nautilus_trader.accounting.accounts.cash import CashAccount
+from nautilus_trader.accounting.error import AccountBalanceNegative
+from nautilus_trader.accounting.factory import AccountFactory
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.enums import AccountType, OmsType
-from nautilus_trader.model.identifiers import TraderId
+from nautilus_trader.model.events import AccountState
+from nautilus_trader.model.identifiers import AccountId, TraderId
+from nautilus_trader.model.objects import AccountBalance, Money
 
-from nautilus_gateio.common.constants import GATEIO_HTTP_MAINNET, GATEIO_HTTP_TESTNET, GATEIO_VENUE
+from nautilus_gateio.common.constants import (
+    GATEIO,
+    GATEIO_HTTP_MAINNET,
+    GATEIO_HTTP_TESTNET,
+    GATEIO_VENUE,
+)
 from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
+from nautilus_gateio.common.errors import GateioServerError
 from nautilus_gateio.config import GateioDataClientConfig, GateioExecClientConfig
 from nautilus_gateio.data import GateioDataClient
 from nautilus_gateio.execution import GateioExecutionClient
@@ -348,3 +361,252 @@ class TestSharedTransportLifecycle:
             assert not second.is_closed
         finally:
             get_cached_gateio_http_client.cache_clear()
+
+
+def _cash_account_state(balance: Money) -> AccountState:
+    """A reported cash account state for the Gate.io issuer.
+
+    This is the event the platform turns into an ``Account`` object:
+    ``AccountFactory.create`` reads the issuer out of the account id and decides
+    from process-global registrations what the resulting account permits
+    (``accounting/factory.pyx``, ``create_c``).
+    """
+    return AccountState(
+        account_id=AccountId(f"{GATEIO}-master"),
+        account_type=AccountType.CASH,
+        base_currency=None,
+        reported=True,
+        balances=[AccountBalance(balance, Money(0, balance.currency), balance)],
+        margins=[],
+        info={},
+        event_id=UUID4(),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+@pytest.fixture
+def no_cash_borrowing_registration() -> Iterator[None]:
+    """Undo any process-global cash-borrowing registration left by a test.
+
+    ``AccountFactory`` keeps the registration in module state for the life of the
+    process, so a test that provokes one would otherwise change how every later
+    test's cash account behaves.
+    """
+    yield
+    AccountFactory.deregister_cash_borrowing(GATEIO)
+
+
+class TestCashBorrowingIsNeverRegistered:
+    """A spot-margin client used to register cash borrowing for the whole venue.
+
+    It never took effect where it was aimed: a margin spot mode makes the client
+    a ``MARGIN`` account, and ``allow_borrowing`` is read in exactly one place —
+    the ``CashAccount`` branch of ``AccountFactory.create_c``. What the call
+    could do was the reverse of its intent, because the registration is global
+    and permanent: any *cash* Gate.io account created afterwards in the same
+    process would accept negative balances, and the risk engine skips its
+    free-balance check for such an account entirely (``risk/engine.pyx``:694,
+    948-1026). A plain spot node sharing a process with a margin one would place
+    orders its balance cannot cover.
+    """
+
+    def test_a_margin_client_leaves_cash_accounts_unable_to_hold_a_negative_balance(
+        self,
+        node_components,
+        block_network,
+        no_cash_borrowing_registration,
+    ):
+        build_exec_client(
+            node_components,
+            GateioExecClientConfig(
+                products=(GateioProductType.SPOT,),
+                spot_account_mode=GateioSpotAccountMode.CROSS_MARGIN,
+            ),
+        )
+
+        account = AccountFactory.create(_cash_account_state(Money(1_000, USDT)))
+        assert isinstance(account, CashAccount)
+
+        overdrawn = Money(-1, USDT)
+        with pytest.raises(AccountBalanceNegative):
+            account.update_balances(
+                [AccountBalance(overdrawn, Money(0, USDT), overdrawn)],
+            )
+
+    def test_a_margin_client_is_a_margin_account_so_borrowing_was_never_read(
+        self,
+        node_components,
+        block_network,
+        no_cash_borrowing_registration,
+    ):
+        """Why the registration could not have worked as intended."""
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(
+                products=(GateioProductType.SPOT,),
+                spot_account_mode=GateioSpotAccountMode.MARGIN,
+            ),
+        )
+        assert client.account_type == AccountType.MARGIN
+
+
+class TestSpotAccountModeAgainstProducts:
+    """Cross-field validation the frozen config struct cannot do.
+
+    The unified ledger is read in one place only — the spot wallet sweep — so a
+    unified client without SPOT among its products reads no balance it is willing
+    to publish, never registers its account, and fails inside
+    ``_await_account_registered`` thirty seconds into connecting.
+    """
+
+    @pytest.mark.parametrize(
+        "products",
+        [
+            (GateioProductType.PERP,),
+            (GateioProductType.PERP, GateioProductType.FUT),
+            (GateioProductType.OPT,),
+        ],
+    )
+    def test_unified_without_spot_is_refused_at_construction(
+        self,
+        node_components,
+        block_network,
+        products,
+    ):
+        with pytest.raises(ValueError, match="requires GateioProductType.SPOT"):
+            build_exec_client(
+                node_components,
+                GateioExecClientConfig(
+                    products=products,
+                    spot_account_mode=GateioSpotAccountMode.UNIFIED,
+                ),
+            )
+
+    def test_unified_with_spot_is_accepted(self, node_components, block_network):
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(
+                products=(GateioProductType.SPOT, GateioProductType.PERP),
+                spot_account_mode=GateioSpotAccountMode.UNIFIED,
+            ),
+        )
+        assert client.account_type == AccountType.MARGIN
+
+    @pytest.mark.parametrize(
+        "mode",
+        [GateioSpotAccountMode.MARGIN, GateioSpotAccountMode.CROSS_MARGIN],
+    )
+    def test_an_inert_margin_mode_is_allowed_and_said_to_be_inert(
+        self,
+        node_components,
+        block_network,
+        log_capture,
+        mode,
+    ):
+        """The other margin modes select a spot ledger and nothing else.
+
+        Without SPOT they change no behaviour, so the client starts — and says
+        the setting is doing nothing rather than let it read as configured
+        margin trading.
+        """
+        log_capture.mark()
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(products=(GateioProductType.PERP,), spot_account_mode=mode),
+        )
+        assert client.account_type == AccountType.MARGIN
+
+        lines = log_capture.wait_for("has no effect without")
+        assert any(f"spot_account_mode={mode.value}" in line for line in lines), lines
+
+
+class TestConnectSynchronisesTheVenueClock:
+    """``sync_time`` had no caller inside the package, only the examples.
+
+    The submission deadline (``x-gate-exptime``) is withheld until the venue
+    clock offset is known, so with nothing calling it a default deployment never
+    sent one: an order held up in the network stayed acceptable indefinitely and
+    could execute against a price it was never meant to see. The signature
+    timestamp rides on the same offset. The reference adapter reads the venue
+    clock while connecting for the same reason (binance/execution.py:350-355).
+    """
+
+    @staticmethod
+    def _stub_venue_calls(client, seen: list[str]) -> None:
+        """Replace everything ``_connect`` does at the venue with a recorder."""
+
+        def _record(name: str):
+            async def _inner(*args, **kwargs):
+                seen.append(name)
+                return None
+
+            return _inner
+
+        client._instrument_provider.initialize = _record("instruments")
+        client._load_user_id = _record("user_id")
+        client._assert_one_way_position_mode = _record("position_mode")
+        client._update_account_state = _record("account_state")
+        client._await_account_registered = _record("account_registered")
+        client._connect_private_websocket = _record("websocket")
+
+    def test_the_clock_is_read_before_any_other_venue_call(
+        self,
+        node_components,
+        block_network,
+    ):
+        _, _, _, loop = node_components
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(account_polling_interval_secs=0.0),
+        )
+        seen: list[str] = []
+        self._stub_venue_calls(client, seen)
+
+        transport = client._http_client
+
+        async def fake_sync_time() -> int:
+            seen.append("clock")
+            transport._time_offset_ms = 250
+            transport._clock_synced = True
+            return 250
+
+        transport.sync_time = fake_sync_time
+
+        loop.run_until_complete(client._connect())
+
+        assert seen[0] == "clock", seen
+        assert transport.clock_synced is True
+        assert transport._expiry_ms() is not None, "the submission deadline is still withheld"
+
+    def test_a_clock_reading_that_fails_does_not_stop_the_client(
+        self,
+        node_components,
+        block_network,
+        log_capture,
+    ):
+        """Fail open: the deadline is a protection, not a precondition."""
+        _, _, _, loop = node_components
+        log_capture.mark()
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(account_polling_interval_secs=0.0),
+        )
+        seen: list[str] = []
+        self._stub_venue_calls(client, seen)
+
+        transport = client._http_client
+
+        async def failing_sync_time() -> int:
+            raise GateioServerError(500, "SERVER_ERROR", "server error")
+
+        transport.sync_time = failing_sync_time
+
+        loop.run_until_complete(client._connect())
+
+        assert "account_registered" in seen, "the client did not finish connecting"
+        assert transport.clock_synced is False
+        assert transport._expiry_ms() is None
+
+        lines = log_capture.wait_for("Cannot read the Gate.io server time")
+        assert any("Cannot read the Gate.io server time" in line for line in lines), lines
