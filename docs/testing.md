@@ -80,10 +80,16 @@ of these:
 
 ## Continuous integration
 
-The workflow in `.github/workflows/ci.yml` runs three jobs:
+The workflow in `.github/workflows/ci.yml` runs four jobs:
 
-1. **Test** on Python 3.12 and 3.13 — `ruff check`, `ruff format --check`,
-   `pytest`, and an import smoke test that exercises the sub-packages.
+1. **Test** on Python 3.12, 3.13 and 3.14 — `ruff check`, `ruff format --check`,
+   both `pytest` and `python -m pytest`, and an import smoke test that exercises
+   the sub-packages. Both invocations are run because they differ: a bare
+   `pytest` does not put the repository root on `sys.path`, and the suite was
+   red in CI for weeks while green locally before that was understood.
+1a. **Minimum platform** — installs the lowest `nautilus_trader` the package
+   claims to support and runs the suite against it, so the lower bound is a
+   tested claim rather than a guess.
 2. **Build** — cleans `dist/`, `build/` and `*.egg-info`, builds the sdist and
    wheel, runs `twine check`, then installs the wheel into a clean virtual
    environment **outside the source tree** and verifies that every sub-package
@@ -95,3 +101,19 @@ The workflow in `.github/workflows/ci.yml` runs three jobs:
    the API fails the build. Actually executing them requires the venue, which
    is why that step is a release check rather than a CI job (see
    [releasing.md](releasing.md)).
+
+### What the suite does not check about CI
+
+The suite does not assert that the workflow does its job. That was tried and
+abandoned on purpose: a test that reads `ci.yml` is a second implementation of
+GitHub Actions' semantics, and every version of it was defeated by a workflow
+that satisfied the assertions and ran nothing — steps neutered with
+`continue-on-error`, commands reduced to `echo`, triggers narrowed to
+`workflow_dispatch` so the job never fires on a push at all. Each round closed
+the hole it was shown and left another one level up.
+
+Whether CI does its job is observable where it happens: in the run. A red badge
+on the default branch is the signal, and the release checklist re-verifies the
+artefacts independently of it. What the suite does check is the package —
+including the built wheel and the documented imports resolving from an install
+outside the source tree, which is the failure that once reached a release.

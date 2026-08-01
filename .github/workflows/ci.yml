@@ -10,10 +10,17 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # Read-only: this job needs the checkout and nothing else. Stated per job so
+    # a workflow-level default can never widen it silently.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
+      # The whole declared range is exercised, not a subset of it:
+      # `requires-python` in pyproject.toml is `>=3.12,<3.15`, so 3.14 is a
+      # version users may install on and must therefore be a version CI runs.
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
 
@@ -33,8 +40,19 @@ jobs:
       - name: Format check (ruff format)
         run: ruff format --check nautilus_gateio tests examples
 
-      - name: Run unit tests
+      # Both invocations, deliberately. `pytest` and `python -m pytest` do not
+      # build the same `sys.path`: the module form prepends the working
+      # directory, the console script does not. That difference once hid a
+      # broken suite for weeks — it passed locally under `python -m pytest` and
+      # failed in CI under `pytest` with `ModuleNotFoundError: No module named
+      # 'tests'`. `pythonpath = ["."]` in pyproject.toml is the fix; running
+      # only one of the two would leave nothing watching that it stays fixed,
+      # and CONTRIBUTING.md tells contributors to run either one.
+      - name: Run unit tests (bare pytest, the console script)
         run: pytest -q
+
+      - name: Run unit tests (python -m pytest, the module form)
+        run: python -m pytest -q
 
       - name: Import smoke test
         run: |
@@ -46,9 +64,55 @@ jobs:
           print(nautilus_gateio.__version__, instrument_id_to_gateio('BTC_USDT-PERP.GATE_IO'))
           "
 
+  minimum-platform:
+    # `nautilus_trader>=1.230.0,<2` is a claim about the oldest platform the
+    # adapter works against, and the matrix above never tests it: pip resolves
+    # the newest release every time. Without this job the lower bound is a guess
+    # written into the metadata, and a platform API added after 1.230.0 could be
+    # used here for months before anyone on the declared minimum found out.
+    # Python 3.12 with nautilus_trader 1.230.0 is the floor of the declared
+    # support box in both dimensions at once.
+    name: Minimum declared platform (nautilus_trader 1.230.0)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install package with dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Installed after the package, so the resolver cannot quietly upgrade it
+      # back: `pip install -e .` pulls the newest platform that satisfies the
+      # range, and this pins it back down to the lower bound.
+      - name: Pin the platform to the declared lower bound
+        run: |
+          pip install "nautilus_trader==1.230.0"
+          python - <<'PY'
+          import nautilus_trader
+
+          assert nautilus_trader.__version__ == "1.230.0", nautilus_trader.__version__
+          print("platform pinned to", nautilus_trader.__version__)
+          PY
+
+      - name: Run unit tests (bare pytest, the console script)
+        run: pytest -q
+
+      - name: Run unit tests (python -m pytest, the module form)
+        run: python -m pytest -q
+
   build:
     name: Build distribution
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
@@ -167,6 +231,8 @@ jobs:
   examples:
     name: Examples
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 

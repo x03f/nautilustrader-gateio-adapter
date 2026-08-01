@@ -1,0 +1,201 @@
+name: Release
+
+# A pushed tag is what publishes a release. Everything the release consists of
+# is built here, from the tagged commit, by a runner nobody can reach — so the
+# artefacts attached to a GitHub Release are reproducible from a public log
+# rather than from whatever happened to be in one maintainer's `dist/`.
+#
+# A tag is a fixed point: it is never moved and its artefacts are never rebuilt
+# or replaced (docs/releasing.md). This workflow therefore runs once per tag,
+# and a mistake in a release is corrected by the next release.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Build, verify and publish the GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      # Create the release and upload its assets.
+      contents: write
+      # Mint the short-lived OIDC token the provenance attestation is signed
+      # with, and record the attestation itself. Both are required by
+      # actions/attest-build-provenance; neither is granted to any other job.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # The tag is the only thing a user sees; the version inside the artefacts
+      # is the only thing pip sees. If they disagree, `v0.2.0a2` can publish a
+      # wheel that installs as something else. Checked before anything is built.
+      - name: Check the tag matches the version in pyproject.toml
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          assert tag == f"v{version}", f"tag {tag} does not match pyproject version {version}"
+          assert ".dev" not in version, (
+              f"version {version} is a developmental release and must not be tagged"
+          )
+          print("tag and version agree:", tag)
+          PY
+
+      # This workflow is the only thing that may create a release for a tag. A
+      # release drafted in the web UI beforehand makes `gh release create` fail
+      # at the very end, after everything has been built and attested, with a
+      # message about an existing release and nothing said about why that
+      # matters. Failing here instead costs one API call and says what to do.
+      - name: Refuse to overwrite a release that was created by hand
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            echo "::error::a release for ${GITHUB_REF_NAME} already exists; it was not built here, so its assets carry no provenance. Delete it and re-run this workflow (docs/releasing.md)."
+            exit 1
+          fi
+          echo "no release exists for ${GITHUB_REF_NAME} yet"
+
+      # `python -m build` does not clear `dist/`, so a stale artefact from an
+      # older version would be attached to this release. On a fresh runner this
+      # is belt and braces; it costs nothing and it is what the local checklist
+      # tells a releaser to do.
+      - name: Clean previous build artifacts
+        run: rm -rf dist/ build/ *.egg-info
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Validate package metadata
+        run: twine check dist/*
+
+      - name: Check dist holds exactly this version
+        run: |
+          python - <<'PY'
+          import pathlib
+          import tomllib
+
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          files = sorted(p.name for p in pathlib.Path("dist").iterdir())
+          expected = sorted(
+              [
+                  f"nautilustrader_gateio_adapter-{version}-py3-none-any.whl",
+                  f"nautilustrader_gateio_adapter-{version}.tar.gz",
+              ]
+          )
+          assert files == expected, f"dist/ holds {files}, expected {expected}"
+          print("dist/ is clean:", files)
+          PY
+
+      # Installed OUTSIDE the source tree on purpose: with the checkout on
+      # `sys.path` these imports would succeed from a wheel that shipped no
+      # sub-packages at all, which is exactly the defect this step exists to
+      # catch before the artefact is published rather than after.
+      - name: Install the wheel in a clean environment and import it
+        run: |
+          python -m venv /tmp/relcheck
+          /tmp/relcheck/bin/pip install --upgrade pip
+          /tmp/relcheck/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/relcheck/bin/python - <<'PY'
+          import os
+
+          import nautilus_gateio
+          from nautilus_gateio import (
+              GATEIO,
+              GateioDataClient,
+              GateioDataClientConfig,
+              GateioExecClientConfig,
+              GateioExecutionClient,
+              GateioInstrumentProvider,
+              GateioLiveDataClientFactory,
+              GateioLiveExecClientFactory,
+              instrument_id_to_gateio,
+          )
+          from nautilus_gateio.http.spot import GateioSpotHttpAPI
+          from nautilus_gateio.websocket.public import GateioPublicWebSocket
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          assert nautilus_gateio.__version__ == tag.removeprefix("v"), (
+              f"installed wheel reports {nautilus_gateio.__version__}, tag is {tag}"
+          )
+          assert GATEIO == "GATE_IO", GATEIO
+          print("wheel verified:", nautilus_gateio.__version__, nautilus_gateio.__file__)
+          PY
+
+      # A checksum file lets anyone who downloads an asset confirm they received
+      # the bytes this run produced. Written in the format `sha256sum -c` reads,
+      # so verifying is one command and not a manual comparison.
+      - name: Compute SHA256 checksums
+        run: |
+          cd dist
+          sha256sum nautilustrader_gateio_adapter-*.whl nautilustrader_gateio_adapter-*.tar.gz \
+            > SHA256SUMS
+          cat SHA256SUMS
+
+      # Provenance: a signed statement, verifiable with `gh attestation verify`,
+      # that these exact bytes were built by this workflow from this commit.
+      # Checksums prove the download was not altered in transit; attestation is
+      # what ties the artefact to the source it claims to come from.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+      # `gh` ships on the runner and authenticates with the job's own
+      # `GITHUB_TOKEN`, so no third-party action and no extra secret is involved
+      # in the step that actually publishes. A tag carrying `a`, `b` or `rc` is
+      # marked as a pre-release, which is what keeps `0.2.0a2` out of the "latest
+      # release" slot. `--generate-notes` seeds the body from the commits; the
+      # checklist then replaces it with the changelog section. The files listed
+      # here are the ones attested above: the attestation is worth nothing if the
+      # bytes a user downloads are not the bytes it covers.
+      - name: Publish the GitHub Release with artifacts and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in
+            *a*|*b*|*rc*) prerelease="--prerelease" ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            ${prerelease} \
+            dist/*.whl \
+            dist/*.tar.gz \
+            dist/SHA256SUMS
+
+      # PyPI publication is deliberately absent, and Trusted Publishing is
+      # deliberately not configured.
+      #
+      # The distribution name on this branch — `nautilustrader-gateio-adapter` —
+      # leads with the NautilusTrader mark, which their trademark policy does not
+      # permit for a project that is neither official nor affiliated. The name
+      # becomes `gateio-nt-community` before anything is uploaded to an index,
+      # and a name claimed on PyPI cannot be released again for reuse. Publishing
+      # first and renaming afterwards would therefore leave a permanently
+      # squatted, infringing name behind, so the order is: rename, then publish.
+      # docs/releasing.md says the same to the person following the checklist.
+      #
+      # When the rename has landed, this is what gets added — a separate job,
+      # `needs: release`, with `permissions: id-token: write` and nothing else,
+      # using `pypa/gh-action-pypi-publish` against a PyPI Trusted Publisher
+      # configured for this repository and workflow. No API token is ever stored
+      # in the repository's secrets. Until then, an installation comes from a
+      # git URL or from the assets attached above.

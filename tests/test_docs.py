@@ -643,17 +643,28 @@ class TestReleaseArtefactHygiene:
             "the build job does not assert that dist/ holds exactly the current version"
         )
 
-    def test_release_guide_documents_the_clean_and_a_pinned_upload(self) -> None:
+    def test_release_guide_cleans_first_and_never_uploads_by_a_bare_glob(self) -> None:
+        """The clean is unconditional; the upload is conditional on there being one.
+
+        There is no PyPI publication while the distribution name carries the
+        NautilusTrader trademark, so the guide documents no upload at all today
+        and this must not demand one — a test that requires the command would be
+        a test requiring the irreversible act. The bare-glob guard stays
+        unconditional, because `dist/` holding two versions is exactly how the
+        wrong files get published once uploads resume under the new name.
+        """
         text = (DOCS / "releasing.md").read_text(encoding="utf-8")
         assert re.search(r"rm -rf dist/ build/ \*\.egg-info", text), (
             "docs/releasing.md does not tell the releaser to clean dist/ first"
         )
-        assert re.search(r"twine upload dist/<[a-z_]+>-<version>\*", text), (
-            "docs/releasing.md does not show an upload pinned to one version's files"
-        )
         assert "twine upload dist/*" not in text, (
-            "docs/releasing.md still recommends a bare upload glob"
+            "docs/releasing.md recommends a bare upload glob, which publishes "
+            "whatever else is left in dist/"
         )
+        if "twine upload" in text:
+            assert re.search(r"twine upload dist/<[a-z_]+>-<version>\*", text), (
+                "docs/releasing.md documents an upload that is not pinned to one version's files"
+            )
 
     def test_no_document_tells_the_releaser_to_claim_the_current_pypi_name(self) -> None:
         """A PyPI name is never released once claimed.

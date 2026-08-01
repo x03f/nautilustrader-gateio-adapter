@@ -1,0 +1,77 @@
+name: Question
+description: Ask how something in the adapter is meant to be used
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions are welcome here. Blank issues are turned off and Discussions
+        are not enabled on this repository, so this form is the way to ask one.
+
+        A question that turns out to be a defect gets relabelled — you do not
+        need to work out which it is first.
+
+        **Do not ask about a security vulnerability here.** Use
+        [private vulnerability reporting](../../security/advisories/new) instead.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: >
+        What are you trying to do, and what is unclear? A concrete goal — the
+        product, the path, the configuration you have — gets a far more useful
+        answer than an abstract one.
+    validations:
+      required: true
+  - type: textarea
+    id: already-read
+    attributes:
+      label: What you have already read
+      description: >
+        Which page you looked at, and what it did not answer. The README feature
+        matrix, `docs/configuration.md`, `docs/products.md` and
+        `docs/troubleshooting.md` are the usual starting points. A page that
+        should have answered this and did not is itself worth knowing about.
+    validations:
+      required: false
+  - type: input
+    id: adapter-build
+    attributes:
+      label: Adapter build
+      description: >
+        Output of `pip freeze | grep gateio`, if the question is about a version
+        you have installed. On a git install it names the exact commit.
+      placeholder: "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter@0e0814f5818011..."
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part is this about?
+      options:
+        - Installation and requirements
+        - Configuration
+        - Symbology and instrument ids
+        - Market data (WebSocket / REST)
+        - Execution / order types
+        - Accounts and margin
+        - Spot
+        - Perpetual / inverse futures
+        - Delivery futures
+        - Options
+        - Documentation
+        - Other / not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Redaction check
+      description: >
+        An issue is public and permanent, and adapter logs carry more account
+        detail than is obvious at a glance — see
+        [SECURITY.md](../../blob/main/SECURITY.md).
+      options:
+        - label: Anything I pasted here carries no API keys, secrets, account identifiers, balances or order ids.
+          required: true

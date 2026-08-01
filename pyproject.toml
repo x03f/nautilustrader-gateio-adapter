@@ -31,6 +31,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    # 3.14 is inside `requires-python` and is in the CI matrix, but it has no
+    # classifier yet: a classifier is a public claim, and this one is not made
+    # until a 3.14 job has been green. It is added when that run exists.
     "Topic :: Office/Business :: Financial :: Investment",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
@@ -48,11 +51,19 @@ dev = [
     "ruff>=0.5",
     "build>=1.0",
     "twine>=5.0",
+    # tests/test_ci_and_community.py reads the workflows and the issue forms as
+    # data rather than as text, so a comment or a reordering cannot make it pass
+    # by accident. It is not a runtime dependency of the package.
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
+# Every one of these is rendered as a link on the package page, so every one has
+# to resolve. The default branch is `main`: a `blob/master` path here would 404
+# for anyone who followed it.
 Homepage = "https://github.com/x03f/nautilustrader-gateio-adapter"
-Repository = "https://github.com/x03f/nautilustrader-gateio-adapter"
+Documentation = "https://github.com/x03f/nautilustrader-gateio-adapter/tree/main/docs"
+Source = "https://github.com/x03f/nautilustrader-gateio-adapter"
 Issues = "https://github.com/x03f/nautilustrader-gateio-adapter/issues"
 Changelog = "https://github.com/x03f/nautilustrader-gateio-adapter/blob/main/CHANGELOG.md"
 

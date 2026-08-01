@@ -49,7 +49,11 @@ answer. A release sets it, following [docs/releasing.md](docs/releasing.md). A
 pull request leaves it alone.
 
 Python >= 3.12 and < 3.15, with `nautilus_trader` >= 1.230.0 and < 2, as pinned
-in `pyproject.toml` on this branch. CI runs on 3.12 and 3.13.
+in `pyproject.toml` on this branch. CI runs the whole of that range: 3.12, 3.13
+and 3.14, plus one job that pins `nautilus_trader==1.230.0` so the declared
+lower bound is tested rather than assumed. Each of those jobs runs the suite
+twice, as `pytest` and as `python -m pytest` — the two build different
+`sys.path`s, and the difference has hidden a broken suite before.
 
 ## Running the tests
 
@@ -131,6 +135,22 @@ and why.
 
 Security problems do not go in an issue: report them privately, as described in
 [SECURITY.md](SECURITY.md).
+
+## Asking a question
+
+Questions belong in the tracker, on the **Question** form
+([new issue](https://github.com/x03f/nautilustrader-gateio-adapter/issues/new/choose)).
+Blank issues are turned off and Discussions are not enabled on this repository,
+so that form is the route — and a question that turns out to be a defect is
+relabelled rather than turned away.
+
+## Code of conduct
+
+Participation here is governed by the
+[Contributor Covenant 2.1](CODE_OF_CONDUCT.md), unmodified. Behaviour that
+violates it is reported through the same private channel as a security problem,
+or as an issue when it does not need to be private; the
+[Enforcement](CODE_OF_CONDUCT.md#enforcement) section has both.
 
 ## Licence
 

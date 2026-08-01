@@ -4,7 +4,9 @@
 # copy. They deliberately do not match source modules: a bare `credentials*`
 # rule once swallowed `nautilus_gateio/common/credentials.py`, which imports
 # fine locally and fails only in a clean checkout. Match secret-shaped
-# suffixes, not bare names; tests/test_packaging.py enforces the difference.
+# suffixes, not bare names;
+# tests/test_package.py::TestVersionControlCoverage::test_no_ignore_rule_matches_a_source_module
+# enforces the difference by running `git check-ignore` over every source file.
 .env
 .env.*
 *.env
