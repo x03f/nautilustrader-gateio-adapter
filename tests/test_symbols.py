@@ -175,16 +175,29 @@ class TestProductInference:
 class TestRejectionOfAmbiguousInput:
     @pytest.mark.parametrize("value", ["", ".GATE_IO"])
     def test_empty_symbol_is_rejected(self, value):
-        with pytest.raises(ValueError, match="empty symbol"):
+        with pytest.raises(ValueError, match="instrument_id symbol"):
             instrument_id_to_gateio(value)
 
     def test_bare_perp_suffix_is_rejected(self):
-        with pytest.raises(ValueError, match="empty venue symbol"):
+        with pytest.raises(ValueError, match="venue symbol under the -PERP suffix"):
             instrument_id_to_gateio("-PERP.GATE_IO")
 
     def test_empty_raw_symbol_is_rejected(self):
-        with pytest.raises(ValueError, match="raw_symbol must not be empty"):
+        with pytest.raises(ValueError, match="raw_symbol"):
             gateio_to_instrument_id(GateioProductType.SPOT, "")
+
+    @pytest.mark.parametrize("blank", [" ", "   ", "\t"])
+    def test_blank_raw_symbol_is_rejected(self, blank):
+        """The hole the hand-written emptiness test left open.
+
+        ``" "`` is not empty, so the old ``if not raw_symbol`` admitted it. For
+        a perpetual the ``-PERP`` suffix is appended before ``Symbol`` sees the
+        string, so ``Symbol``'s own blank check never fired either and the
+        function returned the accepted identifier ``"  -PERP.GATE_IO"``. The
+        client would then have subscribed under a whitespace symbol.
+        """
+        with pytest.raises(ValueError, match="raw_symbol"):
+            gateio_to_instrument_id(GateioProductType.PERP, blank)
 
     @pytest.mark.parametrize(
         "value",

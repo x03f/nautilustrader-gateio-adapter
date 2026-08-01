@@ -40,6 +40,22 @@ and **Changed**.
   pinned form should be updated. Nothing was published to PyPI under the former
   name, so no release has to be yanked.
 
+- **`gateio_to_instrument_id(product, None)` now raises `TypeError` where it
+  raised `ValueError`.** The preconditions on this adapter's public boundaries
+  are now stated through NautilusTrader's own `PyCondition` (see **Changed**
+  below), and `PyCondition.valid_string` separates a blank string from an
+  absent one: it raises `ValueError` for `""` and `"  "`, and `TypeError` for
+  `None`, which is the platform's rule for every argument that may not be
+  `None`. Only the `None` case changed type; `""` still raises `ValueError`, as
+  `docs/symbology.md` says. Code that passes `None` here and catches
+  `ValueError` has to catch `TypeError` too — but that code was relying on an
+  exception to mask an argument it never meant to pass. The same call also
+  closes a hole: `"  "` was not empty, so it passed the old check, and for a
+  perpetual the `-PERP` suffix is appended before `Symbol` sees the string, so
+  the function returned the plausible-looking `InstrumentId("  -PERP.GATE_IO")`
+  and the client would have subscribed under a whitespace symbol. `docs/errors.md`
+  has the full table of what each boundary now raises.
+
 - **`spot_account_mode=UNIFIED` without `GateioProductType.SPOT` among
   `products` now raises `ValueError`** from `GateioExecutionClient.__init__`,
   before any network activity. A node whose configuration file pairs `UNIFIED`
@@ -275,6 +291,27 @@ and **Changed**.
   the configured host resolves.
 
 ### Changed
+
+- **Preconditions on the public boundaries are stated through the platform's
+  `PyCondition`.** Fourteen checks — the configuration helpers' product set, the
+  shared transport's `max_retries` and `timeout_secs`, the symbology helpers'
+  symbol arguments, the wallet transfer's two endpoints, the options
+  `cancel_all` scope, the perpetual-only futures endpoints, the private
+  WebSocket's spot/derivative channel split, and the execution client's
+  both-ids-`None` report query — were hand-written `raise ValueError`
+  statements and are now `PyCondition` calls, the same design-by-contract
+  vocabulary the built-in Binance, OKX and Deribit adapters use. The messages
+  change wording; the raised type is unchanged everywhere except the one case
+  under **Changed (breaking)** above. Two consequences worth stating:
+  `validate_products` refuses a non-`GateioProductType` member with
+  `ValueError`, not `PyCondition.type`'s default `TypeError`, because
+  `docs/configuration.md` tells a caller to wrap the configuration helpers in
+  one `except ValueError`; and the checks against Gate.io's *discrete* value
+  sets — book intervals and depths, candlestick intervals, snapshot limits, the
+  transfer wallet allow-list — deliberately stay hand-written, because the
+  platform's `PyCondition.is_in` raises `KeyError`, which is not a `ValueError`
+  and would escape the handlers the data client wraps every subscription in.
+  Each such site now says so in place.
 
 - **Breaking for anyone calling `GateioHttpClient.close()` directly.** It now
   does two things it did not do before, and both are observable to other holders

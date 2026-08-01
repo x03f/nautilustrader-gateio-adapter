@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 
+from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
 from gateio_nt.common.constants import GATEIO_VENUE
@@ -74,14 +75,17 @@ def instrument_id_to_gateio(instrument_id: InstrumentId | str) -> tuple[GateioPr
 
     The venue symbol returned is exactly what the API expects; the ``-PERP``
     marker (if any) is removed.
+
+    "Present, and not blank" is the platform's ``valid_string`` (installed
+    ``core/correctness.pyx:768-796``); the same check the Binance adapter makes
+    on its own symbol type (``adapters/binance/common/symbol.py:38``). It raises
+    ``ValueError``, as this function already did.
     """
     symbol = str(instrument_id).split(".")[0].upper()
-    if not symbol:
-        raise ValueError("instrument id has an empty symbol")
+    PyCondition.valid_string(symbol, "instrument_id symbol")
     if symbol.endswith(PERP_SUFFIX):
         raw = symbol[: -len(PERP_SUFFIX)]
-        if not raw:
-            raise ValueError(f"instrument symbol {symbol!r} has an empty venue symbol")
+        PyCondition.valid_string(raw, "venue symbol under the -PERP suffix")
         return product_from_raw_symbol(raw, perpetual=True), raw
     return product_from_raw_symbol(symbol), symbol
 
@@ -91,9 +95,18 @@ def gateio_to_instrument_id(
     raw_symbol: str,
     venue: str | None = None,
 ) -> InstrumentId:
-    """Build the canonical instrument id for a Gate.io symbol and product."""
-    if not raw_symbol:
-        raise ValueError("raw_symbol must not be empty")
+    """Build the canonical instrument id for a Gate.io symbol and product.
+
+    ``PyCondition.valid_string`` refuses blank as well as empty, which the
+    hand-written emptiness test did not: for a perpetual product the suffix is
+    appended *before* ``Symbol`` sees the string, so ``"  "`` became the
+    accepted identifier ``"  -PERP.GATE_IO"`` and the client would have
+    subscribed under a whitespace symbol. Note the platform check raises
+    ``TypeError`` for ``None`` (``core/correctness.pyx:787`` delegates to
+    ``not_none``) where this function used to raise ``ValueError`` — see
+    ``docs/errors.md``.
+    """
+    PyCondition.valid_string(raw_symbol, "raw_symbol")
     symbol = raw_symbol.upper()
     if product.is_perpetual:
         symbol += PERP_SUFFIX

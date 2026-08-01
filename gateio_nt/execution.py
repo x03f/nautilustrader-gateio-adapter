@@ -113,6 +113,7 @@ from typing import Any, Final
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor, LogLevel
+from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
@@ -6446,15 +6447,18 @@ class GateioExecutionClient(LiveExecutionClient):
         client_order_id = command.client_order_id
         venue_order_id = command.venue_order_id
 
-        if client_order_id is None and venue_order_id is None:
-            # The platform states this as the method's own contract
-            # (LiveExecutionClient.generate_order_status_report, installed
-            # live/execution_client.py:359-362: "Raises ValueError if both the
-            # `client_order_id` and `venue_order_id` are None"), and the
-            # reference adapter asserts it the same way
-            # (adapters/binance/execution.py:381-384). It is a caller error, not
-            # an order that could not be found, so it must not be logged as one.
-            raise ValueError("both `client_order_id` and `venue_order_id` were `None`")
+        # The platform states this as the method's own contract
+        # (LiveExecutionClient.generate_order_status_report, installed
+        # live/execution_client.py:359-362: "Raises ValueError if both the
+        # `client_order_id` and `venue_order_id` are None"), and the reference
+        # adapter asserts it the same way, in the platform's own vocabulary and
+        # with this exact message (adapters/binance/execution.py:381-384). It is
+        # a caller error, not an order that could not be found, so it must not
+        # be logged as one.
+        PyCondition.is_false(
+            client_order_id is None and venue_order_id is None,
+            "both `client_order_id` and `venue_order_id` were `None`",
+        )
 
         if venue_order_id is None and client_order_id is not None:
             venue_order_id = self._cache.venue_order_id(client_order_id)

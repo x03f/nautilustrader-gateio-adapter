@@ -74,6 +74,7 @@ from typing import Annotated, Any, Union, get_args, get_origin, get_type_hints
 
 import msgspec
 from nautilus_trader.config import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt
+from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 
 from gateio_nt.common.constants import (
@@ -148,14 +149,24 @@ def validate_products(
         Gate.io does not serve on the configured environment.
 
     """
-    if not products:
-        raise ValueError("`products` must name at least one Gate.io product")
+    # Emptiness and membership type are the platform's own contract vocabulary,
+    # not a Gate.io requirement, so they are stated through `PyCondition` — the
+    # same call the built-in OKX client makes for its product set
+    # (installed adapters/okx/data.py:123, `PyCondition.not_empty(
+    # config.instrument_types, "config.instrument_types")`).
+    PyCondition.not_empty(products, "products")
     seen: list[GateioProductType] = []
     for product in products:
-        if not isinstance(product, GateioProductType):
-            raise ValueError(
-                f"`products` must contain GateioProductType members, was {product!r}",
-            )
+        # `PyCondition.type` defaults to `TypeError`; `ex_type` is the
+        # platform's own hook for a caller whose contract says otherwise, and
+        # this one's does: `docs/configuration.md` promises the configuration
+        # helpers raise `ValueError`, and a caller checking a configuration up
+        # front writes one `except ValueError` around all three of them.
+        # `PyCondition.list_type` — the collection-shaped spelling — is not
+        # usable here at all: its `Condition.list_type` counterpart declares
+        # `list argument` (installed core/correctness.pyx:353), so a tuple is
+        # refused by Cython before the check runs ("Expected list, got tuple").
+        PyCondition.type(product, GateioProductType, "products", ValueError)
         if product not in seen:
             seen.append(product)
     if is_testnet(environment):
@@ -174,6 +185,13 @@ def validate_book_interval_ms(interval_ms: int) -> int:
     Venue-specific, and therefore not expressible as a constrained type: Gate.io
     publishes a *discrete* set of push intervals (20, 100 and 1000 ms) and
     rejects a subscription naming anything else. ``PositiveInt`` admits ``37``.
+
+    The platform's set-membership check is not usable either.
+    ``PyCondition.is_in`` raises ``KeyError`` (installed
+    ``core/correctness.pyx:460-464``), which is not a ``ValueError``, so it
+    would escape the ``except ValueError`` this module's documented contract
+    tells a caller to write; and its message names neither the field nor the
+    values Gate.io serves, which is the whole of what the reader needs.
     """
     if interval_ms not in ORDER_BOOK_UPDATE_INTERVALS_MS:
         raise ValueError(
@@ -190,6 +208,9 @@ def validate_snapshot_limit(limit: int) -> int:
     serves snapshots only at the depths in ``ORDER_BOOK_SNAPSHOT_LIMITS``, and
     the depth has to match the level of the stream it seeds. ``PositiveInt``
     admits ``73``, which the venue would answer at some other depth.
+
+    ``PyCondition.is_in`` is unusable for the same reason as in
+    :func:`validate_book_interval_ms`: it raises ``KeyError``.
     """
     if limit not in ORDER_BOOK_SNAPSHOT_LIMITS:
         raise ValueError(

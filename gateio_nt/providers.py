@@ -186,6 +186,13 @@ class GateioInstrumentProvider(InstrumentProvider):
         filters: dict | None = None,
     ) -> None:
         """Load a single instrument, resolving its product from the instrument id."""
+        # Deliberately not `PyCondition.equal(instrument_id.venue, GATEIO_VENUE,
+        # ...)`, which is how the built-in providers state this (installed
+        # adapters/okx/providers.py:172, binance/spot/providers.py:166). Those
+        # raise; this one logs and skips, because `load_ids_async` above loops
+        # over a caller-supplied list and one foreign id must not abandon the
+        # instruments after it. The check itself is the same check — only its
+        # consequence differs, and that difference is the point.
         if instrument_id.venue != GATEIO_VENUE:
             self._log.error(
                 f"Cannot load {instrument_id}: venue is not {GATEIO_VENUE}",
