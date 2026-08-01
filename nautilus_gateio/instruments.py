@@ -46,7 +46,7 @@ Precision limits
 NautilusTrader's fixed-point types support ``FIXED_PRECISION`` decimal places,
 which is 9 on standard builds and 16 on high-precision builds. A handful of
 Gate.io spot pairs quote prices with up to 14 decimals, which a standard build
-cannot represent: quantising such a price yields ``0.000000000``, and both
+cannot represent: quantizing such a price yields ``0.000000000``, and both
 ``Price`` and the tick/book types accept that silently. Publishing the pair
 anyway would mean publishing zeroes as if they were venue prices, so every
 parser here **rejects** an instrument whose price scale the running build cannot
@@ -256,14 +256,14 @@ def parse_spot_instrument(
         pair's deprecated ``fee`` field is used, converted from percent to a
         fraction.
     ts_init : int
-        UNIX timestamp (nanoseconds) when the instrument object was initialised.
+        UNIX timestamp (nanoseconds) when the instrument object was initialized.
 
     Returns
     -------
     CurrencyPair or ``None``
         ``None`` if the payload cannot be represented. In particular a pair whose
         ``precision`` or ``amount_precision`` exceeds what this NautilusTrader
-        build can represent is rejected, because its prices would quantise to
+        build can represent is rejected, because its prices would quantize to
         zero (see the module docstring).
 
     """
@@ -628,7 +628,7 @@ def _contract_ts_event(payload: dict[str, Any], ts_init: int) -> int:
 
     Gate.io stamps futures and delivery contracts with ``config_change_time`` (the
     last time the contract specification changed) and options with ``create_time``;
-    when neither is present the initialisation time is used.
+    when neither is present the initialization time is used.
     """
     for field in ("config_change_time", "create_time"):
         value = payload.get(field)
@@ -707,7 +707,7 @@ def _representable_precision(precision: Any, field: str) -> int:
     """Validate a venue precision against this NautilusTrader build.
 
     Clamping a price scale silently would make every price on the instrument
-    quantise to zero, so an unrepresentable scale is rejected: the caller turns
+    quantize to zero, so an unrepresentable scale is rejected: the caller turns
     the ``ValueError`` into a skipped instrument plus a warning.
     """
     value = int(precision)

@@ -158,7 +158,7 @@ class GateioSpotHttpAPI:
         futures and options WebSocket channels require in their subscription
         payloads.
 
-        Gate.io marks this endpoint deprecated in favour of ``GET /wallet/fee``
+        Gate.io marks this endpoint deprecated in favor of ``GET /wallet/fee``
         (see :meth:`nautilus_gateio.http.wallet.GateioWalletHttpAPI.fee`), which
         returns spot, perpetual and delivery rates in one call.
         """
@@ -252,7 +252,7 @@ class GateioSpotHttpAPI:
 
         ``order_id`` may be the venue order id or the client id carried in
         ``text``, but the client id only resolves while the order is still
-        resting: once an order is filled or cancelled Gate.io accepts the venue
+        resting: once an order is filled or canceled Gate.io accepts the venue
         id alone. Persist the venue id on acceptance and use it for every
         post-terminal lookup.
         """
@@ -353,7 +353,7 @@ class GateioSpotHttpAPI:
         minutes of creation). Partial failure is normal: check ``succeeded`` and
         ``label`` on every returned element.
 
-        Cancelling is idempotent at the venue, but this endpoint is a ``POST``,
+        Canceling is idempotent at the venue, but this endpoint is a ``POST``,
         so the transport does not replay it; re-issue it explicitly if the
         outcome is unknown. Gate.io documents the ``x-gate-exptime`` submission
         deadline here, so a re-issued batch that crawls to the venue is refused

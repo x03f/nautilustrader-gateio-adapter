@@ -15,7 +15,7 @@ Protocol summary (Gate.io WebSocket v4)
 --------------------------------------
 Requests are JSON objects ``{time, id, channel, event, payload[, auth]}``.
 Every subscribe or unsubscribe is acknowledged with the same ``channel``,
-``event`` and ``id``; the acknowledgement is successful when ``error`` is null,
+``event`` and ``id``; the acknowledgment is successful when ``error`` is null,
 which is what this client keys on (``result.status`` is documented as always
 being present and is not authoritative).
 
@@ -115,7 +115,7 @@ class _Subscription:
 
 @dataclass(slots=True)
 class _PendingRequest:
-    """A subscribe or unsubscribe request awaiting its acknowledgement."""
+    """A subscribe or unsubscribe request awaiting its acknowledgment."""
 
     channel: str
     event: str
@@ -149,7 +149,7 @@ class GateioWebSocketClient:
         A connection that delivers nothing for this long is considered dead and
         is recycled.
     ack_timeout_secs : float
-        How long to wait for a subscribe or unsubscribe acknowledgement.
+        How long to wait for a subscribe or unsubscribe acknowledgment.
     size_decimal : bool
         Send the ``X-Gate-Size-Decimal: 1`` handshake header on futures and
         delivery connections, opting into fractional sizes. Off by default; see
@@ -262,7 +262,7 @@ class GateioWebSocketClient:
         self._stopped = True
         # `cancel_tasks_with_timeout` is the platform's own teardown and does
         # what the previous hand-rolled cancel-then-await loop did not: it
-        # snapshots strong references before cancelling (a task held only by the
+        # snapshots strong references before canceling (a task held only by the
         # loop can otherwise be collected mid-cancellation), gathers with
         # `return_exceptions=True`, and warns with the task names if they have
         # not settled within the timeout instead of waiting silently. It also
@@ -343,7 +343,7 @@ class GateioWebSocketClient:
         payload: Any = None,
         auth: bool = False,
     ) -> dict[str, Any]:
-        """Subscribe to ``channel`` and wait for the venue's acknowledgement.
+        """Subscribe to ``channel`` and wait for the venue's acknowledgment.
 
         The subscription is remembered and replayed automatically after a
         reconnect. Gate.io treats repeated subscriptions as additive, so
@@ -362,7 +362,7 @@ class GateioWebSocketClient:
         Returns
         -------
         dict
-            The acknowledgement message.
+            The acknowledgment message.
 
         Raises
         ------
@@ -531,10 +531,10 @@ class GateioWebSocketClient:
         self._invoke_handler(message)
 
     def _resolve_ack(self, message: dict[str, Any]) -> None:
-        """Hand an acknowledgement to whichever request is waiting for it.
+        """Hand an acknowledgment to whichever request is waiting for it.
 
         Gate.io echoes the request ``id`` on every product; the channel and
-        event pairing is used as a fallback so an acknowledgement is never lost
+        event pairing is used as a fallback so an acknowledgment is never lost
         if the venue omits it.
         """
         pending: _PendingRequest | None = None

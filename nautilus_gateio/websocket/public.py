@@ -47,7 +47,7 @@ is described below per channel. Timestamps named ``t`` are milliseconds,
     :class:`nautilus_gateio.books.GateioOrderBook` consumes either form.
 
 ``<product>.order_book``
-    A periodic limited-depth snapshot, self-synchronising and needing no
+    A periodic limited-depth snapshot, self-synchronizing and needing no
     sequence handling. Spot pushes ``event: "update"`` with ``{t, lastUpdateId,
     s, l, bids, asks}``; futures and options push ``event: "all"`` with
     ``{t, id, contract, bids, asks}``.

@@ -171,14 +171,14 @@ def time_in_force_to_gateio(
 
     Gate.io has no separate post-only flag: the constraint is expressed by the
     time-in-force value ``poc``, a maker-only order that *rests* until it is
-    cancelled. A post-only GTC order is therefore ``poc``, and nothing is lost.
+    canceled. A post-only GTC order is therefore ``poc``, and nothing is lost.
 
     IOC and FOK are a different matter. NautilusTrader models post-only as a
     liquidity constraint orthogonal to the time in force (concepts/orders,
     "Post-only" and "Time in force"), so ``LIMIT``/``IOC``/``post_only`` asks for
     an order that is maker-only *and* gone within milliseconds. Sending ``poc``
     would keep the first half and discard the second, leaving a resting order the
-    caller expects to have self-cancelled — the kind of substitution the platform
+    caller expects to have self-canceled — the kind of substitution the platform
     tells an adapter not to make ("If an order includes an instruction or option
     the target venue does not support, the system does not submit it"). Both
     combinations therefore raise, like every other value Gate.io cannot express.
@@ -252,7 +252,7 @@ def order_status_from_gateio(
     about completion: **the quantities say whether the order finished, the
     reason says why it stopped.** The order of the branches below is therefore
     load-bearing — completion is decided from ``filled``/``amount`` first, and
-    ``finish_as`` only selects the flavour of a *non*-completion.
+    ``finish_as`` only selects the flavor of a *non*-completion.
 
     Consulting the reason first looks equivalent and is not; it produces a wrong
     terminal state in both directions, and this ordering closes both at once:
@@ -341,6 +341,6 @@ def order_status_from_gateio(
         # (REC-06); the caller turns the raise into a loud listing failure.
         raise ValueError(f"unreadable order status: {status!r} (finish_as {finish_as!r})")
     # An absent state is the venue making no statement at all — the shape of a
-    # bare acknowledgement — and a resting order is the only reading that
+    # bare acknowledgment — and a resting order is the only reading that
     # cannot close anything.
     return OrderStatus.ACCEPTED

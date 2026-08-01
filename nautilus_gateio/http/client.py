@@ -41,7 +41,7 @@ unless the replay is provably harmless:
   :class:`GateioRequestAmbiguousError`; ``NETWORK_ERROR`` is reserved for the
   case where no byte of any attempt left this process. A cancel is the reason
   this matters: ``DELETE`` is replayed, so it would otherwise report a
-  definitive failure for an order the venue had in fact already cancelled.
+  definitive failure for an order the venue had in fact already canceled.
 
 The client id Gate.io carries in an order's ``text`` field is *not* treated as
 an idempotency key here. The venue rejects a duplicate ``text`` with
@@ -55,7 +55,7 @@ milliseconds) to order-mutating requests. That does not make a replay safe, but
 it bounds how late a request delayed in flight may still be accepted, which
 bounds how long the ambiguity can last. The header is emitted only once
 :meth:`GateioHttpClient.sync_time` has measured the venue clock offset, because
-an unsynchronised clock would otherwise expire valid requests. The execution
+an unsynchronized clock would otherwise expire valid requests. The execution
 client makes that measurement when it connects, so the deadline is in force for
 the whole session; a client used on its own must call :meth:`sync_time` itself,
 or set ``order_expiry_ms=0`` and accept unbounded submissions knowingly.
@@ -394,7 +394,7 @@ class GateioHttpClient:
             # disconnect budget did not finish. `contextlib.suppress(TimeoutError)`
             # does not catch `CancelledError`, so the close has to be in a
             # `finally`; shielded, because a task being torn down can be
-            # cancelled again while it is running its own cleanup, and the pool
+            # canceled again while it is running its own cleanup, and the pool
             # must be released either way.
             await asyncio.shield(self._client.aclose())
 
@@ -449,7 +449,7 @@ class GateioHttpClient:
 
         The measurement is a single reading, so the network round trip inflates
         it by roughly the one-way delay — immaterial against a deadline measured
-        in seconds, and it is not a substitute for a synchronised host clock:
+        in seconds, and it is not a substitute for a synchronized host clock:
         the platform timestamps its own events from the local clock, which this
         offset does not touch. Beyond :data:`CLOCK_DRIFT_WARNING_MS` the caller
         is expected to say so.

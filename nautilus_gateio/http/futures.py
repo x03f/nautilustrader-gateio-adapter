@@ -36,7 +36,7 @@ Delivery futures are a strict subset of perpetual futures: identical path shape
 after the product segment, identical request and response models for contracts,
 order books, trades, candlesticks, orders, fills, positions and the account
 ledger. Duplicating the surface into two classes would duplicate every
-docstring and every payload contract for no behavioural gain, so the product is
+docstring and every payload contract for no behavioral gain, so the product is
 a constructor flag and the handful of genuinely perpetual-only endpoints raise
 instead of silently returning something else. Those are: funding rates (delivery
 contracts have no funding at all), order amendment, and dual-position mode.
@@ -127,7 +127,7 @@ class GateioFuturesHttpAPI:
         fields, and have no funding fields at all. ``settle_price`` stays
         ``"0"`` until the contract settles.
 
-        ``limit``/``offset`` are honoured by the perpetual endpoint only; the
+        ``limit``/``offset`` are honored by the perpetual endpoint only; the
         delivery endpoint ignores them and always returns the full list.
         """
         params: dict[str, Any] = {"limit": limit, "offset": offset}
@@ -240,7 +240,7 @@ class GateioFuturesHttpAPI:
 
         Records are ``{"t": <unix s>, "r": <decimal ratio str>}``, most recent
         first, spaced by the contract's ``funding_interval``. ``r`` is a ratio,
-        not a percentage. Realised funding payments are not in this feed: they
+        not a percentage. Realized funding payments are not in this feed: they
         appear as ``type="fund"`` rows in :meth:`account_book`.
         """
         self._require_perpetual("funding rate history")
@@ -515,7 +515,7 @@ class GateioFuturesHttpAPI:
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         """``DELETE {base}/orders/{order_id}`` — cancel one order.
 
-        Cancelling an unknown or already finished order returns HTTP 404 rather
+        Canceling an unknown or already finished order returns HTTP 404 rather
         than succeeding silently.
         """
         return await self._client.delete(f"{self._base}/orders/{order_id}", expiring=True)
@@ -573,7 +573,7 @@ class GateioFuturesHttpAPI:
 
         Only the last six months are available. Fields: ``id`` (venue trade id),
         ``order_id`` (a *string* here, while the order object reports an integer
-        ``id`` — normalise at the parser boundary), ``size`` (signed contracts),
+        ``id`` — normalize at the parser boundary), ``size`` (signed contracts),
         ``close_size``, ``price``, ``role`` and ``fee`` in the settlement
         currency (negative means a maker rebate).
 
@@ -600,7 +600,7 @@ class GateioFuturesHttpAPI:
         to: int | None = None,
         side: str | None = None,
     ) -> list[dict[str, Any]]:
-        """``GET {base}/position_close`` — realised PnL per closed position.
+        """``GET {base}/position_close`` — realized PnL per closed position.
 
         Rows carry ``side`` (``long``/``short``) and the PnL split
         ``pnl = pnl_pnl + pnl_fund + pnl_fee`` (position result, funding, fees).

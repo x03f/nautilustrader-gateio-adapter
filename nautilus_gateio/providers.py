@@ -430,7 +430,7 @@ def _now_ns() -> int:
 
 
 def _as_list(payload: Any) -> Iterable[Any]:
-    """Normalise a venue response into an iterable of entries."""
+    """Normalize a venue response into an iterable of entries."""
     if payload is None:
         return ()
     if isinstance(payload, list):

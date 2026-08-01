@@ -295,7 +295,7 @@ class GateioOptionsHttpAPI:
         and returns a list, optionally narrowed by ``underlying``.
 
         ``size`` is a signed contract count. Positions also carry
-        ``entry_price``, ``mark_price``, ``mark_iv``, realised and unrealised
+        ``entry_price``, ``mark_price``, ``mark_iv``, realized and unrealized
         PnL, the per-position Greeks, and ``close_order``, which is ``null``
         when no closing order is working.
         """
@@ -314,7 +314,7 @@ class GateioOptionsHttpAPI:
         limit: int | None = None,
         offset: int | None = None,
     ) -> list[dict[str, Any]]:
-        """``GET /options/position_close`` — realised PnL per closed position.
+        """``GET /options/position_close`` — realized PnL per closed position.
 
         ``underlying`` is required. Rows are
         ``{time, contract, side, pnl, text, settle_size}`` with ``side`` being
@@ -409,7 +409,7 @@ class GateioOptionsHttpAPI:
     ) -> list[dict[str, Any]]:
         """``DELETE /options/orders`` — cancel resting orders in scope.
 
-        Returns the cancelled orders. At least one of ``contract`` or
+        Returns the canceled orders. At least one of ``contract`` or
         ``underlying`` is required by deliberate choice: Gate.io treats both as
         optional and cancels *every* resting option order in the account when
         they are omitted, which no caller of this adapter ever wants

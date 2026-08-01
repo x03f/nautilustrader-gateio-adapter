@@ -81,7 +81,7 @@ class GateioTicker(Data):
     Every field is the venue's own string rather than a ``Price`` or a
     ``Quantity``. One ticker row mixes scales — an order-tick price, a contract
     count, a base-currency turnover and a dimensionless implied volatility — and
-    quantising them all onto the instrument's order precision would silently
+    quantizing them all onto the instrument's order precision would silently
     change values. This is the same reason mark and index prices keep the venue's
     scale rather than going through ``Instrument.make_price``.
 

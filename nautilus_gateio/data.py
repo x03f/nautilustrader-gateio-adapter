@@ -7,7 +7,7 @@ per configured product and routes messages by the endpoint they arrived on and
 the channel they name.
 
 Everything published by this client is data the venue actually sent. There are
-no synthesised quotes: quotes come from the real ``book_ticker`` best bid/ask
+no synthesized quotes: quotes come from the real ``book_ticker`` best bid/ask
 stream, trades from the public trade stream, bars from closed candlesticks, and
 order book deltas from the incremental depth stream aligned against a REST
 snapshot.
@@ -37,7 +37,7 @@ Books
 The two book subscriptions read different venue channels and neither derives
 from the other. Deltas come from the incremental ``*.order_book_update`` stream
 aligned against a REST snapshot; ``OrderBookDepth10`` comes from the periodic
-``*.order_book`` snapshot channel, which is self-synchronising and needs no
+``*.order_book`` snapshot channel, which is self-synchronizing and needs no
 sequence algorithm, no REST seed and no rebuild after a reconnect. Holding both
 for one instrument is allowed by the venue but gives NautilusTrader's single
 cached ``OrderBook`` two writers, so the client warns when it sees that.
@@ -213,7 +213,7 @@ MAX_REST_LIMIT: Final[int] = 1000
 #: first attempt occasionally lands behind the first buffered notification.
 SNAPSHOT_ATTEMPTS: Final[int] = 4
 
-#: Delay before a failed book synchronisation is attempted again.
+#: Delay before a failed book synchronization is attempted again.
 SNAPSHOT_RETRY_DELAY_SECS: Final[float] = 5.0
 
 #: How long a candlestick bucket may stay pending after it closed before it is
@@ -485,7 +485,7 @@ class GateioDataClient(LiveMarketDataClient):
         # Depth keeps its own registries rather than sharing the delta path's.
         # Sharing `self._books` would make `_unsubscribe_order_book_deltas` tear
         # down a live depth stream and would make `_handle_ws_reconnect` schedule
-        # a REST resnapshot for a channel that resynchronises itself.
+        # a REST resnapshot for a channel that resynchronizes itself.
         self._depth_streams: dict[InstrumentId, tuple[int, str]] = {}
         self._depth_sequences: dict[InstrumentId, int] = {}
         self._instrument_status_subs: set[InstrumentId] = set()
@@ -614,7 +614,7 @@ class GateioDataClient(LiveMarketDataClient):
             await self.cancel_pending_tasks()
             self._update_instruments_task = None
             self._bar_flush_task = None
-            # The close watchers were cancelled with everything else above;
+            # The close watchers were canceled with everything else above;
             # dropping the handles keeps `_subscribe_instrument_close` from
             # reporting an already-subscribed instrument after a reconnect cycle.
             self._instrument_close_tasks.clear()
@@ -928,7 +928,7 @@ class GateioDataClient(LiveMarketDataClient):
         interval, level = self._resolve_book_stream(product, command.depth)
 
         # The book is registered before subscribing so that no notification
-        # arriving with (or immediately after) the acknowledgement is dropped;
+        # arriving with (or immediately after) the acknowledgment is dropped;
         # notifications received before the snapshot are buffered by the book.
         # Gate.io requires the REST snapshot depth to match the streamed depth.
         self._books[instrument_id] = GateioOrderBook(raw_symbol)
@@ -938,7 +938,7 @@ class GateioDataClient(LiveMarketDataClient):
             await client.subscribe_order_book_update(raw_symbol, interval=interval, level=level)
         except (GateioError, ValueError) as e:
             if is_transient_ws_error(e):
-                # The socket is reconnecting or the acknowledgement was late.
+                # The socket is reconnecting or the acknowledgment was late.
                 # The WebSocket client keeps the subscription and replays it, so
                 # the local book is kept too and resnapshotted on reconnect.
                 self._log.warning(
@@ -980,7 +980,7 @@ class GateioDataClient(LiveMarketDataClient):
     async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
         """Subscribe the periodic ``*.order_book`` snapshot channel at ten levels.
 
-        This channel is self-synchronising: every message is a complete book of
+        This channel is self-synchronizing: every message is a complete book of
         the subscribed depth, so there is no sequence algorithm, no REST seed and
         nothing to rebuild after a reconnect. It is a different venue channel
         from the incremental stream the delta path uses, so holding both costs
@@ -1406,7 +1406,7 @@ class GateioDataClient(LiveMarketDataClient):
         # new connection, and the monotonic guard in `_handle_book_depth` would
         # then read every message of the new stream as a reordered one and drop
         # it silently while the subscription still looked healthy. The channel is
-        # self-synchronising, so forgetting the last sequence costs nothing.
+        # self-synchronizing, so forgetting the last sequence costs nothing.
         for instrument_id in self._depth_streams:
             if instrument_id_to_gateio(instrument_id)[0] is product:
                 self._depth_sequences.pop(instrument_id, None)
@@ -1472,7 +1472,7 @@ class GateioDataClient(LiveMarketDataClient):
                     # failure here (network error, 5xx, exhausted 429 retries)
                     # must take the same retry path as a sequence mismatch. If
                     # it escaped, the subscription would be left with an
-                    # unsynchronised book that buffers every further
+                    # unsynchronized book that buffers every further
                     # notification and never publishes again.
                     payload = await self._fetch_book_snapshot(product, raw_symbol, limit)
                     book.apply_snapshot(payload)
@@ -1526,11 +1526,11 @@ class GateioDataClient(LiveMarketDataClient):
             self._resyncing.discard(instrument_id)
 
     def _schedule_book_retry(self, instrument_id: InstrumentId) -> None:
-        """Re-attempt a failed book synchronisation after a delay.
+        """Re-attempt a failed book synchronization after a delay.
 
         A book that cannot be aligned is never abandoned: without a retry the
         subscription would stay silent for the life of the process, since every
-        further notification is buffered while the book is unsynchronised.
+        further notification is buffered while the book is unsynchronized.
 
         Except while the node is stopping. The gate refuses the snapshot, that
         refusal arrives here as a failure, and re-arming would answer it with a
@@ -1849,7 +1849,7 @@ class GateioDataClient(LiveMarketDataClient):
         if instrument is None:
             return None
 
-        # TradeId is always the venue's own trade id and is never synthesised.
+        # TradeId is always the venue's own trade id and is never synthesized.
         # A row without one cannot be identified, deduplicated or reconciled, so
         # it is rejected rather than published as the literal id "None".
         raw_id = item.get("id")
@@ -2926,7 +2926,7 @@ class GateioDataClient(LiveMarketDataClient):
         end_secs: int,
         limit: int,
     ) -> list[tuple[int, dict[str, Any]]]:
-        """Page through the candlestick endpoint and normalise the rows.
+        """Page through the candlestick endpoint and normalize the rows.
 
         Gate.io returns at most 1000 candles per call, so a request spanning a
         longer window is split into consecutive pages. Rows are returned as
