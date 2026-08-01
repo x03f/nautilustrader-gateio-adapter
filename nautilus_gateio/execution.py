@@ -105,7 +105,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
 from functools import partial
 from typing import Any, Final
@@ -114,6 +114,7 @@ from nautilus_trader.accounting.factory import AccountFactory
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor, LogLevel
+from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     BatchCancelOrders,
@@ -1265,7 +1266,7 @@ class GateioExecutionClient(LiveExecutionClient):
         now_ns = self._clock.timestamp_ns()
         lookback_ns = DEFAULT_LOOKBACK_SECS * 1_000_000_000
         start_ns = max(anchor_ns, now_ns - lookback_ns) if anchor_ns else now_ns - lookback_ns
-        start = datetime.fromtimestamp(start_ns / 1_000_000_000, tz=UTC)
+        start = unix_nanos_to_dt(start_ns)
 
         try:
             order_reports = await self.generate_order_status_reports(

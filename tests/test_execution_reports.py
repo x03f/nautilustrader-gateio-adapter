@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     GenerateFillReports,
@@ -2401,3 +2402,126 @@ def test_fill_reports_are_sorted_for_replay(perp_env):
 
     assert [report.trade_id.value for report in reports] == ["T-early", "T-late"]
     assert reports[0].commission.as_decimal() == Decimal("0.01")
+
+
+# -- the reconnect re-query window --------------------------------------------
+
+
+class TestReconnectAnchorNamesTheInstantItClaims:
+    """RN-2: the reconnect anchor is built from nanoseconds, not from a float.
+
+    ``_reconcile_after_reconnect`` opens its window at the timestamp of the last
+    event the private stream did deliver, because Gate.io replays nothing and
+    everything after that instant has to be fetched again. The anchor was built
+    by dividing nanoseconds into a ``float`` and handing the result to
+    ``datetime.fromtimestamp``, which cannot hold nanoseconds at all: the window
+    then opened at a *rounded* instant, and the rounding goes both ways. When it
+    goes up, the window opens after the last event the client knows about, and
+    whatever the venue did in between is outside the only query that would have
+    recovered it.
+    """
+
+    @staticmethod
+    def _anchor_from(clock, sub_microsecond_ns: int) -> int:
+        """A plausible last-event timestamp carrying sub-microsecond digits.
+
+        Five seconds back, so it stays well inside the lookback and wins the
+        ``max()`` against it.
+        """
+        now_ns = clock.timestamp_ns()
+        return (now_ns - 5_000_000_000) // 1_000_000_000 * 1_000_000_000 + sub_microsecond_ns
+
+    @staticmethod
+    def _capture_starts(env) -> list[Any]:
+        """Record the window each report query is asked for, then abort the pass.
+
+        Aborting keeps the test on the anchor and off the hand-over: the pass
+        after these two calls is covered by its own tests.
+        """
+        starts: list[Any] = []
+
+        async def _no_account_refresh() -> None:
+            return None
+
+        async def _capture(command: Any) -> Any:
+            starts.append(command.start)
+            raise GateioError("stop after the window is fixed")
+
+        env.client._update_account_state = _no_account_refresh
+        env.client.generate_order_status_reports = _capture
+        return starts
+
+    @pytest.mark.parametrize(
+        "sub_microsecond_ns",
+        [
+            123_456_789,  # rounds up: the window would open after the anchor
+            987_654_321,  # rounds down: the window opens at the wrong instant
+            999_999_999,  # rounds up across the second
+            1,  # a single nanosecond past a whole second
+        ],
+    )
+    def test_the_window_opens_exactly_at_the_last_delivered_event(
+        self,
+        perp_env,
+        sub_microsecond_ns: int,
+    ) -> None:
+        env = perp_env
+        starts = self._capture_starts(env)
+        anchor_ns = self._anchor_from(env.clock, sub_microsecond_ns)
+        env.client._last_stream_event_ns[GateioProductType.PERP] = anchor_ns
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
+
+        assert starts, "the reconnect never asked for order reports"
+        assert dt_to_unix_nanos(starts[0]) == anchor_ns
+
+    def test_the_window_never_opens_after_the_last_delivered_event(self, perp_env) -> None:
+        """The damage, stated as the property that forbids it.
+
+        An anchor whose last three nanosecond digits round upwards moved the
+        start of the window past the event it was taken from. Anything the venue
+        recorded in that gap — an execution the stream never delivered, which is
+        the entire reason this query runs — falls outside it.
+        """
+        env = perp_env
+        starts = self._capture_starts(env)
+        anchor_ns = self._anchor_from(env.clock, 123_456_789)
+        env.client._last_stream_event_ns[GateioProductType.PERP] = anchor_ns
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
+
+        assert starts
+        assert dt_to_unix_nanos(starts[0]) <= anchor_ns
+
+    def test_the_fill_query_is_asked_for_the_same_window(self, perp_env) -> None:
+        """Orders and fills must be recovered over one window, not two.
+
+        Both queries take the same ``start`` object, so this holds by
+        construction — and it is exactly the construction a later edit could
+        lose by rebuilding the anchor for the second call.
+        """
+        env = perp_env
+        starts: list[Any] = []
+
+        async def _no_account_refresh() -> None:
+            return None
+
+        async def _no_orders(command: Any) -> list[Any]:
+            starts.append(command.start)
+            return []
+
+        async def _capture_fills(command: Any) -> list[Any]:
+            starts.append(command.start)
+            raise FillReportsUnavailable("stop after the window is fixed", [])
+
+        env.client._update_account_state = _no_account_refresh
+        env.client.generate_order_status_reports = _no_orders
+        env.client.generate_fill_reports = _capture_fills
+
+        anchor_ns = self._anchor_from(env.clock, 123_456_789)
+        env.client._last_stream_event_ns[GateioProductType.PERP] = anchor_ns
+
+        env.run(env.client._reconcile_after_reconnect(GateioProductType.PERP))
+
+        assert len(starts) == 2
+        assert dt_to_unix_nanos(starts[0]) == dt_to_unix_nanos(starts[1]) == anchor_ns
