@@ -1170,7 +1170,9 @@ async def test_the_drain_waits_for_every_request_on_the_wire_not_just_the_first(
         if client._inflight == 3:
             break
         await asyncio.sleep(0.01)
-    assert client._inflight == 3, f"the probe never got three requests on the wire: {client._inflight}"
+    assert client._inflight == 3, (
+        f"the probe never got three requests on the wire: {client._inflight}"
+    )
 
     teardown = asyncio.create_task(client.close())
     await asyncio.sleep(0.01)
