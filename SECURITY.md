@@ -97,8 +97,15 @@ provides a fingerprint helper:
 ```python
 from nautilus_gateio.common.credentials import mask
 
-mask(api_key)  # 'abcd...yz'; '<unset>' when empty; one '*' per character to 8
+mask(api_key)  # 'abcd...wxyz'; '<empty>' when empty; '***' up to 8 characters
 ```
+
+`mask` is NautilusTrader's own `mask_api_key`, not a copy of it. Since
+`0.2.0a2` it discloses the first four and last four characters of a long
+credential, where the package's previous hand-written version disclosed four and
+two; against a 32-character Gate.io key that is eight characters instead of six.
+In exchange, a credential of eight characters or fewer no longer discloses its
+own length.
 
 The adapter never calls `mask` internally — it has nothing to mask, because it
 does not print credentials at all. The helper exists for your own diagnostics.

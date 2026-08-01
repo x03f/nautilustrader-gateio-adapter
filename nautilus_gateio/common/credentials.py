@@ -7,13 +7,15 @@ Environment variables (following the NautilusTrader adapter convention):
 
 Values are stripped of surrounding whitespace, because keys pasted with a
 trailing newline otherwise produce signatures the venue silently rejects.
-Credentials are never logged; :func:`mask` renders a safe fingerprint for
+Credentials are never logged; :data:`mask` renders a safe fingerprint for
 diagnostics.
 """
 
 from __future__ import annotations
 
 import os
+
+from nautilus_trader.common.secure import mask_api_key
 
 ENV_API_KEY = "GATE_API_KEY"
 ENV_API_SECRET = "GATE_API_SECRET"
@@ -45,10 +47,24 @@ def resolve_credentials(
     return (api_key or "").strip(), (api_secret or "").strip()
 
 
-def mask(secret: str) -> str:
-    """Render a credential as a short fingerprint that is safe to log."""
-    if not secret:
-        return "<unset>"
-    if len(secret) <= 8:
-        return "*" * len(secret)
-    return f"{secret[:4]}...{secret[-2:]}"
+#: Render a credential as a short fingerprint that is safe to log.
+#:
+#: This *is* ``nautilus_trader.common.secure.mask_api_key``, exported under the
+#: name this package documents. Two maskers exist in NautilusTrader 1.230 and
+#: they disagree at the edges; this is the pure-Python one, which the OKX and
+#: Deribit adapters log through. The other lives
+#: in ``core.nautilus_pyo3`` and is what Binance uses; it renders an absent
+#: credential as the empty string and pads a short one to its own length, so it
+#: would lose both properties this adapter wants — a *named* absent case, since
+#: running with no credentials at all is a supported state for public market
+#: data, and a fixed ``***`` that does not publish how long a short secret is.
+#:
+#: One thing did get wider, and it is stated here rather than left to be found.
+#: For a credential longer than eight characters the hand-written version this
+#: replaces showed four leading and **two** trailing characters
+#: (``abcd...yz``); this one shows four and **four** (``abcd...wxyz``). A
+#: Gate.io key is 32 hex characters and a secret 64, so the fingerprint now
+#: discloses eight of them instead of six. That is the whole of the change in
+#: what reaches a log, and ``tests/test_config.py`` pins it so it cannot widen
+#: again without a test failing.
+mask = mask_api_key

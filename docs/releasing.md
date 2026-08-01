@@ -121,11 +121,18 @@ git commit -am "Release v<version>"
 git push origin main
 ```
 
-Upload the files for **this** version explicitly. Never use a bare glob:
-
-```bash
-twine upload dist/nautilustrader_gateio_adapter-<version>*
-```
+> **Do not upload to PyPI yet.** The current distribution name,
+> `nautilustrader-gateio-adapter`, uses the NautilusTrader trademark and is going
+> to be replaced by `gateio-nt-community` (import `gateio_nt`). A PyPI name is
+> never released once claimed, so uploading under the present name is an
+> irreversible mistake, not a step that can be undone in the next release.
+> Releases are cut as git tags with their artefacts attached until the rename
+> has landed. When it has, upload the files for **this** version explicitly and
+> never with a bare glob:
+>
+> ```bash
+> twine upload dist/<distribution_name>-<version>*
+> ```
 
 Then tag and push:
 

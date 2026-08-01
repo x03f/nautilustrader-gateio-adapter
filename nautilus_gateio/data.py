@@ -424,9 +424,9 @@ class GateioDataClient(LiveMarketDataClient):
     ------
     ValueError
         If the configuration is inconsistent (empty or environment-incompatible
-        product set, unsupported book interval or snapshot depth). The
-        configuration struct is frozen, so this validation happens here rather
-        than on the struct.
+        product set, unsupported book interval or snapshot depth). These compare
+        one field against another, so they run here rather than on the struct,
+        whose ``__post_init__`` sees each field on its own.
 
     """
 

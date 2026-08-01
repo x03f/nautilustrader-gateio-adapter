@@ -130,7 +130,11 @@ not replaced from the environment.
 Empty credentials are a valid state: public market data needs none. A signed
 request attempted without them fails locally with the label
 `MISSING_CREDENTIALS` rather than being sent. Credentials are never logged;
-`credentials.mask()` renders a short fingerprint for diagnostics.
+`credentials.mask` renders a short fingerprint for diagnostics. It is
+NautilusTrader's own `mask_api_key`, the one OKX and Deribit log through, rather
+than a copy of it: an absent credential renders `<empty>`, anything up to eight
+characters renders `***` without disclosing its length, and anything longer
+renders as its first four and last four characters (`abcd...wxyz`).
 
 The testnet fallback deserves one caution. With `environment="testnet"` and only
 the mainnet variables set, the mainnet key is used against the testnet host —
@@ -155,11 +159,11 @@ Extends `nautilus_trader.live.config.LiveDataClientConfig`.
 | `options_underlyings`              | `tuple[str, ...] \| None`       | `None`                      | Restricts option instrument loading to these underlyings, e.g. `("BTC_USDT",)`. Ignored unless `OPT` is configured                                                  |
 | `base_url_http`                    | `str \| None`                   | `None`                      | Overrides the REST base URL derived from `environment`                                                                                                              |
 | `base_url_ws`                      | `str \| None`                   | `None`                      | Overrides the WebSocket URL for **every** configured product. Intended for a single-product setup or a local aggregating proxy                                      |
-| `update_instruments_interval_mins` | `int \| None`                   | `60`                        | Interval of the instrument reload task. `None` (or `0`) disables reloading                                                                                          |
-| `http_timeout_secs`                | `float`                         | `20.0`                      | Per-request REST timeout                                                                                                                                            |
-| `max_retries`                      | `int`                           | `3`                         | Total REST attempts for a request the transport may safely repeat. Values below `1` are clamped to `1`                                                              |
-| `order_book_snapshot_limit`        | `int`                           | `100`                       | Depth of the REST snapshot seeding each local book. Must be one of `1, 5, 10, 20, 50, 100`. Also the level requested on the WebSocket where the product accepts one |
-| `order_book_update_interval_ms`    | `int`                           | `100`                       | Push interval of the incremental depth stream. Must be one of `20`, `100`, `1000`                                                                                   |
+| `update_instruments_interval_mins` | `NonNegativeInt \| None`        | `60`                        | Interval of the instrument reload task. `None` (or `0`) disables reloading; a negative period is refused                                                            |
+| `http_timeout_secs`                | `PositiveFloat`                 | `20.0`                      | Per-request REST timeout. Must be above `0`                                                                                                                         |
+| `max_retries`                      | `PositiveInt`                   | `3`                         | Total REST attempts for a request the transport may safely repeat. Must be at least `1`; below that the configuration is **refused**, not clamped                   |
+| `order_book_snapshot_limit`        | `PositiveInt`                   | `100`                       | Depth of the REST snapshot seeding each local book. Must be one of `1, 5, 10, 20, 50, 100`. Also the level requested on the WebSocket where the product accepts one |
+| `order_book_update_interval_ms`    | `PositiveInt`                   | `100`                       | Push interval of the incremental depth stream. Must be one of `20`, `100`, `1000`                                                                                   |
 | `bars_timestamp_on_close`          | `bool`                          | `True`                      | Timestamp bars at the close of their interval (the Nautilus convention). `False` timestamps at the open, matching Gate.io's `t` field                               |
 
 Helpers on the class:
@@ -196,9 +200,9 @@ Extends `nautilus_trader.live.config.LiveExecClientConfig`.
 | `base_url_ws`                   | `str \| None`                   | `None`                       | Overrides the private WebSocket URL for every configured product                                                                                   |
 | `spot_account_mode`             | `GateioSpotAccountMode`         | `GateioSpotAccountMode.SPOT` | Which ledger spot orders trade against: `SPOT`, `MARGIN` (isolated), `CROSS_MARGIN` or `UNIFIED`. See [Account model](#account-model)              |
 | `client_order_id_tag`           | `str`                           | `"ng"`                       | Short tag embedded in generated Gate.io `text` client order ids                                                                                    |
-| `account_polling_interval_secs` | `float`                         | `30.0`                       | Interval of the REST account-state poll that backs up the private WebSocket balance stream. `0` disables the poll                                  |
-| `max_retries`                   | `int`                           | `3`                          | Total REST attempts for a request the transport may safely repeat. Values below `1` are clamped to `1`                                             |
-| `http_timeout_secs`             | `float`                         | `20.0`                       | Per-request REST timeout                                                                                                                           |
+| `account_polling_interval_secs` | `NonNegativeFloat`              | `30.0`                       | Interval of the REST account-state poll that backs up the private WebSocket balance stream. `0` disables the poll; a negative interval is refused  |
+| `max_retries`                   | `PositiveInt`                   | `3`                          | Total REST attempts for a request the transport may safely repeat. Must be at least `1`; below that the configuration is **refused**, not clamped  |
+| `http_timeout_secs`             | `PositiveFloat`                 | `20.0`                       | Per-request REST timeout. Must be above `0`                                                                                                        |
 
 Helpers on the class: `is_testnet`, `resolve_http_url()`,
 `resolve_ws_url(product)` — identical to the data client's.
@@ -217,6 +221,58 @@ ambiguous-request error telling the caller to reconcile rather than resubmit.
 Raising `max_retries` therefore does not increase the risk of a duplicate order.
 This classification is *implemented and mock-tested*
 (`tests/test_http_client.py`).
+
+## Numbers outside their range are refused, not repaired
+
+Every numeric field above carries one of NautilusTrader's constrained types, and
+a value outside that range is refused with a `ValueError` naming the field. This
+happens on **both** ways in:
+
+```python
+GateioExecClientConfig(max_retries=0)
+# ValueError: `max_retries` is out of range for GateioExecClientConfig:
+#             Expected `int` >= 1, was 0
+
+ImportableConfig(
+    path="nautilus_gateio.config:GateioExecClientConfig",
+    config={"max_retries": 0},
+).create()
+# msgspec.ValidationError: Expected `int` >= 1 - at `$.max_retries`
+```
+
+The two exception types differ because the second is raised by `msgspec`'s
+decoder, but `msgspec.ValidationError` is a subclass of `ValueError`, so one
+`except ValueError` catches either. The constrained type alone would only cover
+the second: a `msgspec` constraint is checked when a struct is *decoded*, and
+writing the config in Python — the form every example in this repository uses —
+decodes nothing. The classes therefore also check themselves in `__post_init__`,
+which `msgspec` runs after a direct construction as well as after a decode.
+
+Because a construction that would fail can no longer succeed,
+`NautilusConfig.validate()` keeps its declared contract: it still returns `True`
+for every configuration that exists, rather than raising.
+
+Two fields are non-negative rather than positive —
+`update_instruments_interval_mins` and `account_polling_interval_secs` — because
+`0` is this adapter's documented spelling of "run no such task". What is refused
+there is a negative period.
+
+Range is not the same as set. `order_book_update_interval_ms` and
+`order_book_snapshot_limit` are additionally checked against the discrete values
+Gate.io actually serves; `37` ms is a positive integer and still wrong. Those two
+checks run in the client constructor and are callable on their own as
+`validate_book_interval_ms()` and `validate_snapshot_limit()`.
+
+### `max_retries` below `1` used to be clamped
+
+Until `0.2.0a2` the shared transport did `max(1, max_retries)`, and both tables
+above promised that. A deployment that asked for no retries silently got one
+attempt. The clamp is gone: `GateioHttpClient(max_retries=0)` now raises
+`ValueError` too. It has to be at least `1` because the attempt loop treats it as
+a count of attempts — with `0` the request is never sent, and the caller would be
+handed `TOO_MANY_REQUESTS` about a request that never left the process. An early
+refusal naming the field is worth more than a number quietly replaced by a
+different one.
 
 ## Inherited fields
 
@@ -398,11 +454,17 @@ demonstrated.
 
 ## Validation helpers
 
-Both structs are frozen, which rules out custom validation in `__post_init__`
-without giving up immutability. Cross-field validation therefore runs in the
-client constructors and raises `ValueError` with an explicit message before any
-network activity. The same functions are public, so a configuration can be
-checked up front:
+Being frozen does not rule out `__post_init__`: `msgspec` runs it after the
+fields are set but before the struct is handed back, which is why the per-field
+bounds above are enforced there and hold on both doors. What it does rule out is
+*changing* a value from there, so `__post_init__` can refuse but never correct.
+
+Cross-field validation is a separate matter, and it runs in the client
+constructors rather than on the struct — not for want of a hook, but because
+the fields it compares live in different places: `products` against
+`environment`, and `spot_account_mode` against `products`. It raises
+`ValueError` with an explicit message before any network activity. The same
+functions are public, so a configuration can be checked up front:
 
 ```python
 from nautilus_gateio.config import (

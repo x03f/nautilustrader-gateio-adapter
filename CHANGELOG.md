@@ -195,6 +195,66 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   disconnects one client by hand while another goes on trading is affected; see
   `docs/architecture.md`, "Two shutdown states".
 
+- **Breaking: a numeric configuration field outside its range is now refused,
+  where it used to be accepted.** Every numeric field of
+  `GateioDataClientConfig` and `GateioExecClientConfig` carries one of
+  NautilusTrader's constrained types, and both classes check themselves in
+  `__post_init__` — which `msgspec` runs after a direct Python construction as
+  well as after a decode. `GateioDataClientConfig(http_timeout_secs=0)` and
+  `GateioExecClientConfig(max_retries=-3)` now raise `ValueError` naming the
+  field; before, they were accepted and the damage surfaced elsewhere, as a
+  client whose every request expired or a timer counting backwards. The
+  constrained type alone would only have covered the declarative
+  `ImportableConfig` route, because a `msgspec` constraint is applied when a
+  struct is decoded and writing the config in Python decodes nothing — and
+  Python is the form the README, `docs/configuration.md` and every file in
+  `examples/` are written in. `update_instruments_interval_mins` and
+  `account_polling_interval_secs` stay non-negative rather than positive,
+  because `0` is this adapter's documented spelling of "run no such task".
+  `NautilusConfig.validate()` keeps its declared `-> bool` contract: an instance
+  that could fail its own round trip can no longer be constructed, so every
+  instance that exists still answers `True`. A range alone does not achieve
+  that, because `inf` satisfies every ordering bound and JSON has no spelling
+  for it — `msgspec.json.encode` writes `null`, and `validate()`, which is
+  `bool(self.parse(self.json()))`, would raise on the way back. Non-finite
+  floats are therefore refused on their own terms, for their own reason, on
+  every bounded `float` field the classes declare.
+
+- **Breaking: `GateioHttpClient(timeout_secs=...)` refuses a value that cannot
+  time anything.** The transport constructor is exported and the README drives
+  it directly, so bounding the config classes was only half the door. `0` is not
+  "no limit" to httpx, it is "already expired": every request fails before it
+  leaves the process and is reported as `NETWORK_ERROR` — a venue failure the
+  venue never had. Zero, negatives and non-finite values now raise `ValueError`.
+  **Migration:** pass a positive number of seconds; the default is unchanged.
+
+- **Breaking: `max_retries` below `1` is refused instead of clamped to `1`.**
+  `GateioHttpClient.__init__` did `max(1, max_retries)`, and both configuration
+  tables in `docs/configuration.md` promised that clamping. A deployment that
+  asked for no retries got one attempt and nothing said so. The attempt loop
+  reads the number as a count of attempts, so `0` means the request is never
+  sent and the caller is handed a fabricated `TOO_MANY_REQUESTS` about a request
+  that never left the process. Both doors — the client configs and the transport
+  constructor — now raise `ValueError`. The documented promise of clamping is
+  withdrawn from both tables. **Migration:** if a configuration or a direct
+  `GateioHttpClient(...)` passes `max_retries=0`, it was already getting one
+  attempt; write `1`.
+
+- **The credential fingerprint is NautilusTrader's `mask_api_key`, and it
+  discloses two characters more than the helper it replaced.**
+  `nautilus_gateio.common.credentials.mask` is now the platform's
+  `nautilus_trader.common.secure.mask_api_key` — the pure-Python one the OKX and
+  Deribit adapters log through, not the `core.nautilus_pyo3` one Binance uses,
+  which renders an absent credential as an empty string. Three things changed in
+  what a log can show: an absent credential reads `<empty>` rather than
+  `<unset>`; a credential of eight characters or fewer reads `***` instead of one
+  `*` per character, so it no longer publishes its own length; and a longer one
+  reads `abcd...wxyz` rather than `abcd...yz`, disclosing eight characters of a
+  32-character Gate.io key where it used to disclose six. The last of those is
+  the one change that shows *more*, and `tests/test_config.py` pins the width so
+  it cannot widen again silently. `SECURITY.md` and `docs/configuration.md` state
+  the current behaviour.
+
 - **The branch no longer reports the released version.** `pyproject.toml` and
   `nautilus_gateio.__version__` carry `0.2.0a2.dev0`: a
   [PEP 440](https://peps.python.org/pep-0440/) developmental release of the next
@@ -213,6 +273,24 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   `subscribe_option_greeks`, which is still not implemented.
 
 ### Documentation
+
+- **`docs/releasing.md` no longer tells the releaser to upload the current
+  distribution name to PyPI.** `nautilustrader-gateio-adapter` uses the
+  NautilusTrader trademark and is to be replaced by `gateio-nt-community`
+  (import `gateio_nt`). A PyPI name is never released once claimed, so that
+  upload is not a step a later release could correct — the guide now defers the
+  upload until the rename has landed, and shows the pinned, one-version form
+  without naming the distribution. `tests/test_docs.py` keeps both halves: an
+  upload glob is still refused, and no page may spell out an upload of the
+  present name.
+
+- **`docs/configuration.md` gains "Numbers outside their range are refused, not
+  repaired".** It shows both refusals side by side — the constructor's
+  `ValueError` and the decoder's `ValidationError`, and that the second is a
+  subclass of the first — says why the constrained type alone was not enough,
+  and states that `validate()` keeps answering `True`. The field tables carry
+  the constrained type names instead of bare `int`/`float`, and the two rows
+  that promised clamping now say the value is refused.
 
 - **The README is rewritten.** The capability matrices use the platform's own
   convention — a check mark for supported, a hyphen for unsupported, nothing else
