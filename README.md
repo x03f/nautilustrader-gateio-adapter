@@ -21,13 +21,79 @@ and it is not affiliated with, maintained by or endorsed by Gate.io or Nautech S
 - An order Gate.io cannot express is denied with a stated reason before any request is sent. It is
   never converted into a different order, and never reported as a venue rejection the venue did not
   make.
-- All four NautilusTrader report generators are implemented against REST, so a restart holding
-  resting orders and open positions is a supported path.
+- All four NautilusTrader report generators are implemented against REST and asserted by the offline
+  suite against recorded venue payloads. What a live restart has shown is narrower: one recorded run
+  read an open perpetual position back into a node that had never seen it, and no run has adopted a
+  resting order or restarted a node onto its own live state. Restart recovery therefore sits below
+  the top rung of the [evidence ladder](docs/validation.md#the-evidence-ladder), which is the one
+  vocabulary these pages grade evidence in.
+
+## Quickstart
+
+Public market data needs no account, so the shortest path from install to data involves no
+credentials at all.
+
+```bash
+pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/nautilustrader-gateio-adapter"
+```
+
+That line installs the default branch, which is ahead of the published release; pinning the release
+tag instead, and everything else about versions, is under
+[Requirements and installation](#requirements-and-installation).
+
+```python
+import asyncio
+
+from nautilus_gateio import GateioFuturesHttpAPI, GateioHttpClient, GateioSpotHttpAPI
+
+
+async def main() -> None:
+    async with GateioHttpClient() as client:
+        spot = GateioSpotHttpAPI(client)
+        perp = GateioFuturesHttpAPI(client, settle="usdt")
+
+        pair = await spot.currency_pair("BTC_USDT")
+        book = await spot.order_book("BTC_USDT", limit=5)
+        contract = await perp.contract("BTC_USDT")
+
+        print(f"spot precision  : {pair['precision']} / {pair['amount_precision']}")
+        print(f"spot top of book: {book['bids'][0][0]} / {book['asks'][0][0]}")
+        print(f"perp multiplier : {contract['quanto_multiplier']}")
+
+
+asyncio.run(main())
+```
+
+```text
+spot precision  : 1 / 6
+spot top of book: 62811.4 / 62811.5
+perp multiplier : 0.0001
+```
+
+The figures are whatever the venue is publishing when you run it; what matters is that three public
+endpoints answered without a key and without a Nautilus node.
+
+Where to go from there:
+
+| Next                                | Where                                                                                             | Needs                             |
+|-------------------------------------|---------------------------------------------------------------------------------------------------|-----------------------------------|
+| The same data inside a node         | [A live `TradingNode`](#a-live-tradingnode)                                                       | Nothing                           |
+| Read a real account, place no order | [Credentials](#credentials), [`examples/05_account_readonly.py`](examples/05_account_readonly.py) | `GATE_API_KEY`, `GATE_API_SECRET` |
+| One order, on the testnet           | [One order on the testnet](#one-order-on-the-testnet)                                             | A testnet key and secret          |
+| What the venue has actually seen    | [Status](#status), [docs/validation.md](docs/validation.md)                                       | Nothing                           |
+| What surprises people first         | [What will bite you](#what-will-bite-you)                                                         | Nothing                           |
+
+This is alpha software that places real orders with real money by default: `environment` is
+`"mainnet"` on both clients unless you say otherwise. Read [Status](#status) and
+[Before your first order](#before-your-first-order) before the first order, not after it.
 
 ## Status
 
 **Alpha.** A build of this branch reports `0.2.0a2.dev0`; the published release reports `0.2.0a1`.
-Both are built against `nautilus_trader` 1.230.0 on Python 3.13.
+Both require `nautilus_trader>=1.230.0,<2` and Python `>=3.12,<3.15`, and CI runs the suite on 3.12,
+3.13 and 3.14. Where a page names an interpreter — the platform behaviors verified in
+[docs/configuration.md](docs/configuration.md) — it is 3.13, because that is the version those
+readings were taken on, not a version this package requires.
 
 Gate.io mainnet has answered the public market-data paths, the whole spot order lifecycle, one
 USDT perpetual and one option contract. No order has been sent on an inverse perpetual or a
@@ -192,31 +258,9 @@ why delivery and options need no suffix, is in [docs/symbology.md](docs/symbolog
 
 ### Public REST, no credentials
 
-```python
-import asyncio
-
-from nautilus_gateio import GateioFuturesHttpAPI, GateioHttpClient, GateioSpotHttpAPI
-
-
-async def main() -> None:
-    async with GateioHttpClient() as client:
-        spot = GateioSpotHttpAPI(client)
-        perp = GateioFuturesHttpAPI(client, settle="usdt")
-
-        pair = await spot.currency_pair("BTC_USDT")
-        book = await spot.order_book("BTC_USDT", limit=5)
-        contract = await perp.contract("BTC_USDT")
-
-        print(f"spot precision  : {pair['precision']} / {pair['amount_precision']}")
-        print(f"spot top of book: {book['bids'][0][0]} / {book['asks'][0][0]}")
-        print(f"perp multiplier : {contract['quanto_multiplier']}")
-
-
-asyncio.run(main())
-```
-
-The REST transport and the WebSocket clients work without a Nautilus node, which is what
-[`examples/01_public_rest.py`](examples/01_public_rest.py) and
+The [quickstart](#quickstart) above is this path: one typed namespace per product family over one
+shared transport, no credentials anywhere. The REST transport and the WebSocket clients work without
+a Nautilus node, which is what [`examples/01_public_rest.py`](examples/01_public_rest.py) and
 [`examples/02_public_websocket.py`](examples/02_public_websocket.py) show.
 
 ### A live `TradingNode`
@@ -491,72 +535,27 @@ node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)
 ```
 
 A declarative node config can carry the client configuration instead, which is how a pip-installed
-adapter is wired into a node without being imported in your own code:
+adapter is wired into a node without being imported in your own code. The registration above does
+not go away on that path: `nautilus_trader` 1.230.0 cannot build the execution client from a
+declared factory, so `node.add_exec_client_factory(...)` stays in Python while the rest of the entry
+is data. State `environment` on **both** entries — they are separate configurations and each
+defaults to mainnet, which is how a node ends up trading in one environment while watching prices
+from another ([configuration.md](docs/configuration.md#the-environment-default-is-mainnet)).
 
-```python
-from nautilus_trader.common.config import ImportableConfig, ImportableFactoryConfig
-from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.live.node import TradingNode
+[docs/configuration.md](docs/configuration.md) is the reference for that path, under *Registering
+from a declarative config*: a full example, why the execution factory cannot be declared, the casing
+each of the two enums takes, and the one field a declarative config cannot express at all.
 
-from nautilus_gateio import GATEIO, GateioLiveExecClientFactory
-
-config = TradingNodeConfig(
-    trader_id="GATEIO-001",
-    data_clients={
-        "GATE_IO": ImportableConfig(
-            path="nautilus_gateio.config:GateioDataClientConfig",
-            config={
-                "environment": "testnet",  # state it on BOTH clients, see below
-                "products": ["SPOT", "PERP"],
-                "instrument_provider": {"load_all": True},
-            },
-            factory=ImportableFactoryConfig(
-                path="nautilus_gateio.factories:GateioLiveDataClientFactory",
-            ),
-        ),
-    },
-    exec_clients={
-        "GATE_IO": ImportableConfig(
-            path="nautilus_gateio.config:GateioExecClientConfig",
-            config={"environment": "testnet", "products": ["SPOT"], "spot_account_mode": "spot"},
-        ),
-    },
-)
-
-node = TradingNode(config=config)
-node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)  # not declarative, see below
-node.build()
-```
-
-What that path requires, verified against `nautilus_trader` 1.230.0:
-
-- **`environment` is per client, and it defaults to mainnet.** The two entries are separate
-  configurations, so leaving it off the data client while setting it on the execution client is how
-  a node ends up trading in one environment while watching prices from another. The startup log
-  states each one; read both lines
-  ([configuration.md](docs/configuration.md#the-environment-default-is-mainnet)).
-- **The execution factory has to be registered in Python.** Give the exec entry a
-  `factory=ImportableFactoryConfig(...)` and `node.build()` raises
-  `AttributeError: 'GateioLiveExecClientFactory' object has no attribute '__name__'`.
-  `nautilus_trader/live/node_builder.py::TradingNodeBuilder.build_exec_clients` reads `__name__` off
-  the factory object to recognize the sandbox factory, and `ImportableFactoryConfig.create()` hands
-  it an instance rather than the class. Registering the factory beforehand makes the builder skip
-  that construction, and the rest of the entry stays declarative. The data-client path carries no
-  such check and works fully declaratively.
-- `products` takes the enum *names*: `"SPOT"`, `"PERP"`, `"INVERSE"`, `"FUT"`, `"OPT"`, uppercase.
-- `spot_account_mode` takes the venue's own strings: `"spot"`, `"margin"`, `"cross_margin"`,
-  `"unified"`, lowercase. `"SPOT"` raises
-  ``msgspec.ValidationError: Invalid enum value 'SPOT' - at `$.spot_account_mode` ``. The two enums
-  live in the same config class and take opposite casing.
-- `instrument_provider.load_ids` cannot be given here at all. `ImportableConfig.create()` decodes
-  without a hook, so string ids raise ``msgspec.ValidationError: Expected
-  `nautilus_trader.model.identifiers.InstrumentId`, got `str` - at
-  `$.instrument_provider.load_ids[0]` ``. That is a platform limitation rather than an adapter one.
-  Use `load_all` with `filters`, or build the config in Python.
-
-The factories cache one HTTP transport and one instrument provider per set of credentials,
-environment, products and provider config, so two clients configured identically share one
-connection pool and one instrument load.
+The factories share one HTTP transport and one instrument provider between clients configured alike,
+so a data client and an execution client in the same node use one connection pool and one instrument
+load. Each cache holds exactly one entry — `functools.lru_cache(1)` in
+[`nautilus_gateio/factories.py`](nautilus_gateio/factories.py), matching the adapters bundled with
+NautilusTrader. The transport is keyed by credentials, base URL, timeout and retry count; `products`
+is not part of that key, and the instrument provider is keyed separately, by transport, products,
+option underlyings and provider config. A second, differently configured transport therefore evicts
+the first rather than joining it: invisible within one node, visible to a process that builds nodes
+for two environments
+([architecture.md](docs/architecture.md#shared-reference-counted-rest-transport)).
 
 ## Configuration
 
@@ -642,8 +641,14 @@ resynchronizing.
 
 ## Feature support matrix
 
-`✓` means the capability is implemented and covered by the offline test suite. `-` means it is not
-available on that product. The **Mainnet** column is a different question: it names the products for
+These tables grade capability; how well a capability is *proven* is graded in one place only, the
+[evidence ladder](docs/validation.md#the-evidence-ladder) in
+[docs/validation.md](docs/validation.md), and this page defines no scale of its own.
+
+`✓` means the capability is implemented and the offline suite asserts it against recorded venue
+payloads — the ladder's *unit-tested* rung at least, higher where that page says so, and the Notes
+cell says where offline coverage stops short of the client. `-` means it is not available on that
+product. The **Mainnet** column is the ladder's top rung, per product: it names the products for
 which a run against the real exchange is recorded in [docs/validation.md](docs/validation.md), and
 `-` there means the venue has never seen that path. No row is marked stable, because a single
 recorded run is not evidence of stability; see
