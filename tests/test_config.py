@@ -7,6 +7,8 @@ are cleared for every test by an autouse fixture in ``conftest.py``.
 
 from __future__ import annotations
 
+from typing import get_args
+
 import httpx
 import msgspec
 import pytest
@@ -441,6 +443,13 @@ REFUSED_VALUES = [
     (GateioExecClientConfig, "account_polling_interval_secs", -30.0),
 ]
 
+#: Floats that satisfy every ordering bound and still cannot survive a round
+#: trip, because JSON has no spelling for them: ``msgspec.json.encode`` writes
+#: ``null``. They are listed apart from :data:`REFUSED_VALUES` because they are
+#: refused for a different reason, and the reason is the point -- a bound alone
+#: admits ``inf``.
+NOT_FINITE = [float("inf"), float("-inf"), float("nan"), 1e400]
+
 #: ``(cls, field, value)`` triples at the *legal* edge of each bounded field:
 #: the smallest value the range still admits. They exist to pin the boundary
 #: itself. A check moved one step in either direction fails here or in
@@ -679,6 +688,28 @@ class TestPlatformConfigContractIsIntact:
         assert config.validate() is True
 
     @pytest.mark.parametrize("config_cls", CONFIG_CLASSES)
+    @pytest.mark.parametrize("value", NOT_FINITE, ids=repr)
+    def test_a_float_json_cannot_write_is_refused_on_every_float_field(self, config_cls, value):
+        """The contract above, proven over the fields rather than over a list.
+
+        The refusal table is hand-written, so it can only ever demonstrate the
+        contract on the values someone thought of; ``inf`` is precisely the
+        value nobody thinks of, because it satisfies every ordering bound there
+        is. This walks the bounded ``float`` fields the class actually declares,
+        so a field added later is covered without anyone remembering to add it.
+        """
+        float_fields = [
+            name
+            for name, hint in bounded_fields(config_cls)
+            if get_args(hint) and get_args(hint)[0] is float
+        ]
+        assert float_fields, f"{config_cls.__name__} declares no bounded float field to check"
+
+        for name in float_fields:
+            with pytest.raises(ValueError, match="finite"):
+                config_cls(**{name: value})
+
+    @pytest.mark.parametrize("config_cls", CONFIG_CLASSES)
     def test_a_configuration_survives_its_own_serialisation(self, config_cls):
         """``parse(json())`` is what ``validate()`` runs; it must round-trip.
 
@@ -733,6 +764,23 @@ class TestRetryBudgetIsHonouredOrRefused:
         """
         with pytest.raises(ValueError, match="max_retries"):
             GateioHttpClient(max_retries=max_retries)
+
+    @pytest.mark.parametrize(
+        "timeout_secs",
+        [0.0, -20.0, float("inf"), float("nan")],
+        ids=repr,
+    )
+    def test_a_timeout_that_cannot_time_anything_is_refused_here_too(self, timeout_secs):
+        """The other number on the same public door.
+
+        This constructor is exported and the README drives it directly, so the
+        config layer refusing a value is only half the guarantee. ``0`` is not
+        "no limit" to httpx, it is "already expired": every request would fail
+        before it left the process and be reported as ``NETWORK_ERROR`` -- a
+        venue failure the venue never had.
+        """
+        with pytest.raises(ValueError, match="timeout_secs"):
+            GateioHttpClient(timeout_secs=timeout_secs)
 
     async def test_the_config_default_reaches_the_transport_unchanged(self):
         """Ties the two layers together: the default is legal and is not rewritten."""

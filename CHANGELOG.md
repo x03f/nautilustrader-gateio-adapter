@@ -164,7 +164,20 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   because `0` is this adapter's documented spelling of "run no such task".
   `NautilusConfig.validate()` keeps its declared `-> bool` contract: an instance
   that could fail its own round trip can no longer be constructed, so every
-  instance that exists still answers `True`.
+  instance that exists still answers `True`. A range alone does not achieve
+  that, because `inf` satisfies every ordering bound and JSON has no spelling
+  for it — `msgspec.json.encode` writes `null`, and `validate()`, which is
+  `bool(self.parse(self.json()))`, would raise on the way back. Non-finite
+  floats are therefore refused on their own terms, for their own reason, on
+  every bounded `float` field the classes declare.
+
+- **Breaking: `GateioHttpClient(timeout_secs=...)` refuses a value that cannot
+  time anything.** The transport constructor is exported and the README drives
+  it directly, so bounding the config classes was only half the door. `0` is not
+  "no limit" to httpx, it is "already expired": every request fails before it
+  leaves the process and is reported as `NETWORK_ERROR` — a venue failure the
+  venue never had. Zero, negatives and non-finite values now raise `ValueError`.
+  **Migration:** pass a positive number of seconds; the default is unchanged.
 
 - **Breaking: `max_retries` below `1` is refused instead of clamped to `1`.**
   `GateioHttpClient.__init__` did `max(1, max_retries)`, and both configuration

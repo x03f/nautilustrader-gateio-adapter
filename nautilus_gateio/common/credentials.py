@@ -52,7 +52,7 @@ def resolve_credentials(
 #: This *is* ``nautilus_trader.common.secure.mask_api_key``, exported under the
 #: name this package documents. Two maskers exist in NautilusTrader 1.230 and
 #: they disagree at the edges; this is the pure-Python one, which the OKX and
-#: Deribit adapters log through (four call sites between them). The other lives
+#: Deribit adapters log through. The other lives
 #: in ``core.nautilus_pyo3`` and is what Binance uses; it renders an absent
 #: credential as the empty string and pads a short one to its own length, so it
 #: would lose both properties this adapter wants — a *named* absent case, since

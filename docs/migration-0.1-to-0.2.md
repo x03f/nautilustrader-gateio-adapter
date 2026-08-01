@@ -471,8 +471,10 @@ ws = GateioPublicWebSocket(product=GateioProductType.PERP, handler=print)
 | `base_url_http`                            | kept                                                                                                                                     |
 | —                                          | new: `products`, `options_underlyings`, `base_url_ws`, `spot_account_mode`, `max_retries`, `http_timeout_secs`                           |
 
-Both classes are frozen `msgspec` structs, so cross-field validation runs in the
-client constructors rather than in `__post_init__`. `validate_products`,
+Per-field bounds are enforced on the struct itself, so a number outside its
+range is refused whether you construct the class in Python or decode it from
+JSON. Cross-field validation runs in the client constructors instead, because it
+compares one field against another. `validate_products`,
 `validate_book_interval_ms` and `validate_snapshot_limit` are public if you want
 to check a configuration before building a client. The full reference is in
 [configuration.md](configuration.md).

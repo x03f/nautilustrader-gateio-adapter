@@ -894,8 +894,9 @@ class GateioExecutionClient(LiveExecutionClient):
     ------
     ValueError
         If the configured product set is empty or not served by the configured
-        environment. The configuration struct is frozen, so this validation
-        happens here rather than on the struct.
+        environment. These compare one field against another, so they run here
+        rather than on the struct, whose ``__post_init__`` sees each field on
+        its own.
 
     Warnings
     --------

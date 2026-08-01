@@ -68,6 +68,7 @@ configuration up front.
 
 from __future__ import annotations
 
+import math
 from types import UnionType
 from typing import Annotated, Any, Union, get_args, get_origin, get_type_hints
 
@@ -249,9 +250,11 @@ def enforce_field_bounds(config: Any) -> None:
     Raises
     ------
     ValueError
-        If a bounded field holds a value its annotation excludes. The message
-        names the field. (``msgspec.ValidationError`` from the decode path is
-        itself a ``ValueError``, so one ``except ValueError`` covers both.)
+        If a bounded field holds a value its annotation excludes, holds a type
+        the annotation does not admit, or holds a float JSON cannot write. The
+        message names the field and says which of the three it is.
+        (``msgspec.ValidationError`` from the decode path is itself a
+        ``ValueError``, so one ``except ValueError`` covers both.)
     RuntimeError
         If ``config``'s class declares no bounded field at all. That is a
         programming error — an annotation was dropped, or a class that has
@@ -267,11 +270,30 @@ def enforce_field_bounds(config: Any) -> None:
         )
     for name, hint in fields:
         value = getattr(config, name)
+        # `inf` satisfies every ordering bound there is, so `msgspec.convert`
+        # admits it — but JSON has no spelling for it, and `msgspec.json.encode`
+        # writes `null` instead. The platform's `NautilusConfig.validate()` is
+        # `bool(self.parse(self.json()))`, so an admitted `inf` would come back
+        # as `null` and make a method declared `-> bool` raise instead. Refusing
+        # it here is what keeps "an instance that exists round-trips" true.
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(
+                f"`{name}` must be a finite number for {type(config).__name__}: JSON cannot "
+                f"write it, so the configuration would not survive its own round trip, "
+                f"was {value!r}",
+            )
         try:
             msgspec.convert(value, type=hint)
         except msgspec.ValidationError as exc:
+            # `convert` type-checks as well as range-checks, and the two failures
+            # read very differently to whoever wrote the value: `60.0` for an
+            # `int` field is the right magnitude in the wrong type, not a number
+            # out of range. So this wrapper does not name the fault — msgspec's
+            # own message already distinguishes "Expected `int` >= 1" from
+            # "Expected `int`, got `float`", and a wrapper that guesses would
+            # send the reader hunting for a bound that is not the problem.
             raise ValueError(
-                f"`{name}` is out of range for {type(config).__name__}: {exc}, was {value!r}",
+                f"`{name}` is not a value {type(config).__name__} accepts: {exc}, was {value!r}",
             ) from None
 
 

@@ -454,11 +454,17 @@ demonstrated.
 
 ## Validation helpers
 
-Both structs are frozen, which rules out custom validation in `__post_init__`
-without giving up immutability. Cross-field validation therefore runs in the
-client constructors and raises `ValueError` with an explicit message before any
-network activity. The same functions are public, so a configuration can be
-checked up front:
+Being frozen does not rule out `__post_init__`: `msgspec` runs it after the
+fields are set but before the struct is handed back, which is why the per-field
+bounds above are enforced there and hold on both doors. What it does rule out is
+*changing* a value from there, so `__post_init__` can refuse but never correct.
+
+Cross-field validation is a separate matter, and it runs in the client
+constructors rather than on the struct — not for want of a hook, but because
+the fields it compares live in different places: `products` against
+`environment`, and `spot_account_mode` against `products`. It raises
+`ValueError` with an explicit message before any network activity. The same
+functions are public, so a configuration can be checked up front:
 
 ```python
 from nautilus_gateio.config import (
