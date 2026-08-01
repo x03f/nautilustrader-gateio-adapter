@@ -10,7 +10,7 @@ outside the checkout and imports it, writes `SHA256SUMS`, attests the provenance
 those exact files, and creates the GitHub Release with them attached. A releaser
 builds nothing that a user ever downloads. The local build in steps 3 and 4 below
 is a rehearsal — it catches a broken package list before a tag exists, and its
-artefacts are then thrown away.
+artifacts are then thrown away.
 
 Two things follow, and both matter:
 
@@ -98,7 +98,7 @@ python examples/03_instruments.py
 
 ## 3. Rehearse the build from a clean tree
 
-Nothing built here is published — the tag's workflow builds the artefacts a user
+Nothing built here is published — the tag's workflow builds the artifacts a user
 receives. This is the rehearsal that catches a broken package list, a bad
 version string or a metadata error while it is still cheap, before a tag exists.
 
@@ -118,7 +118,7 @@ released: `nautilustrader_gateio_adapter-<version>-py3-none-any.whl` and
 `nautilustrader_gateio_adapter-<version>.tar.gz`.
 
 Both filenames must carry the version from `pyproject.toml` with no `.dev`
-segment. A `.dev` in a filename here means step 1 was skipped, and the artefact
+segment. A `.dev` in a filename here means step 1 was skipped, and the artifact
 must not be published.
 
 ## 4. Verify the built wheel, not the source tree
@@ -142,8 +142,8 @@ print(nautilus_gateio.__version__, GATEIO)
 The version printed here is the one being released, with no `.dev` segment.
 
 CI performs this check on every push (the `build` job) and the release workflow
-performs it again on the artefacts it is about to attach, so a broken package
-list fails there rather than in a published artefact.
+performs it again on the artifacts it is about to attach, so a broken package
+list fails there rather than in a published artifact.
 
 Then discard the rehearsal, so nothing local can be mistaken for the release:
 
@@ -181,7 +181,7 @@ Nothing else is uploaded anywhere. In particular there is no index upload: see
 the note at the top of this page for why that step does not exist and must not be
 added by hand.
 
-A tag, once pushed, is a fixed point: it is never moved, and the artefacts built
+A tag, once pushed, is a fixed point: it is never moved, and the artifacts built
 from it are never rebuilt or replaced. A mistake in a release is corrected by the
 next release, not by re-cutting this one.
 
@@ -221,7 +221,7 @@ git push origin main
 
 * [ ] The release run is green and the GitHub Release carries three assets: the
       wheel, the sdist and `SHA256SUMS`.
-* [ ] Verify the published artefacts the way a stranger would — from the release,
+* [ ] Verify the published artifacts the way a stranger would — from the release,
       not from the tree they were built in:
       ```bash
       gh release download v<version> --dir /tmp/verify

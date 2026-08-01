@@ -512,7 +512,7 @@ wallets of the enabled products into that one account — hence `master` rather
 than a product name. See [products.md](products.md) for what that means per
 product.
 
-## Behavioural changes that are not API changes
+## Behavioral changes that are not API changes
 
 * **Fills arrive over the private WebSocket**, not by REST polling. A fill is
   now published when the venue pushes it rather than when the next poll happens,

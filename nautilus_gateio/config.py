@@ -25,7 +25,7 @@ Numeric fields carry NautilusTrader's constrained types (``PositiveInt``,
 ``PositiveFloat``, ``NonNegativeInt``, ``NonNegativeFloat``). Two fields are
 non-negative rather than positive, because ``0`` already means something here:
 it disables the instrument reload task and the account poll respectively, and
-that is documented behaviour, not a mistake to catch.
+that is documented behavior, not a mistake to catch.
 
 A constrained type alone is not enough, because it is a ``msgspec`` constraint
 and ``msgspec`` applies those when it *decodes*. Writing
@@ -110,7 +110,7 @@ def is_testnet(environment: str) -> bool:
 
 
 def resolve_http_url(environment: str, override: str | None = None) -> str:
-    """Return the REST base URL for ``environment``, honouring an override."""
+    """Return the REST base URL for ``environment``, honoring an override."""
     if override:
         return override
     return GATEIO_HTTP_TESTNET if is_testnet(environment) else GATEIO_HTTP_MAINNET
@@ -121,7 +121,7 @@ def resolve_ws_url(
     environment: str,
     override: str | None = None,
 ) -> str:
-    """Return the WebSocket URL for ``product``, honouring an override.
+    """Return the WebSocket URL for ``product``, honoring an override.
 
     Raises
     ------

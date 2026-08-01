@@ -171,7 +171,7 @@ past the sink's own level, so `log_level="INFO"` keeps the transport's DEBUG
 lines off the console whatever the component map says.
 
 At `DEBUG` the transport reports each connection, each heartbeat failure and
-each acknowledgement it could not match. Two things to know when reading it:
+each acknowledgment it could not match. Two things to know when reading it:
 `log_components_only=True` suppresses every component not named in
 `log_component_levels`, and a `Logger` built before the logging subsystem is
 initialized discards its messages, which is what happens when the transport is

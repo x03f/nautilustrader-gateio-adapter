@@ -281,7 +281,7 @@ class OrderReportsUnavailable(Exception):
     ``_validate_reconciliation_state`` only warns), an open/closed disagreement
     with the venue that nothing repairs.
 
-    The behaviour this buys from the engine cannot fabricate, verified against
+    The behavior this buys from the engine cannot fabricate, verified against
     the installed source: at startup this client's ``generate_mass_status``
     turns the raise into a ``None`` mass status, ``reconcile_execution_state``
     returns False, and the kernel refuses to start the trader
@@ -627,7 +627,7 @@ def trigger_rule(
     The order type is not thereby redundant, because the two are only
     interchangeable while the order is well formed. A stop is placed away from
     the market in the direction of the trade (BUY above, SELL below); an
-    if-touched order towards it (BUY below, SELL above). For a well-formed order
+    if-touched order toward it (BUY below, SELL above). For a well-formed order
     the market-derived rule and the type-derived rule agree and this function is
     a no-op check. When they disagree — a BUY ``STOP_MARKET`` whose trigger sits
     below the market, or a stop whose level the market has already breached —
@@ -1383,7 +1383,7 @@ class GateioExecutionClient(LiveExecutionClient):
         * an order status report alone states a filled quantity without the
           trades that produced it, so the engine closes the difference with an
           **inferred** fill carrying a synthetic trade id. The venue's own trade
-          then arrives with the real id, which the engine cannot recognise as the
+          then arrives with the real id, which the engine cannot recognize as the
           same execution: it is either applied on top (4 lots recorded as 8) or,
           when the inferred fill is stamped later than the real one, discarded —
           and with it the only key by which any later replay could be matched;
@@ -1596,7 +1596,7 @@ class GateioExecutionClient(LiveExecutionClient):
         overfill. Losing a real venue trade id to a fabricated one costs the fee
         that trade paid — a spot buy's fee is withheld in the base currency, so
         the position is overstated by it — and destroys the only key by which a
-        later replay of that trade could be recognised.
+        later replay of that trade could be recognized.
 
         Raises :class:`FillReportsUnavailable` when a venue-named trade cannot
         be booked because no readable statement of its order could be obtained
@@ -1780,7 +1780,7 @@ class GateioExecutionClient(LiveExecutionClient):
         # The signed delta is recorded for the log line below and for
         # operators reading the memory; it takes no part in the decision. An
         # earlier form popped the entry at delta == 0 before any comparison,
-        # and a zero-net outage round trip — ordinary strategy behaviour —
+        # and a zero-net outage round trip — ordinary strategy behavior —
         # disarmed the instrument, so the very next stale row erased the
         # pre-existing position beneath the round trip (REC-07, R8-F2). A
         # non-empty booking set that nets to zero still cannot be contained
@@ -2374,7 +2374,7 @@ class GateioExecutionClient(LiveExecutionClient):
                     # Woken inside the shutdown window. The gate would refuse
                     # every wallet read anyway; leaving now keeps a stopping node
                     # from printing a wall of errors and from spinning at the
-                    # poll interval until the platform gets round to cancelling.
+                    # poll interval until the platform gets round to canceling.
                     self._log.debug("Stopping 'poll_account_state': the transport is closing")
                     return
                 await self._update_account_state()
@@ -2677,7 +2677,7 @@ class GateioExecutionClient(LiveExecutionClient):
         (``model/orders/list.pyx``), so a list built with
         ``OrderFactory.bracket(contingency_type=ContingencyType.OCO)`` is not a
         bracket by that test and would slip through into the batch path, where
-        both exits go live and neither is ever cancelled.
+        both exits go live and neither is ever canceled.
 
         Contingent orders remain available against this venue through the
         platform's own emulator: give any leg an ``emulation_trigger`` and
@@ -2835,7 +2835,7 @@ class GateioExecutionClient(LiveExecutionClient):
             # Nothing this client refuses can reach here any more: the whole
             # request was built above. What is left happened around a request
             # Gate.io may already have accepted — a response this client could
-            # not read, a task cancelled mid-call — including the `ValueError`
+            # not read, a task canceled mid-call — including the `ValueError`
             # and `OrderValidationError` a malformed success payload can raise
             # while it is being parsed. Rejecting on that is unrecoverable, not
             # merely pessimistic; see `_outcome_unresolved`.
@@ -3519,7 +3519,7 @@ class GateioExecutionClient(LiveExecutionClient):
 
         Gate.io only accepts ``ioc`` (and, on futures and delivery, ``fok``) for
         ``type=market``. GTC and DAY carry no meaning for an order that cannot
-        rest, so they map to ``ioc``; ``FOK`` is honoured where the venue
+        rest, so they map to ``ioc``; ``FOK`` is honored where the venue
         supports it and rejected where it does not, rather than being quietly
         downgraded into a different execution guarantee.
         """
@@ -5578,12 +5578,12 @@ class GateioExecutionClient(LiveExecutionClient):
         api = self._futures_api(product)
         account = await require_wallet(api.accounts(), f"the {product.value} wallet")
         currency = str(account.get("currency") or product.settle).upper()
-        # The wallet balance, deliberately *without* the venue's unrealised PnL.
+        # The wallet balance, deliberately *without* the venue's unrealized PnL.
         # Gate.io says of `total`: "does not include upl of positions", and that
         # is exactly the figure the platform wants: `Portfolio.equity()` for a
         # margin account is `balances_total + sum(unrealized_pnl(open positions))`
         # (portfolio/portfolio.pyx:1176-1243; concepts/portfolio.md, "Equity
-        # formula"), so folding the venue's unrealised PnL into `total` makes the
+        # formula"), so folding the venue's unrealized PnL into `total` makes the
         # platform count it a second time. In-tree Binance reports the same
         # figure for the same reason — `walletBalance`, not `marginBalance`
         # (adapters/binance/futures/schemas/account.py:75-88). It also makes the
@@ -5591,7 +5591,7 @@ class GateioExecutionClient(LiveExecutionClient):
         # wallet balance alone and would otherwise contradict it every tick.
         total = to_decimal(account.get("total"))
         free = to_decimal(account.get("available"))
-        # `available` can exceed the wallet balance when unrealised profit is
+        # `available` can exceed the wallet balance when unrealized profit is
         # spendable as collateral; clamping keeps `locked` non-negative, which is
         # what the reference adapter does at this same point.
         _accumulate(balances, currency, total, min(free, total))
@@ -5662,7 +5662,7 @@ class GateioExecutionClient(LiveExecutionClient):
         account = await require_wallet(self._options_http.account(), "the options wallet")
         currency = str(account.get("currency") or "USDT").upper()
         # `total` is the options account balance; `equity` is "balance + position
-        # value" and therefore already carries the unrealised PnL the Portfolio
+        # value" and therefore already carries the unrealized PnL the Portfolio
         # adds itself (see `_collect_futures_balances`). Use the balance, and
         # recover it from `equity` only when the venue omitted it.
         total = to_decimal(account.get("total"))
@@ -5807,7 +5807,7 @@ class GateioExecutionClient(LiveExecutionClient):
         :meth:`generate_position_status_reports` raises *by design*: it is the
         only way this client can tell the engine that a position query went
         unanswered, and the engine's position paths depend on hearing it.
-        Inheriting the base behaviour would let one 502 on the position endpoint
+        Inheriting the base behavior would let one 502 on the position endpoint
         throw away the order and fill recovery a restart exists to perform.
 
         Positions lose nothing by being left out of the mass status when they
@@ -6588,7 +6588,7 @@ class GateioExecutionClient(LiveExecutionClient):
         venue id on the spot and perpetual single-order endpoints
         (:data:`CLIENT_ID_ADDRESSABLE_PRODUCTS`) but not on delivery or options,
         and even where it is taken it stops resolving once the order has been
-        finished for a minute. So the direct read is an optimisation, not the
+        finished for a minute. So the direct read is an optimization, not the
         mechanism: what works on every product and at every age is the order
         listing, which carries ``text`` on every row and is already parsed into
         reports by :meth:`_order_reports_for_product`. Resting orders are listed
@@ -7183,7 +7183,7 @@ class GateioExecutionClient(LiveExecutionClient):
         :class:`FillReportsUnavailable`, carrying everything the other products
         did answer. Returning the partial list instead — which is what logging
         and continuing amounts to — is indistinguishable from "the venue reports
-        no such trades", and the engine's only defence against squaring a
+        no such trades", and the engine's only defense against squaring a
         position to flat on a failed query is that this call raises: it sets
         ``had_fill_query_errors`` in ``_query_and_find_missing_fills`` from the
         exception and from nothing else. Swallowing the failure there costs a
@@ -7379,7 +7379,7 @@ class GateioExecutionClient(LiveExecutionClient):
         read it (REC-06). A silently dropped row is a lost execution: the
         engine believes the listing was complete, replaces the missing
         quantity with a commission-less inferred fill, and the venue's trade
-        id — the only key by which a later replay could be recognised — is
+        id — the only key by which a later replay could be recognized — is
         gone (CZ-2, CZ-4, CZ-5). The listing caller turns the raise into
         :class:`FillReportsUnavailable`, which is the one signal that arms the
         engine's brake against squaring positions on an incomplete answer.

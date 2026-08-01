@@ -4,7 +4,7 @@ Gate.io publishes depth as a REST snapshot plus an incremental WebSocket stream
 (``spot.order_book_update`` / ``futures.order_book_update`` /
 ``options.order_book_update``). The snapshot carries an ``id``; every update
 carries the range of update ids it covers, ``U`` (first) to ``u`` (last). The
-documented synchronisation algorithm is:
+documented synchronization algorithm is:
 
 1. subscribe to the incremental channel and buffer the notifications;
 2. fetch the REST snapshot with ``with_id=true`` and remember its ``id``;
@@ -73,7 +73,7 @@ _ZERO: Final[Decimal] = Decimal(0)
 class OrderBookSequenceError(Exception):
     """Raised when the incremental stream is no longer contiguous.
 
-    The local book is left unsynchronised; the caller must fetch a fresh REST
+    The local book is left unsynchronized; the caller must fetch a fresh REST
     snapshot (and, for a venue-driven resync, may also resubscribe) before
     publishing further deltas.
     """
@@ -83,7 +83,7 @@ class SnapshotStaleError(Exception):
     """Raised when a REST snapshot is older than the state the book already holds.
 
     Deliberately **not** a subclass of :class:`OrderBookSequenceError`: a stale
-    snapshot is not a sequence break. The book is still synchronised and needs
+    snapshot is not a sequence break. The book is still synchronized and needs
     nothing at all; the snapshot is simply discarded. This happens when a REST
     request that was already in flight returns after the stream has resynced the
     book on its own (a ``full: true`` message, for example). Applying it would
@@ -102,14 +102,14 @@ def _to_decimal(value: Any) -> Decimal | None:
 
 
 def parse_levels(levels: Iterable[Any] | None) -> list[tuple[Decimal, Decimal]]:
-    """Normalise either supported level container form into ``(price, size)`` pairs.
+    """Normalize either supported level container form into ``(price, size)`` pairs.
 
     Gate.io publishes book levels in two dialects — spot sends
     ``[["price", "amount"], ...]`` while futures, delivery and options send
     ``[{"p": price, "s": size}, ...]`` — on the incremental stream, the periodic
     snapshot channel and the REST snapshot alike. Public because the data
-    client's ``OrderBookDepth10`` path needs the same normalisation without the
-    rest of this module: that channel is self-synchronising, so routing it
+    client's ``OrderBookDepth10`` path needs the same normalization without the
+    rest of this module: that channel is self-synchronizing, so routing it
     through :meth:`GateioOrderBook.apply_snapshot` would drag in sequence,
     buffering and staleness machinery it has no use for, and would raise on spot
     besides, since the spot snapshot names its sequence ``lastUpdateId`` rather
@@ -190,7 +190,7 @@ class GateioOrderBook:
 
     @property
     def is_synced(self) -> bool:
-        """Whether the book is currently synchronised with the venue."""
+        """Whether the book is currently synchronized with the venue."""
         return self._synced
 
     @property
@@ -226,7 +226,7 @@ class GateioOrderBook:
     def overlaps_applied(self) -> int:
         """Notifications whose range straddled the local update id.
 
-        Expected exactly once per resynchronisation (the message that straddles
+        Expected exactly once per resynchronization (the message that straddles
         the snapshot id); a persistently growing counter means the venue is
         replaying ranges.
         """
@@ -328,7 +328,7 @@ class GateioOrderBook:
         ValueError
             If the payload carries no update id.
         SnapshotStaleError
-            If the book is already synchronised at an update id at least as new
+            If the book is already synchronized at an update id at least as new
             as the snapshot's. The book is left untouched and the caller has
             nothing to do.
         OrderBookSequenceError
@@ -376,7 +376,7 @@ class GateioOrderBook:
         """Apply one incremental notification and return the resulting changes.
 
         ``payload`` may be either the full WebSocket message or just its
-        ``result`` object. Before the book is synchronised the notification is
+        ``result`` object. Before the book is synchronized the notification is
         buffered and an empty list is returned.
 
         Returns
@@ -389,7 +389,7 @@ class GateioOrderBook:
         ------
         OrderBookSequenceError
             If the notification starts after the local update id plus one, i.e.
-            updates were lost. The book is marked unsynchronised and the caller
+            updates were lost. The book is marked unsynchronized and the caller
             must resnapshot.
         """
         result = payload.get("result") if "result" in payload else payload
@@ -399,7 +399,7 @@ class GateioOrderBook:
         self._last_apply_was_snapshot = False
 
         # A ``full: true`` message is itself a complete snapshot of the
-        # subscribed depth and resynchronises the book without a REST call.
+        # subscribed depth and resynchronizes the book without a REST call.
         if result.get("full") is True:
             return self._apply_full(result)
 
@@ -523,7 +523,7 @@ class GateioOrderBook:
             )
 
         if first_id < expected:
-            # Straddles the local update id: happens once per resynchronisation
+            # Straddles the local update id: happens once per resynchronization
             # and is safe because level sizes are absolute.
             self._overlaps_applied += 1
 

@@ -142,17 +142,17 @@ Questions belong in the tracker, on the **Question** form
 ([new issue](https://github.com/x03f/nautilustrader-gateio-adapter/issues/new/choose)).
 Blank issues are turned off and Discussions are not enabled on this repository,
 so that form is the route — and a question that turns out to be a defect is
-relabelled rather than turned away.
+relabeled rather than turned away.
 
 ## Code of conduct
 
 Participation here is governed by the
-[Contributor Covenant 2.1](CODE_OF_CONDUCT.md), unmodified. Behaviour that
+[Contributor Covenant 2.1](CODE_OF_CONDUCT.md), unmodified. Behavior that
 violates it is reported through the same private channel as a security problem,
 or as an issue when it does not need to be private; the
 [Enforcement](CODE_OF_CONDUCT.md#enforcement) section has both.
 
-## Licence
+## License
 
 MIT — see [LICENSE](LICENSE). Contributions are accepted under the same license;
 there is no contributor license agreement, and you keep the copyright in what

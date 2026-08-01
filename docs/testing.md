@@ -28,7 +28,7 @@ Requirements: Python >= 3.12, < 3.15, and the `nautilus_trader` range pinned in
 | Errors                      | Typed hierarchy, label-to-error mapping, retry classification, and the capability-gating translation into `WalletNotProvisionedError`                                                                           |
 | REST transport              | Header construction, query encoding, error translation, pacing, retry safety (mutating requests are never replayed), ambiguity reporting                                                                        |
 | REST namespaces             | Path and parameter construction per product, including the `/futures` versus `/delivery` split and the endpoints that refuse to exist on a delivery namespace                                                   |
-| WebSocket transport         | Subscribe and unsubscribe acknowledgement handling, replay after reconnect, backoff schedule, heartbeat and receive-timeout recycling                                                                           |
+| WebSocket transport         | Subscribe and unsubscribe acknowledgment handling, replay after reconnect, backoff schedule, heartbeat and receive-timeout recycling                                                                            |
 | Order books                 | The full synchronization algorithm: buffering, straddle detection, stale-snapshot rejection, gap detection and resync, zero-size deletions, both payload shapes                                                 |
 | Instruments                 | Payload to instrument per product, precision guards, contract multipliers, fee conventions, and the rejection of unrepresentable price scales                                                                   |
 | Instrument provider         | Multi-product loading, filtering of untradable and expired instruments, per-product degradation on an unprovisioned wallet                                                                                      |
@@ -114,6 +114,6 @@ the hole it was shown and left another one level up.
 
 Whether CI does its job is observable where it happens: in the run. A red badge
 on the default branch is the signal, and the release checklist re-verifies the
-artefacts independently of it. What the suite does check is the package —
+artifacts independently of it. What the suite does check is the package —
 including the built wheel and the documented imports resolving from an install
 outside the source tree, which is the failure that once reached a release.
