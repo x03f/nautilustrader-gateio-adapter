@@ -43,6 +43,68 @@ failure worth retrying" the same way the transport answers it internally.
 `error_from_response(status, label, message)`, which builds the right subclass
 from a raw response, lives in `gateio_nt.common.errors`.
 
+## Before the venue: preconditions on the public boundaries
+
+Everything else on this page is about a request that was made. This section is
+about the ones that are refused before they are built, because an argument or a
+configuration cannot mean what it would have to mean.
+
+These checks are stated through NautilusTrader's own `PyCondition`
+(`nautilus_trader.core.correctness`) — the design-by-contract helper the
+built-in Binance, OKX, Deribit and Interactive Brokers adapters use for the same
+purpose. That matters to you for one reason: **`PyCondition` does not raise a
+single exception type**, so the type is part of each boundary's contract rather
+than something to assume.
+
+| Boundary                                                              | Refuses                                                        | Raises      |
+|-----------------------------------------------------------------------|----------------------------------------------------------------|-------------|
+| `validate_products(products, environment)`                            | an empty product set                                            | `ValueError` |
+| `validate_products(products, environment)`                            | a member that is not a `GateioProductType`                      | `ValueError` |
+| `validate_products(products, environment)`                            | a product the environment does not serve                        | `ValueError` |
+| `validate_book_interval_ms`, `validate_snapshot_limit`                | a value outside the discrete set Gate.io serves                 | `ValueError` |
+| `GateioHttpClient(max_retries=…)`                                     | anything below `1`                                              | `ValueError` |
+| `GateioHttpClient(timeout_secs=…)`                                    | zero, negative, `nan`, `inf`                                    | `ValueError` |
+| `gateio_to_instrument_id(product, raw_symbol)`                        | an empty or blank `raw_symbol`                                  | `ValueError` |
+| `gateio_to_instrument_id(product, raw_symbol)`                        | `raw_symbol=None`                                               | `TypeError`  |
+| `instrument_id_to_gateio(instrument_id)`                              | an id with no venue symbol (`""`, `".GATE_IO"`, `"-PERP.…"`)    | `ValueError` |
+| `GateioWalletHttpAPI.transfer(...)`                                   | an endpoint that is not an internal trading wallet              | `ValueError` |
+| `GateioWalletHttpAPI.transfer(...)`                                   | the same wallet on both ends                                    | `ValueError` |
+| `GateioOptionsHttpAPI.cancel_all()`                                   | no `contract` and no `underlying` scope                         | `ValueError` |
+| `GateioFuturesHttpAPI` perpetual-only methods on a delivery namespace | funding rate, dual mode, batch submit, countdown cancel         | `ValueError` |
+| `GateioPrivateWebSocket.subscribe_positions()` on spot                | a channel Gate.io does not have on spot                         | `ValueError` |
+| `GateioPrivateWebSocket` spot-only channels on a derivative           | likewise, in the other direction                                | `ValueError` |
+| `generate_order_status_report(...)`                                   | both `client_order_id` and `venue_order_id` `None`              | `ValueError` |
+
+`TypeError` appears exactly once, and deliberately: `PyCondition.valid_string`
+separates "blank" from "absent" — `""` and `"  "` are values that cannot be a
+symbol (`ValueError`), while `None` is an argument that was never supplied
+(`TypeError`, from the platform's `not_none`). Everything else on this surface
+raises `ValueError`, including the two checks where the platform's own default
+is `TypeError`: `validate_products`' membership check passes the platform's
+`ex_type` hook so that one `except ValueError` around the configuration helpers
+covers all of them, as `configuration.md` promises.
+
+### Who catches these
+
+* **The configuration checks** run inside the client constructors, before any
+  network activity, so a node with a bad configuration fails to start rather
+  than starting wrong. Call the three helpers yourself to check a configuration
+  up front (see [configuration.md](configuration.md)).
+* **The symbology and REST-namespace checks** are yours: you meet them when you
+  drive those helpers directly, which is exactly the "what is yours" row at the
+  bottom of this page.
+* **`generate_order_status_report`'s** refusal is the platform's own documented
+  contract for that method, not this adapter's invention, and it is raised at
+  whoever called it — a caller error, not an order that could not be found, so
+  it is not logged as one.
+* **The subscription paths inside the data client** catch `ValueError` from the
+  venue-set checks, log the refusal against the subscription, and carry on. This
+  is why those particular checks are *not* stated as `PyCondition.is_in`, which
+  raises `KeyError`: a `KeyError` is not a `ValueError`, so it would pass
+  straight through those handlers and end the client task over one unsupported
+  book interval. Where you see a hand-written `raise ValueError` on a boundary
+  in this package, that is the reason, and the code says so at the site.
+
 ## The response hierarchy: `GateioError`
 
 Gate.io API v4 reports failures as a JSON body of the form

@@ -58,6 +58,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from nautilus_trader.core.correctness import PyCondition
+
 from gateio_nt.common.errors import UnsupportedOrderError
 from gateio_nt.http.client import GateioHttpClient
 
@@ -105,11 +107,14 @@ class GateioFuturesHttpAPI:
         return self._base
 
     def _require_perpetual(self, what: str) -> None:
-        if self._delivery:
-            raise ValueError(
-                f"{what} is not available for delivery futures "
-                f"(Gate.io only exposes it under /futures/{{settle}})"
-            )
+        # Precondition of the perpetual-only methods on this namespace, stated
+        # once in the platform's vocabulary; `is_false` raises `ValueError`, as
+        # this did (installed core/correctness.pyx:83-90).
+        PyCondition.is_false(
+            self._delivery,
+            f"{what} is not available for delivery futures "
+            f"(Gate.io only exposes it under /futures/{{settle}})",
+        )
 
     # -- public market data ------------------------------------------------
 

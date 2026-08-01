@@ -72,6 +72,7 @@ from types import TracebackType
 from typing import Any, Final
 
 import httpx
+from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.live.cancellation import DEFAULT_FUTURE_CANCELLATION_TIMEOUT
 
 from gateio_nt.common.constants import (
@@ -255,25 +256,31 @@ class GateioHttpClient:
         self._api_key = api_key
         self._api_secret = api_secret
         self.base_url = base_url
-        if max_retries < 1:
-            # This used to be `max(1, max_retries)`. Silently promoting the
-            # operator's number meant a deployment that asked for no retries got
-            # one attempt and nothing said so; and the config layer now refuses
-            # the same value outright, so clamping here would leave the two
-            # doors disagreeing about what `max_retries=0` means.
+        # This used to be `max(1, max_retries)`. Silently promoting the
+        # operator's number meant a deployment that asked for no retries got one
+        # attempt and nothing said so; and the config layer now refuses the same
+        # value outright, so clamping here would leave the two doors disagreeing
+        # about what `max_retries=0` means. "At least 1" for a count is exactly
+        # `positive_int`, which raises `ValueError` as this constructor already
+        # did (installed core/correctness.pyx:618-625).
+        PyCondition.positive_int(max_retries, "max_retries")
+        # Same reasoning as `max_retries`, and the same door: this constructor
+        # is public and the README drives it directly. Zero is not "no limit" to
+        # httpx, it is "already expired", so every request would be refused
+        # before it left the process and reported as `NETWORK_ERROR` — a venue
+        # failure the venue never had. `positive` covers zero, negatives and
+        # `nan` (`nan > 0` is false).
+        PyCondition.positive(timeout_secs, "timeout_secs")
+        if not math.isfinite(timeout_secs):
+            # `inf` is the one value `positive` admits and httpx cannot use as a
+            # deadline: verified against the installed platform, `PyCondition.
+            # positive(float("inf"), ...)` passes, because the check is
+            # `value > 0` (core/correctness.pyx:589). Finiteness is a
+            # requirement of the transport, not an ordering bound, so the
+            # platform has no vocabulary for it and this stays our own.
             raise ValueError(
-                f"`max_retries` must be at least 1 (the attempt loop runs it as a count), "
-                f"was {max_retries}",
-            )
-        if not math.isfinite(timeout_secs) or timeout_secs <= 0:
-            # Same reasoning as `max_retries`, and the same door: this
-            # constructor is public and the README drives it directly. Zero is
-            # not "no limit" to httpx, it is "already expired", so every request
-            # would be refused before it left the process and reported as
-            # `NETWORK_ERROR` — a venue failure the venue never had.
-            raise ValueError(
-                f"`timeout_secs` must be a finite number above 0 (0 expires every request "
-                f"before it is sent), was {timeout_secs!r}",
+                f"`timeout_secs` must be a finite number (an infinite deadline is not a "
+                f"deadline httpx can arm), was {timeout_secs!r}",
             )
         self.max_retries = max_retries
         self.order_expiry_ms = order_expiry_ms

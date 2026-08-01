@@ -55,6 +55,8 @@ import asyncio
 from collections.abc import Callable, Sequence
 from typing import Any, Final
 
+from nautilus_trader.core.correctness import PyCondition
+
 from gateio_nt.common.constants import CHANNEL_PREFIX, ws_url
 from gateio_nt.common.enums import GateioProductType
 from gateio_nt.websocket.client import GateioWebSocketClient
@@ -214,8 +216,15 @@ class GateioPrivateWebSocket:
         symbols: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Subscribe to position updates (futures, delivery and options only)."""
-        if self.product.is_spot:
-            raise ValueError("spot has no position channel; positions exist on derivatives only")
+        # The predicate is Gate.io's (spot keeps no venue-side position), but
+        # "refuse when this predicate holds, with this message" is the
+        # platform's `is_false` — the same shape the Binance client uses for its
+        # own venue predicates (installed adapters/binance/execution.py:381-384,
+        # futures/execution.py:272). It raises `ValueError`, as this did.
+        PyCondition.is_false(
+            self.product.is_spot,
+            "spot has no position channel; positions exist on derivatives only",
+        )
         return await self._subscribe_contract_scoped(f"{self.prefix}.positions", user_id, symbols)
 
     async def unsubscribe_positions(
@@ -223,21 +232,29 @@ class GateioPrivateWebSocket:
         user_id: str | int | None = None,
         symbols: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        if self.product.is_spot:
-            raise ValueError("spot has no position channel; positions exist on derivatives only")
+        PyCondition.is_false(
+            self.product.is_spot,
+            "spot has no position channel; positions exist on derivatives only",
+        )
         return await self._unsubscribe_contract_scoped(f"{self.prefix}.positions", user_id, symbols)
 
     # -- internals ---------------------------------------------------------
 
     def _require_spot(self, channel: str) -> None:
-        if not self.product.is_spot:
-            raise ValueError(
-                f"{channel} is a spot channel and is unavailable on {self.product.value}"
-            )
+        # Called from the spot-only subscribe methods above; this is their
+        # precondition, stated once.
+        PyCondition.is_true(
+            self.product.is_spot,
+            f"{channel} is a spot channel and is unavailable on {self.product.value}",
+        )
 
     def _resolve_user_id(self, user_id: str | int | None) -> str:
         resolved = str(user_id) if user_id is not None else self.user_id
         if not resolved:
+            # Not `PyCondition.valid_string`. What is missing is not an argument
+            # the caller mistyped but an account fact the caller may not know it
+            # needs, and the message has to carry where to get it; the platform
+            # check's message is fixed at "string was invalid".
             raise ValueError(
                 f"{self.product.value} private channels require the account's numeric user id "
                 f"(available from GET /spot/fee)"

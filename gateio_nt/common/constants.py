@@ -51,7 +51,13 @@ WS_URLS: Final[dict[GateioProductType, str]] = {
 
 
 def ws_url(product: GateioProductType, testnet: bool = False) -> str:
-    """Return the WebSocket endpoint for ``product``."""
+    """Return the WebSocket endpoint for ``product``.
+
+    The refusal is a product-and-environment pairing, not an argument fault:
+    every argument here is individually valid and only the combination has no
+    endpoint. The platform's contract vocabulary has no shape for that, so this
+    stays a hand-written ``ValueError`` naming the product.
+    """
     if testnet:
         if product is GateioProductType.SPOT:
             return GATEIO_WS_SPOT_TESTNET

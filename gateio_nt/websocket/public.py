@@ -341,6 +341,20 @@ class GateioPublicWebSocket:
         return await self.client.unsubscribe(self.order_book_update_channel, payload)
 
     def _book_update_payload(self, symbol: str, interval: str, level: int | None) -> list[str]:
+        # The set checks in this method and in `_book_snapshot_payload` and
+        # `_candles_payload` are deliberately NOT `PyCondition.is_in`, for two
+        # reasons that are both about what the caller then does:
+        #
+        # * `is_in` raises `KeyError` (installed core/correctness.pyx:460-464),
+        #   and `KeyError` is not a `ValueError`. Every caller of these payload
+        #   builders is a subscription path in `gateio_nt.data` that catches
+        #   `(GateioError, ValueError)` to log the refusal and carry on; a
+        #   `KeyError` would escape that handler and take down the client task
+        #   over one unsupported interval.
+        # * The admissible set is per product and per channel — the answer to
+        #   "what may I ask for instead" is different for spot, perpetual,
+        #   delivery and options — so the message has to enumerate it. `is_in`
+        #   reports only the rejected element and a collection *name*.
         intervals = _UPDATE_INTERVALS[self.product]
         if interval not in intervals:
             raise ValueError(

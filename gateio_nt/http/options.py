@@ -36,6 +36,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from nautilus_trader.core.correctness import PyCondition
+
 from gateio_nt.http.client import GateioHttpClient
 
 
@@ -428,11 +430,11 @@ class GateioOptionsHttpAPI:
         ValueError
             If neither ``contract`` nor ``underlying`` is given.
         """
-        if not contract and not underlying:
-            raise ValueError(
-                "options cancel_all requires a scope: pass 'contract' or 'underlying'. "
-                "Gate.io would otherwise cancel every resting option order in the account"
-            )
+        PyCondition.is_true(
+            bool(contract or underlying),
+            "options cancel_all requires a scope: pass 'contract' or 'underlying'. "
+            "Gate.io would otherwise cancel every resting option order in the account",
+        )
         params: dict[str, Any] = {
             "contract": contract,
             "underlying": underlying,

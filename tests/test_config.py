@@ -147,13 +147,27 @@ class TestResolveWsUrl:
 
 class TestValidateProducts:
     def test_empty_tuple_is_rejected(self):
-        with pytest.raises(ValueError, match="at least one Gate.io product"):
+        with pytest.raises(ValueError, match="'products' collection was empty"):
             validate_products((), MAINNET)
 
     @pytest.mark.parametrize("bad", ["SPOT", "spot", 1, None])
     def test_non_product_members_are_rejected(self, bad):
-        with pytest.raises(ValueError, match="GateioProductType members"):
+        with pytest.raises(ValueError, match="'products' argument not of type"):
             validate_products((bad,), MAINNET)
+
+    @pytest.mark.parametrize("bad", ["SPOT", 1, None])
+    def test_a_non_product_member_still_raises_value_error(self, bad):
+        """The type stays ``ValueError`` on purpose.
+
+        ``PyCondition.type`` defaults to ``TypeError``; this call passes
+        ``ex_type=ValueError`` because ``docs/configuration.md`` tells a caller
+        checking a configuration up front to write one ``except ValueError``
+        around all three helpers. A bare ``PyCondition.type`` here would sail
+        straight through that handler.
+        """
+        with pytest.raises(ValueError):
+            validate_products((bad,), MAINNET)
+        assert not issubclass(TypeError, ValueError)
 
     def test_duplicates_are_removed_and_order_preserved(self):
         products = (

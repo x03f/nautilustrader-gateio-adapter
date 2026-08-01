@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Any, Final
 
+from nautilus_trader.core.correctness import PyCondition
+
 from gateio_nt.http.client import GateioHttpClient
 
 #: The account names accepted on either end of an internal transfer.
@@ -75,6 +77,12 @@ class GateioWalletHttpAPI:
 
     @staticmethod
     def _validate_account(name: str, role: str) -> str:
+        # Deliberately not `PyCondition.is_in`. This is the module's stated
+        # "no external destination can be expressed" property, and the value
+        # refused has to be reported together with the wallets that are
+        # allowed — `is_in` names neither, and it raises `KeyError` (installed
+        # core/correctness.pyx:460-464), which `transfer`'s documented
+        # `ValueError` contract does not admit.
         if not isinstance(name, str) or name not in ALLOWED_TRANSFER_ACCOUNTS:
             allowed = ", ".join(sorted(ALLOWED_TRANSFER_ACCOUNTS))
             raise ValueError(
@@ -149,8 +157,10 @@ class GateioWalletHttpAPI:
         """
         source = self._validate_account(from_, "source")
         destination = self._validate_account(to, "destination")
-        if source == destination:
-            raise ValueError(f"transfer source and destination are the same wallet: {source!r}")
+        # "These two must differ" is the platform's `not_equal`, which raises
+        # `ValueError` and names both arguments and their values (installed
+        # core/correctness.pyx:342-350).
+        PyCondition.not_equal(source, destination, "from_", "to")
 
         needs_settle = source in _SETTLE_REQUIRED or destination in _SETTLE_REQUIRED
         if needs_settle and not settle:
