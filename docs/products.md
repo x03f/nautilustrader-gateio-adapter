@@ -565,13 +565,16 @@ the link from the venue's own listing.
 | Options underlying streams        | -    | -         | -       | -        | ✓       | `options.ul_*` through `GateioPublicWebSocket.client`, not routed into the data engine.                                    | Not wired into the data client; the transport's generic `GateioWebSocketClient.subscribe` underneath is unit-tested |
 
 One qualification on that status column, because the row is graded once and the
-products are not equal. The offline data tests build a `GateioDataClient`
-configured for spot, the USDT perpetual and options, and drive subscriptions and
-payloads through it. For inverse perpetuals and delivery futures what the suite
-asserts is narrower — the instrument parsers, and the per-product channel names,
-depth limits and push intervals in `nautilus_gateio.websocket.public` — while
-the client's own subscription path is never run with those products. The
-[validation status](validation.md) page records the same split.
+products are not equal, and the split is not the same for every behavior. The
+subscription and payload tests drive a `GateioDataClient` configured for spot,
+the USDT perpetual and options; settlement is exercised on a client configured
+for every product, including a delivery contract, so `_watch_instrument_close`
+does run for delivery futures and options. What no offline test drives through
+the client is the subscription path for an **inverse** perpetual: there the
+suite asserts the instrument parser and the per-product channel names, depth
+limits and push intervals in `nautilus_gateio.websocket.public`, and stops
+there. The [validation status](validation.md) page grades each behavior on the
+[evidence ladder](validation.md#the-evidence-ladder) rather than by product.
 
 An option's greeks and implied volatilities arrive with the ticker row and reach
 a strategy as `GateioTicker` fields, which are the venue's own strings. They are

@@ -78,7 +78,7 @@ Where to go from there:
 | Next                                | Where                                                                                             | Needs                             |
 |-------------------------------------|---------------------------------------------------------------------------------------------------|-----------------------------------|
 | The same data inside a node         | [A live `TradingNode`](#a-live-tradingnode)                                                       | Nothing                           |
-| Read a real account, place no order | [Credentials](#credentials), [`examples/05_account_readonly.py`](examples/05_account_readonly.py) | `GATE_API_KEY`, `GATE_API_SECRET` |
+| Read a real account, place no order | [Credentials](#credentials), [`examples/05_account_readonly.py`](examples/05_account_readonly.py) | A testnet key and secret, or `GATEIO_ENVIRONMENT=mainnet` with a mainnet pair |
 | One order, on the testnet           | [One order on the testnet](#one-order-on-the-testnet)                                             | A testnet key and secret          |
 | What the venue has actually seen    | [Status](#status), [docs/validation.md](docs/validation.md)                                       | Nothing                           |
 | What surprises people first         | [What will bite you](#what-will-bite-you)                                                         | Nothing                           |

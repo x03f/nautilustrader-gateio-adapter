@@ -416,10 +416,13 @@ on the default `spot` ledger and armed price-triggered orders on the buy side,
 which is the `normal` encoding.
 
 The other three values are **implemented**. The mode-to-string mapping is
-unit-tested (`tests/test_enums.py`) and the refusal of a cross-margin
-price-triggered order is unit-tested (`tests/test_execution_orders.py`), but no
-test in this repository asserts the `account` field of an outgoing order body for
-any mode, and no order on any margin ledger has reached the venue.
+unit-tested (`tests/test_enums.py`), and so is the refusal of a cross-margin
+price-triggered order (`tests/test_execution_orders.py`). The `account` field of
+an outgoing order body is asserted on the wire, but only for the default ledger —
+`"account": "spot"` on a plain order and `"account": "normal"` inside a
+price-triggered one — so what the suite pins is that the field is sent and where
+it sits, not that a margin mode reaches the venue as the right string. No order
+on any margin ledger has reached Gate.io.
 
 Two boundaries are easy to trip over:
 
