@@ -56,6 +56,7 @@ been observed to serve this path through the adapter.
 | Historical bars over REST                                            | unit-tested (see note)                                         | spot                                                   |
 | Historical trades over REST                                          | implemented                                                    | spot                                                   |
 | Mark price, index price, funding rate                                | unit-tested                                                    | USDT perpetual                                         |
+| `OptionGreeks` from `options.contract_tickers`                       | unit-tested                                                    | —                                                      |
 | Historical funding rates over REST                                   | unit-tested                                                    | USDT perpetual                                         |
 | Book resynchronization after a reconnect                             | unit-tested (see note)                                         | —                                                      |
 | `OrderBookDepth10` from the periodic `*.order_book` snapshot channel | unit-tested                                                    | —                                                      |

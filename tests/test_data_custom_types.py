@@ -726,6 +726,30 @@ def test_a_greek_that_is_not_a_finite_number_publishes_nothing(
     assert harness.client._published["option_greeks_incomplete"] == 1
 
 
+def test_a_row_of_zeros_is_published_because_zero_is_what_it_says(
+    harness: Harness,
+) -> None:
+    """The other half of the rule the two tests above state.
+
+    Gate.io sends ``"0"`` on every numeric field of a contract that has not
+    traded, and a far out-of-the-money option really does have a delta near
+    zero. Refusing a value because it is falsy would drop exactly the contracts
+    an options strategy watches for a first quote, and would drop them silently.
+    """
+    harness.client._ticker_subs[OPTION_ID] = {"greeks"}
+
+    harness.client._handle_ws_message(
+        GateioProductType.OPT,
+        options_ticker_message(**dict.fromkeys(GREEK_ROW, "0")),
+    )
+
+    (published,) = greeks(harness)
+    assert published.delta == 0.0
+    assert published.rho == 0.0
+    assert published.mark_iv == 0.0
+    assert published.open_interest == 0.0
+
+
 def test_an_absent_optional_field_is_none_rather_than_zero(harness: Harness) -> None:
     """Zero implied volatility and zero open interest are both real statements.
 
