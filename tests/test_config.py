@@ -8,6 +8,7 @@ are cleared for every test by an autouse fixture in ``conftest.py``.
 from __future__ import annotations
 
 import pytest
+from nautilus_trader.common.secure import mask_api_key
 
 from nautilus_gateio.common.constants import (
     DEFAULT_HTTP_TIMEOUT_SECS,
@@ -351,14 +352,33 @@ class TestResolveCredentials:
 
 
 class TestMaskCredential:
-    def test_unset_credential(self):
-        assert mask("") == "<unset>"
+    """RN-1: the fingerprint helper is the platform's, not a copy of it."""
 
-    def test_short_credential_is_fully_hidden(self):
-        assert mask("12345678") == "*" * 8
+    def test_it_is_the_platform_helper_itself(self):
+        """No second implementation exists to drift away from the first.
+
+        The package used to carry its own four-plus-two masker. Asserting
+        identity rather than equal output is deliberate: equal output today is
+        what a copy also has.
+        """
+        assert mask is mask_api_key
+
+    def test_masking_does_not_disclose_the_length_of_a_short_secret(self):
+        """The damage the hand-written version did.
+
+        It rendered one ``*`` per character, so the mask of a credential too
+        short to fingerprint still published how long it was — and the length of
+        a secret is the first thing an attacker would like to be told. Every
+        secret below the fingerprint threshold must mask to the same string.
+        """
+        assert mask("1234") == mask("1234567") == mask("12345678")
+
+    def test_unset_credential_is_named_as_such(self):
+        """Running with no credentials is a supported state, not a blank field."""
+        assert mask("") == "<empty>"
 
     def test_long_credential_shows_only_a_fingerprint(self):
         secret = "abcdefghijklmnopqrstuvwxyz"
         masked = mask(secret)
-        assert masked == "abcd...yz"
+        assert masked == "abcd...wxyz"
         assert secret not in masked
