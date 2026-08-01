@@ -56,7 +56,8 @@ deployment can stay where it is:
 To stay on it, pin the tag:
 
 ```bash
-pip install "gateio-nt-community @ git+https://github.com/x03f/gateio-nt-community@v0.1.0"
+# The tag predates the rename, so it still builds the old distribution name.
+pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/gateio-nt-community@v0.1.0"
 ```
 
 To move off it, see the README's

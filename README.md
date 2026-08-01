@@ -130,7 +130,8 @@ That line installs the **default branch**, which is ahead of the published relea
 `0.2.0a2.dev0`, and is what the pages here describe. To install the release instead, pin the tag:
 
 ```bash
-pip install "gateio-nt-community @ git+https://github.com/x03f/gateio-nt-community@v0.2.0a1"
+# The tag predates the rename, so it still builds the old distribution name.
+pip install "nautilustrader-gateio-adapter @ git+https://github.com/x03f/gateio-nt-community@v0.2.0a1"
 ```
 
 The package is not on PyPI, so a bare `pip install gateio-nt-community` finds nothing, and
