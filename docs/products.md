@@ -414,14 +414,19 @@ and lets the *fired* order carry its own `gtc` or `ioc`. The `GTC` rows and the
 | `display_qty` (conditional orders)       | denied                                                          | denied                                                                    | denied                      | Not applicable              | Implemented and mock-tested                                                                                                                     |
 | `quote_quantity`                         | market buy only; denied on a market sell and on any limit order | denied                                                                    | denied                      | denied                      | Implemented and mock-tested                                                                                                                     |
 | Trigger reference price                  | `LAST_PRICE`/`DEFAULT` only; anything else denied               | `LAST_PRICE`/`DEFAULT`, `MARK_PRICE`, `INDEX_PRICE`; anything else denied | as perpetual                | Not applicable              | Implemented and mock-tested (the accepted types and both refusals); implemented, mainnet validation pending (the mark and index request bodies) |
-| Hedge (dual) position mode               | Not applicable                                                  | refused at connect                                                        | Not applicable              | Not applicable              | Unsupported                                                                                                                                     |
+| Hedge (dual) position mode               | Not applicable                                                  | refused at connect, as is any answer that does not establish the mode     | Not applicable              | Not applicable              | Unsupported                                                                                                                                     |
 
 Reduce-only is refused on spot rather than dropped: it is a derivatives concept,
 and an order that quietly lost it would mean something different from the one
 that was requested. Hedge mode is detected at connect and the client refuses to
 start, because NautilusTrader nets positions per instrument and a venue holding
 a separate long and short leg for one contract cannot be reconciled; the adapter
-never switches the mode itself.
+never switches the mode itself. The refusal is on the venue's answer rather than
+on a list of hedge spellings: a wallet that states no mode, or one the venue
+declines to answer for, is refused on the same grounds, since an unread mode is
+not a one-way mode. The exemption is the wallet Gate.io has not created yet,
+which holds nothing to hedge. The full split is in
+[execution.md](execution.md#account-routing).
 
 ## What is refused rather than translated
 

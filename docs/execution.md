@@ -79,7 +79,7 @@ routed through it.
 | Account id                 | `GATE_IO-master`                                                                                                                                                                                                                                                                                         |
 | Account type               | `CASH` when spot is the only product **and** `spot_account_mode=SPOT`; `MARGIN` in every other combination                                                                                                                                                                                               |
 | OMS type                   | `NETTING`                                                                                                                                                                                                                                                                                                |
-| Hedge (dual) position mode | unsupported — detected at connect and refused with an explanatory error                                                                                                                                                                                                                                  |
+| Hedge (dual) position mode | unsupported — the client starts only against an account the venue states is one-way; hedge mode, and any answer that does not establish the mode, are refused at connect with an explanatory error                                                                                                       |
 | Balances                   | Aggregated per currency across the wallets of the enabled products                                                                                                                                                                                                                                       |
 | Margins                    | Scoped the way the venue holds the collateral: a cross-margined position (Gate.io `leverage="0"`) is reported account-wide, keyed by its settlement currency; an isolated position is reported per instrument. The options wallet reports one account-wide figure. Published only for a `MARGIN` account |
 | `Strategy.query_account()` | Re-reads every enabled product's wallet over REST and publishes a fresh `AccountState`. Implemented and mock-tested                                                                                                                                                                                      |
@@ -113,12 +113,30 @@ never publish. See
 [configuration.md](configuration.md#which-ledger-a-spot-order-names).
 
 Position mode is checked at connect, once per perpetual product (delivery
-futures and options have no hedge mode, and the check is skipped with a warning
-when the wallet is not provisioned at all). Nautilus nets positions per
-instrument, so an account holding separate long and short legs of the same
-contract cannot be reconciled; the client raises with the venue-side remedy
-spelled out and never changes the setting itself. Changing an account-wide venue
-setting on the operator's behalf is not this client's decision to make.
+futures and options have no hedge mode). Nautilus nets positions per instrument,
+so an account holding separate long and short legs of the same contract cannot
+be reconciled; the client raises with the venue-side remedy spelled out and
+never changes the setting itself. Changing an account-wide venue setting on the
+operator's behalf is not this client's decision to make.
+
+The gate is on the venue's answer, not on the absence of a hedge spelling: an
+unread mode is not a one-way mode, so **only** `position_mode: "single"` starts
+the client. `GET /futures/{settle}/accounts` splits three ways, and the start
+survives one of them:
+
+| The wallet answers                                                                     | What follows                                                                                                                                             |
+|----------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `position_mode: "single"`, `in_dual_mode` false or absent                              | the client starts                                                                                                                                        |
+| any other mode, or a truthy `in_dual_mode`                                             | refused, naming the value the venue gave and the `dual_mode` endpoint that changes it                                                                    |
+| no mode at all — the field missing, `null`, `""`, `0`, `false`, or a non-object answer | refused, naming what the wallet actually returned; the mode was never established, and reading silence as one-way is how a hedged account starts trading  |
+| `USER_NOT_FOUND`                                                                       | skipped for that product with a warning, and the remaining products are still checked: Gate.io creates the wallet on the first transfer in, and a wallet that does not exist holds no legs to hedge |
+| `FORBIDDEN`, `INVALID_UNIFIED_ACCOUNT`, `UNIFIED_ACCOUNT_NOT_ACTIVATED`                | refused: the venue rejected the question rather than answering it, and none of the three passes on its own — each names a standing property of the key or of the account |
+
+A transient failure (a 5xx, a 429, a timed-out request — whatever
+`should_retry` reads as transient) also stops the start, because it too leaves
+the mode unread, but it reaches the caller as the venue's own error rather than
+as this refusal: an error a supervisor can retry has to stay retryable, and an
+operator must not be sent to switch off a hedge mode that was never reported.
 
 Gate.io keeps a **separate wallet per product**, and funds never move between
 them implicitly. The client logs a warning at startup so this is never a

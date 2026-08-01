@@ -163,6 +163,27 @@ and **Changed**.
   longer describe the registration, and no longer carry the *mock-tested* status
   it stood on.
 
+- **A position mode the client could not read started it anyway.** The connect
+  gate refused hedge (dual) mode but reached the same conclusion as "one-way"
+  from an answer that established nothing: `str(account.get("position_mode") or
+  "single")` read a missing field, `null`, `""`, `0` and `false` as `single`, and
+  a wallet the venue declined to answer for at all — `FORBIDDEN`,
+  `INVALID_UNIFIED_ACCOUNT`, `UNIFIED_ACCOUNT_NOT_ACTIVATED`, none of which
+  passes with time — was skipped with a warning. On all seven the node connected
+  in full, opened its private stream and traded against an account whose
+  position model it had never confirmed matched its own. **Behaviour change,
+  stricter:** the client now starts only against a wallet the venue states is
+  one-way, and refuses otherwise with a message naming what the wallet actually
+  returned, the endpoint to check and the key permission to grant. Two things
+  are deliberately unchanged: a futures wallet Gate.io has not created yet
+  (`USER_NOT_FOUND`) still skips that one product with a warning and lets the
+  remaining products be checked, because a wallet that does not exist holds no
+  legs to hedge; and a transient failure (a 5xx, a 429, a timed-out request)
+  still stops the start as the venue's own retryable error rather than as this
+  refusal. A key that lacks futures read permission on a configured perpetual
+  product will now fail to start where it previously ran — grant the permission,
+  or drop that product from `products`.
+
 - **A published `GateioTicker` reached no subscriber.** The row was handed to
   `_handle_data` unwrapped, and `DataEngine` dispatches a venue-native type only
   through `CustomData`: anything else falls to `Cannot handle data: unrecognized

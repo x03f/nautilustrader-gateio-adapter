@@ -358,7 +358,11 @@ than code.
   estimated quantity that could leave the order open forever or make the engine discard a fill; see
   [docs/execution.md](docs/execution.md#fills).
 - **Position mode is one-way** (`OmsType.NETTING`). Hedge mode is detected at connect and refused
-  with an explanatory error, never switched off for you.
+  with an explanatory error, never switched off for you. So is an answer that does not establish the
+  mode — a blank `position_mode`, or a wallet the key may not read (`FORBIDDEN`) — because an unread
+  mode is not a one-way mode. The one exception is a futures wallet Gate.io has not created yet
+  (`USER_NOT_FOUND`): it holds no positions, so that product is skipped with a warning and the rest
+  are still checked. See [docs/execution.md](docs/execution.md#account-routing).
 
 ## One order on the testnet
 
@@ -697,7 +701,7 @@ recorded run is not evidence of stability; see
 | Private WebSocket order and fill lifecycle | ✓    | ✓    | ✓       | ✓        | ✓       | -                    | Recorded runs confirm the outcomes, not this transport in isolation.                          |
 | Order, fill and position reports           | ✓    | ✓    | ✓       | ✓        | ✓       | Spot, USDT perpetual | A fresh node read an open perpetual position back. Order adoption has no live run.            |
 | Internal wallet transfers                  | ✓    | ✓    | ✓       | ✓        | ✓       | -                    | Between the account's own trading wallets only.                                               |
-| Hedge (dual) position mode                 | -    | -    | -       | -        | -       | -                    | *Not supported.* Detected at connect and refused, never switched.                             |
+| Hedge (dual) position mode                 | -    | -    | -       | -        | -       | -                    | *Not supported.* Only a one-way answer starts the client; hedge mode and an unreadable mode are both refused at connect, never switched. |
 
 ### Accounts and margin
 
