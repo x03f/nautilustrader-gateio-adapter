@@ -243,6 +243,8 @@ class ExecHarness:
             handler=self.account_states.append,
         )
 
+        self.transport = StubApi(sync_time=0)
+
         self.client = GateioExecutionClient(
             loop=self.loop,
             client_id=ClientId(GATEIO_CLIENT_ID.value),
@@ -250,7 +252,14 @@ class ExecHarness:
             cache=self.cache,
             clock=self.clock,
             instrument_provider=self.provider,
-            http_client=StubApi(),
+            # `sync_time` answers an offset in milliseconds, not a listing, so it
+            # is the one transport call the "unconfigured means empty list"
+            # default gets wrong: `_connect` reads the venue clock and takes the
+            # magnitude of what comes back. Zero is the honest stand-in for a
+            # host whose clock agrees with the venue; a test that wants the
+            # unread-clock path sets `transport.responses["sync_time"]` to the
+            # error the venue would raise.
+            http_client=self.transport,
             config=GateioExecClientConfig(
                 api_key="test-key",
                 api_secret="test-secret",
