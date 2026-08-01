@@ -49,15 +49,22 @@ def resolve_credentials(
 
 #: Render a credential as a short fingerprint that is safe to log.
 #:
-#: This *is* NautilusTrader's own helper, exported under the name this package
-#: documents. It is not wrapped, because no Gate.io requirement survives that it
-#: fails to express: it renders ``<empty>`` for an absent credential — which
-#: this adapter needs, since running with no credentials at all is a supported
-#: state for public market data — and a fixed ``***`` for a secret short enough
-#: that a fingerprint would give it away. Four in-tree adapters log through it.
+#: This *is* ``nautilus_trader.common.secure.mask_api_key``, exported under the
+#: name this package documents. Two maskers exist in NautilusTrader 1.230 and
+#: they disagree at the edges; this is the pure-Python one, which the OKX and
+#: Deribit adapters log through (four call sites between them). The other lives
+#: in ``core.nautilus_pyo3`` and is what Binance uses; it renders an absent
+#: credential as the empty string and pads a short one to its own length, so it
+#: would lose both properties this adapter wants — a *named* absent case, since
+#: running with no credentials at all is a supported state for public market
+#: data, and a fixed ``***`` that does not publish how long a short secret is.
 #:
-#: The hand-written version this replaces differed only in ways that were worse:
-#: it padded a short secret to its own length, disclosing how long the credential
-#: was, and it named the absent case ``<unset>``, a spelling nothing else in the
-#: platform uses.
+#: One thing did get wider, and it is stated here rather than left to be found.
+#: For a credential longer than eight characters the hand-written version this
+#: replaces showed four leading and **two** trailing characters
+#: (``abcd...yz``); this one shows four and **four** (``abcd...wxyz``). A
+#: Gate.io key is 32 hex characters and a secret 64, so the fingerprint now
+#: discloses eight of them instead of six. That is the whole of the change in
+#: what reaches a log, and ``tests/test_config.py`` pins it so it cannot widen
+#: again without a test failing.
 mask = mask_api_key

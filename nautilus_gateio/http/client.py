@@ -195,11 +195,19 @@ class GateioHttpClient:
         Per-request timeout.
     max_retries : int
         Total attempts for a request whose replay is provably safe; see
-        `Retry safety`_. Mutating requests are not replayed regardless.
+        `Retry safety`_. Mutating requests are not replayed regardless. Must be
+        at least ``1``: the attempt loop runs ``max_retries`` times, so ``0``
+        means the request is never sent, and the caller is then told
+        ``TOO_MANY_REQUESTS`` about a request that never left the process.
     order_expiry_ms : int
         Submission deadline attached to order-mutating requests via
         ``x-gate-exptime``. Applied only after :meth:`sync_time` has measured
         the venue clock offset; set to ``0`` to disable the header entirely.
+
+    Raises
+    ------
+    ValueError
+        If ``max_retries`` is below ``1``.
     """
 
     def __init__(
@@ -215,7 +223,17 @@ class GateioHttpClient:
         self._api_key = api_key
         self._api_secret = api_secret
         self.base_url = base_url
-        self.max_retries = max(1, max_retries)
+        if max_retries < 1:
+            # This used to be `max(1, max_retries)`. Silently promoting the
+            # operator's number meant a deployment that asked for no retries got
+            # one attempt and nothing said so; and the config layer now refuses
+            # the same value outright, so clamping here would leave the two
+            # doors disagreeing about what `max_retries=0` means.
+            raise ValueError(
+                f"`max_retries` must be at least 1 (the attempt loop runs it as a count), "
+                f"was {max_retries}",
+            )
+        self.max_retries = max_retries
         self.order_expiry_ms = order_expiry_ms
         self._limiter = RateLimiter(max_requests_per_second)
         self._client = httpx.AsyncClient(

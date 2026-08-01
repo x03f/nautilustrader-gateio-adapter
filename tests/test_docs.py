@@ -641,9 +641,31 @@ class TestReleaseArtefactHygiene:
         assert re.search(r"rm -rf dist/ build/ \*\.egg-info", text), (
             "docs/releasing.md does not tell the releaser to clean dist/ first"
         )
-        assert "twine upload dist/nautilustrader_gateio_adapter-<version>*" in text
+        assert re.search(r"twine upload dist/<[a-z_]+>-<version>\*", text), (
+            "docs/releasing.md does not show an upload pinned to one version's files"
+        )
         assert "twine upload dist/*" not in text, (
             "docs/releasing.md still recommends a bare upload glob"
+        )
+
+    def test_no_document_tells_the_releaser_to_claim_the_current_pypi_name(self) -> None:
+        """A PyPI name is never released once claimed.
+
+        The current distribution name uses the NautilusTrader trademark and is
+        to be replaced by `gateio-nt-community`. Uploading under the present
+        name would be irreversible, so no page may spell out the command that
+        does it.
+        """
+        offenders = [
+            str(page.relative_to(REPO))
+            for page in _doc_pages()
+            if re.search(
+                r"twine upload\s+\S*nautilustrader[-_]gateio[-_]adapter",
+                page.read_text(encoding="utf-8"),
+            )
+        ]
+        assert not offenders, (
+            f"an upload of the trademark-infringing name is spelled out in: {offenders}"
         )
 
     def test_no_document_recommends_a_bare_upload_glob(self) -> None:

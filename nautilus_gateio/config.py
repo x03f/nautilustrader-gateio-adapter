@@ -22,14 +22,33 @@ products together with ``environment="testnet"`` is rejected by the client.
 Validation
 ----------
 Numeric fields carry NautilusTrader's constrained types (``PositiveInt``,
-``PositiveFloat``). Both configuration classes are ``msgspec`` structs and a
-declarative configuration reaches them through ``ImportableConfig.create()``,
-which *decodes* them — so a timeout of ``0`` or a negative retry count is
-refused at that boundary, naming the field, instead of being accepted and
-surfacing later as a client whose every request expires. Two fields are
+``PositiveFloat``, ``NonNegativeInt``, ``NonNegativeFloat``). Two fields are
 non-negative rather than positive, because ``0`` already means something here:
 it disables the instrument reload task and the account poll respectively, and
 that is documented behaviour, not a mistake to catch.
+
+A constrained type alone is not enough, because it is a ``msgspec`` constraint
+and ``msgspec`` applies those when it *decodes*. Writing
+``GateioExecClientConfig(max_retries=0)`` in Python never decodes anything, and
+that is the form the README, this package's examples and
+``docs/configuration.md`` are written in; the declarative
+``ImportableConfig`` form is the rarer one. So each class also runs
+:func:`enforce_field_bounds` from ``__post_init__``, which ``msgspec`` calls
+after construction *and* after decoding. A frozen struct can do this: it is
+forbidden from assigning to itself, not from reading itself, and
+``KrakenExecClientConfig`` in NautilusTrader 1.230 validates the same way.
+
+``enforce_field_bounds`` does not restate the bounds. It reads the constraint
+off the annotation and hands the value to ``msgspec`` itself, so the two doors
+into a configuration cannot come to disagree about what ``max_retries=0`` means.
+A class that reaches it carrying no constrained field at all is a programming
+error and says so, rather than passing everything.
+
+This keeps NautilusTrader's own contract intact. ``NautilusConfig.validate()``
+is declared to return ``bool`` and is implemented as
+``bool(self.parse(self.json()))``; because an out-of-range value is refused at
+construction, no instance that could fail that round trip ever exists, and
+``validate()`` still answers ``True`` rather than raising.
 
 Constrained types express a range, not a set. Where Gate.io accepts only
 particular values — the order book push interval and the REST snapshot depth
@@ -37,9 +56,8 @@ are each a short list the venue publishes — the range is not the constraint, s
 those two fields keep an explicit check (:func:`validate_book_interval_ms`,
 :func:`validate_snapshot_limit`).
 
-Both configuration classes are frozen, which means they cannot run custom
-validation in ``__post_init__`` without giving up immutability. All cross-field
-validation therefore happens in the client constructors
+Cross-field validation — which products may be combined with which environment
+— still happens in the client constructors
 (:class:`~nautilus_gateio.data.GateioDataClient` and the execution client),
 which raise ``ValueError`` with an explicit message before any network
 activity. The helper functions in this module (:func:`validate_products`,
@@ -50,6 +68,10 @@ configuration up front.
 
 from __future__ import annotations
 
+from types import UnionType
+from typing import Annotated, Any, Union, get_args, get_origin, get_type_hints
+
+import msgspec
 from nautilus_trader.config import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt
 from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 
@@ -175,6 +197,84 @@ def validate_snapshot_limit(limit: int) -> int:
     return limit
 
 
+def _constraints(hint: Any) -> tuple[msgspec.Meta, ...]:
+    """Return the ``msgspec`` constraints an annotation carries, if any.
+
+    ``PositiveInt`` is ``Annotated[int, Meta(gt=0)]`` and
+    ``NonNegativeInt | None`` wraps one of those in a union, so both shapes have
+    to be unwrapped to find the constraint.
+    """
+    origin = get_origin(hint)
+    if origin is Annotated:
+        return tuple(m for m in get_args(hint)[1:] if isinstance(m, msgspec.Meta))
+    if origin in (Union, UnionType):
+        return tuple(m for arg in get_args(hint) for m in _constraints(arg))
+    return ()
+
+
+_BOUNDED_FIELDS: dict[type, tuple[tuple[str, Any], ...]] = {}
+
+
+def bounded_fields(cls: type) -> tuple[tuple[str, Any], ...]:
+    """Return ``(name, annotation)`` for every field of ``cls`` that is bounded.
+
+    "Bounded" means the annotation carries a ``msgspec`` constraint — which is
+    exactly what ``PositiveInt``, ``PositiveFloat``, ``NonNegativeInt`` and
+    ``NonNegativeFloat`` are. Inherited fields are included, because
+    ``get_type_hints`` walks the MRO.
+    """
+    cached = _BOUNDED_FIELDS.get(cls)
+    if cached is not None:
+        return cached
+
+    hints = get_type_hints(cls, include_extras=True)
+    fields = tuple(
+        (name, hints[name])
+        for name in cls.__struct_fields__
+        if name in hints and _constraints(hints[name])
+    )
+    _BOUNDED_FIELDS[cls] = fields
+    return fields
+
+
+def enforce_field_bounds(config: Any) -> None:
+    """Refuse a value outside the range its own annotation declares.
+
+    Called from ``__post_init__``, which ``msgspec`` runs both after a direct
+    Python construction and after a decode, so a nonsensical number is refused
+    by whichever door it arrives through. The bound itself is never restated
+    here: the annotation is handed back to ``msgspec.convert``, so this check
+    and the decoder's check are the same check.
+
+    Raises
+    ------
+    ValueError
+        If a bounded field holds a value its annotation excludes. The message
+        names the field. (``msgspec.ValidationError`` from the decode path is
+        itself a ``ValueError``, so one ``except ValueError`` covers both.)
+    RuntimeError
+        If ``config``'s class declares no bounded field at all. That is a
+        programming error — an annotation was dropped, or a class that has
+        nothing to check was wired to this function — and it must not be
+        allowed to read as "everything passed".
+    """
+    fields = bounded_fields(type(config))
+    if not fields:
+        raise RuntimeError(
+            f"{type(config).__name__} declares no constrained field, so "
+            "`enforce_field_bounds` would check nothing; restore the "
+            "constrained annotations or stop calling it",
+        )
+    for name, hint in fields:
+        value = getattr(config, name)
+        try:
+            msgspec.convert(value, type=hint)
+        except msgspec.ValidationError as exc:
+            raise ValueError(
+                f"`{name}` is out of range for {type(config).__name__}: {exc}, was {value!r}",
+            ) from None
+
+
 class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
     """Configuration for :class:`~nautilus_gateio.data.GateioDataClient`.
 
@@ -222,10 +322,12 @@ class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
 
     Notes
     -----
-    The struct is frozen; cross-field validation runs in the client
-    constructor. Call :func:`validate_products`, :func:`validate_book_interval_ms`
-    and :func:`validate_snapshot_limit` directly to check a configuration
-    without building a client.
+    A value outside the range its type declares is refused here, whether the
+    configuration is written in Python or decoded from a declarative one.
+    Cross-field validation — which products go with which environment — runs in
+    the client constructor. Call :func:`validate_products`,
+    :func:`validate_book_interval_ms` and :func:`validate_snapshot_limit`
+    directly to check a configuration without building a client.
 
     """
 
@@ -246,6 +348,9 @@ class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
     order_book_snapshot_limit: PositiveInt = 100
     order_book_update_interval_ms: PositiveInt = 100
     bars_timestamp_on_close: bool = True
+
+    def __post_init__(self) -> None:
+        enforce_field_bounds(self)
 
     @property
     def is_testnet(self) -> bool:
@@ -302,9 +407,10 @@ class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
 
     Notes
     -----
-    The struct is frozen; cross-field validation (products versus environment,
-    spot account mode versus configured products) runs in the client
-    constructor.
+    A value outside the range its type declares is refused here, whether the
+    configuration is written in Python or decoded from a declarative one.
+    Cross-field validation (products versus environment, spot account mode
+    versus configured products) runs in the client constructor.
 
     """
 
@@ -323,6 +429,9 @@ class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
     account_polling_interval_secs: NonNegativeFloat = 30.0
     max_retries: PositiveInt = 3
     http_timeout_secs: PositiveFloat = DEFAULT_HTTP_TIMEOUT_SECS
+
+    def __post_init__(self) -> None:
+        enforce_field_bounds(self)
 
     @property
     def is_testnet(self) -> bool:

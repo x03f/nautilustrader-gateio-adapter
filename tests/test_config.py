@@ -7,9 +7,10 @@ are cleared for every test by an autouse fixture in ``conftest.py``.
 
 from __future__ import annotations
 
+import httpx
 import msgspec
 import pytest
-from nautilus_trader.common.config import ImportableConfig
+from nautilus_trader.common.config import ImportableConfig, NautilusConfig
 from nautilus_trader.common.secure import mask_api_key
 
 from nautilus_gateio.common.constants import (
@@ -34,6 +35,7 @@ from nautilus_gateio.common.credentials import (
     resolve_credentials,
 )
 from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
+from nautilus_gateio.common.errors import GateioError
 from nautilus_gateio.config import (
     MAINNET,
     ORDER_BOOK_UPDATE_INTERVALS_MS,
@@ -41,6 +43,8 @@ from nautilus_gateio.config import (
     TESTNET_PRODUCTS,
     GateioDataClientConfig,
     GateioExecClientConfig,
+    bounded_fields,
+    enforce_field_bounds,
     is_testnet,
     resolve_http_url,
     resolve_ws_url,
@@ -48,6 +52,7 @@ from nautilus_gateio.config import (
     validate_products,
     validate_snapshot_limit,
 )
+from nautilus_gateio.http.client import GateioHttpClient
 
 CONFIG_CLASSES = [GateioDataClientConfig, GateioExecClientConfig]
 
@@ -385,117 +390,391 @@ class TestMaskCredential:
         assert masked == "abcd...wxyz"
         assert secret not in masked
 
+    def test_the_fingerprint_discloses_at_most_eight_characters(self):
+        """The one place this masker is *wider* than the one it replaced.
+
+        The hand-written version showed four leading and two trailing
+        characters; the platform's shows four and four. Against a 32-character
+        Gate.io key that is eight disclosed characters instead of six, which is
+        the whole of the change in what reaches a log -- and it is pinned here
+        so it cannot widen further without this failing. ``visible_chars``
+        raised to ``6`` would leak twelve and break this test.
+        """
+        secret = "0123456789abcdef0123456789abcdef"
+        masked = mask(secret)
+
+        disclosed = sum(1 for c in masked if c != ".")
+        assert disclosed == 8
+        assert masked == "0123...cdef"
+        # Two of the venue's 32 hex characters were shown at each end before;
+        # the middle of the credential is still never rendered.
+        assert secret[4:-4] not in masked
+
 
 DATA_CONFIG_PATH = "nautilus_gateio.config:GateioDataClientConfig"
 EXEC_CONFIG_PATH = "nautilus_gateio.config:GateioExecClientConfig"
+CONFIG_PATHS = {
+    GateioDataClientConfig: DATA_CONFIG_PATH,
+    GateioExecClientConfig: EXEC_CONFIG_PATH,
+}
 
-#: ``(path, field, value)`` triples a declarative configuration must not survive.
+#: ``(cls, field, value)`` triples no configuration may survive, by any route.
 #: Each value is nonsense the client would otherwise carry into production: a
 #: retry budget that permits no attempt, a timeout that expires before the
 #: request is written, a period counted backwards. ``0`` is absent for the two
-#: timers that document it as "disabled" -- see the test below that holds that
+#: timers that document it as "disabled" -- see the test that holds that
 #: spelling open.
-REFUSED_AT_THE_BOUNDARY = [
-    (DATA_CONFIG_PATH, "max_retries", 0),
-    (DATA_CONFIG_PATH, "max_retries", -3),
-    (DATA_CONFIG_PATH, "http_timeout_secs", 0.0),
-    (DATA_CONFIG_PATH, "http_timeout_secs", -20.0),
-    (DATA_CONFIG_PATH, "order_book_snapshot_limit", 0),
-    (DATA_CONFIG_PATH, "order_book_snapshot_limit", -100),
-    (DATA_CONFIG_PATH, "order_book_update_interval_ms", 0),
-    (DATA_CONFIG_PATH, "order_book_update_interval_ms", -100),
-    (DATA_CONFIG_PATH, "update_instruments_interval_mins", -60),
-    (EXEC_CONFIG_PATH, "max_retries", 0),
-    (EXEC_CONFIG_PATH, "max_retries", -3),
-    (EXEC_CONFIG_PATH, "http_timeout_secs", 0.0),
-    (EXEC_CONFIG_PATH, "http_timeout_secs", -20.0),
-    (EXEC_CONFIG_PATH, "account_polling_interval_secs", -30.0),
+REFUSED_VALUES = [
+    (GateioDataClientConfig, "max_retries", 0),
+    (GateioDataClientConfig, "max_retries", -3),
+    (GateioDataClientConfig, "http_timeout_secs", 0.0),
+    (GateioDataClientConfig, "http_timeout_secs", -20.0),
+    (GateioDataClientConfig, "order_book_snapshot_limit", 0),
+    (GateioDataClientConfig, "order_book_snapshot_limit", -100),
+    (GateioDataClientConfig, "order_book_update_interval_ms", 0),
+    (GateioDataClientConfig, "order_book_update_interval_ms", -100),
+    (GateioDataClientConfig, "update_instruments_interval_mins", -60),
+    (GateioExecClientConfig, "max_retries", 0),
+    (GateioExecClientConfig, "max_retries", -3),
+    (GateioExecClientConfig, "http_timeout_secs", 0.0),
+    (GateioExecClientConfig, "http_timeout_secs", -20.0),
+    (GateioExecClientConfig, "account_polling_interval_secs", -30.0),
+]
+
+#: ``(cls, field, value)`` triples at the *legal* edge of each bounded field:
+#: the smallest value the range still admits. They exist to pin the boundary
+#: itself. A check moved one step in either direction fails here or in
+#: :data:`REFUSED_VALUES`, and nowhere is a boundary asserted only from one side.
+ADMITTED_AT_THE_EDGE = [
+    (GateioDataClientConfig, "max_retries", 1),
+    (GateioDataClientConfig, "http_timeout_secs", 0.001),
+    (GateioDataClientConfig, "order_book_snapshot_limit", 1),
+    (GateioDataClientConfig, "order_book_update_interval_ms", 1),
+    (GateioDataClientConfig, "update_instruments_interval_mins", 0),
+    (GateioExecClientConfig, "max_retries", 1),
+    (GateioExecClientConfig, "http_timeout_secs", 0.001),
+    (GateioExecClientConfig, "account_polling_interval_secs", 0.0),
 ]
 
 
-class TestDeclarativeConfigIsRefusedAtTheBoundary:
-    """RN-3: numeric fields carry the platform's constrained types.
+class TestBoundedFieldDiscovery:
+    """RN-3a: the check must have something to check.
 
-    A declarative configuration — the form documented in the README and in
-    ``docs/configuration.md`` — never reaches the struct constructor. It arrives
-    as a ``dict`` and ``ImportableConfig.create()`` *decodes* it, which is the
-    one place a ``msgspec`` constraint is enforced. With bare ``int`` and
-    ``float`` annotations every value below was accepted silently and the damage
-    landed somewhere else entirely: ``max_retries=0`` was clamped up to one
-    attempt by the HTTP client, so a deployment that asked for no retries got
-    them anyway and nothing said so; ``http_timeout_secs=0`` produced a client
-    whose every request expired; a zero reload interval armed a timer with no
-    period. None of those name the field that caused them.
+    ``enforce_field_bounds`` reads the bounds off the annotations rather than
+    restating them, which is what keeps the constructor and the decoder from
+    drifting apart -- but it also means an annotation lost in a refactor would
+    turn the check into a loop over nothing. These tests fail on an empty or
+    shrunken discovery, so the vacuum cannot pass for a pass.
     """
 
-    @pytest.mark.parametrize(("path", "field", "value"), REFUSED_AT_THE_BOUNDARY)
-    def test_a_nonsensical_value_is_refused_and_the_field_is_named(
-        self,
-        path: str,
-        field: str,
-        value: float,
-    ) -> None:
-        importable = ImportableConfig(path=path, config={field: value})
+    @pytest.mark.parametrize(
+        ("config_cls", "expected"),
+        [
+            (
+                GateioDataClientConfig,
+                {
+                    "update_instruments_interval_mins",
+                    "http_timeout_secs",
+                    "max_retries",
+                    "order_book_snapshot_limit",
+                    "order_book_update_interval_ms",
+                },
+            ),
+            (
+                GateioExecClientConfig,
+                {"account_polling_interval_secs", "max_retries", "http_timeout_secs"},
+            ),
+        ],
+    )
+    def test_every_numeric_field_is_discovered_as_bounded(self, config_cls, expected):
+        assert {name for name, _ in bounded_fields(config_cls)} == expected
 
-        with pytest.raises(msgspec.ValidationError) as excinfo:
-            importable.create()
+    def test_a_class_with_nothing_to_check_is_an_error_not_a_pass(self):
+        """``all([])`` is ``True``; this refuses to be that.
+
+        A class reaching the checker with no constrained field means an
+        annotation was dropped. Reporting "valid" would be the exact failure
+        this whole check exists to prevent, so it is a hard error instead.
+        """
+
+        class Unbounded(NautilusConfig, frozen=True):
+            plain: int = 3
+
+        with pytest.raises(RuntimeError, match="no constrained field"):
+            enforce_field_bounds(Unbounded())
+
+    def test_the_refusal_table_exercises_every_bounded_field_of_both_classes(self):
+        """A guard against a table that quietly stops covering something.
+
+        Each class must appear, and within a class every field the discovery
+        found must have at least one refused value -- otherwise a check that
+        works for one class, or for four of five fields, would still show green.
+        """
+        for config_cls in CONFIG_CLASSES:
+            discovered = {name for name, _ in bounded_fields(config_cls)}
+            exercised = {field for cls, field, _ in REFUSED_VALUES if cls is config_cls}
+            assert exercised == discovered
+            edges = {field for cls, field, _ in ADMITTED_AT_THE_EDGE if cls is config_cls}
+            assert edges == discovered
+
+
+class TestOutOfRangeNumbersAreRefusedOnEveryPath:
+    """RN-3: a nonsensical number is refused however the configuration is written.
+
+    Two routes reach these classes and only one of them decodes. The direct
+    Python constructor is the route the README, ``docs/configuration.md`` and
+    every example in ``examples/`` are written in; ``ImportableConfig`` is the
+    declarative route used to wire a pip-installed adapter into a node without
+    importing it. A constrained ``msgspec`` type covers the second alone,
+    because a constraint is applied when a struct is decoded and constructing
+    one in Python decodes nothing.
+
+    Left unchecked, each value below lands somewhere other than the field that
+    caused it: ``max_retries=0`` was silently clamped up to one attempt, so a
+    deployment that asked for no retries got them anyway; ``http_timeout_secs=0``
+    produced a client whose every request expired; a negative reload period armed
+    a timer counting backwards.
+    """
+
+    @pytest.mark.parametrize(("config_cls", "field", "value"), REFUSED_VALUES)
+    def test_direct_construction_refuses_and_names_the_field(self, config_cls, field, value):
+        """The main documented path: plain Python, no decoding anywhere."""
+        with pytest.raises(ValueError) as excinfo:
+            config_cls(**{field: value})
 
         assert field in str(excinfo.value)
 
-    def test_a_sensible_declarative_configuration_still_decodes(self) -> None:
-        """The constraints must not cost the documented path its usable values."""
-        config = ImportableConfig(
-            path=DATA_CONFIG_PATH,
-            config={
-                "max_retries": 5,
-                "http_timeout_secs": 10,
-                "order_book_snapshot_limit": 20,
-                "order_book_update_interval_ms": 20,
-                "update_instruments_interval_mins": None,
-            },
+    @pytest.mark.parametrize(("config_cls", "field", "value"), REFUSED_VALUES)
+    def test_declarative_configuration_refuses_and_names_the_field(
+        self,
+        config_cls,
+        field,
+        value,
+    ):
+        """The decode path, which the constrained types already covered.
+
+        ``msgspec.ValidationError`` is a subclass of ``ValueError``, so this
+        asserts the same catchable type as the constructor path: one
+        ``except ValueError`` handles a bad configuration whichever way it
+        arrived.
+        """
+        importable = ImportableConfig(path=CONFIG_PATHS[config_cls], config={field: value})
+
+        with pytest.raises(ValueError) as excinfo:
+            importable.create()
+
+        assert isinstance(excinfo.value, msgspec.ValidationError)
+        assert field in str(excinfo.value)
+
+    @pytest.mark.parametrize(("config_cls", "field", "value"), ADMITTED_AT_THE_EDGE)
+    def test_the_smallest_legal_value_is_still_admitted_on_both_paths(
+        self,
+        config_cls,
+        field,
+        value,
+    ):
+        """The other side of every boundary asserted above.
+
+        Without this, a check that refused everything -- or one shifted a step
+        too far, refusing ``max_retries=1`` or ``account_polling_interval_secs=0``
+        -- would satisfy every refusal test in this class.
+        """
+        constructed = config_cls(**{field: value})
+        decoded = ImportableConfig(
+            path=CONFIG_PATHS[config_cls],
+            config={field: value},
         ).create()
 
+        assert getattr(constructed, field) == value
+        assert getattr(decoded, field) == value
+
+    def test_a_whole_sensible_configuration_still_builds(self):
+        """The constraints must not cost the documented path its usable values."""
+        config = GateioDataClientConfig(
+            max_retries=5,
+            http_timeout_secs=10,
+            order_book_snapshot_limit=20,
+            order_book_update_interval_ms=20,
+            update_instruments_interval_mins=None,
+        )
+
         assert config.max_retries == 5
-        assert config.http_timeout_secs == 10.0
+        assert config.http_timeout_secs == 10
         assert config.order_book_snapshot_limit == 20
         assert config.order_book_update_interval_ms == 20
         assert config.update_instruments_interval_mins is None
 
     @pytest.mark.parametrize(
-        ("path", "field"),
+        ("config_cls", "field"),
         [
-            (DATA_CONFIG_PATH, "update_instruments_interval_mins"),
-            (EXEC_CONFIG_PATH, "account_polling_interval_secs"),
+            (GateioDataClientConfig, "update_instruments_interval_mins"),
+            (GateioExecClientConfig, "account_polling_interval_secs"),
         ],
     )
-    def test_zero_still_disables_the_timers_that_document_it(
-        self,
-        path: str,
-        field: str,
-    ) -> None:
-        """``0`` is a documented spelling here, so the constraint admits it.
+    def test_zero_still_disables_the_timers_that_document_it(self, config_cls, field):
+        """``0`` is a documented spelling here, so the bound admits it.
 
         Both clients read these two fields as "start no task at all" when they
-        are falsy. A positive-only constraint would have refused a configuration
-        that is valid today, which is why these two are non-negative.
+        are falsy. A positive-only bound would have refused a configuration that
+        is valid today, which is why these two are non-negative.
         """
-        config = ImportableConfig(path=path, config={field: 0}).create()
+        assert getattr(config_cls(**{field: 0}), field) == 0
 
-        assert getattr(config, field) == 0
-
-    def test_the_venue_specific_sets_are_still_checked_separately(self) -> None:
+    def test_the_venue_specific_sets_are_still_checked_separately(self):
         """A constrained type states a range; Gate.io publishes a set.
 
-        ``37`` ms and ``73`` levels are positive, so they pass the decode and
-        must still be refused by the explicit checks — which is why those two
+        ``37`` ms and ``73`` levels are positive, so they pass the bound and
+        must still be refused by the explicit checks -- which is why those two
         validators are kept.
         """
-        config = ImportableConfig(
-            path=DATA_CONFIG_PATH,
-            config={"order_book_update_interval_ms": 37, "order_book_snapshot_limit": 73},
-        ).create()
+        config = GateioDataClientConfig(
+            order_book_update_interval_ms=37,
+            order_book_snapshot_limit=73,
+        )
 
         with pytest.raises(ValueError, match="order_book_update_interval_ms"):
             validate_book_interval_ms(config.order_book_update_interval_ms)
         with pytest.raises(ValueError, match="order_book_snapshot_limit"):
             validate_snapshot_limit(config.order_book_snapshot_limit)
+
+
+class TestPlatformConfigContractIsIntact:
+    """RN-3b: refusing early must not break what NautilusTrader promises.
+
+    ``NautilusConfig.validate()`` is declared ``-> bool`` and implemented as
+    ``bool(self.parse(self.json()))``. A caller -- a node, a tool, a user's
+    pre-flight check -- expects an answer, not an exception. Refusing at
+    construction is what keeps that true: an instance that would fail the round
+    trip can no longer be built, so every instance that exists validates.
+    """
+
+    @pytest.mark.parametrize("config_cls", CONFIG_CLASSES)
+    def test_validate_answers_true_instead_of_raising(self, config_cls):
+        assert config_cls().validate() is True
+
+    @pytest.mark.parametrize(("config_cls", "field", "value"), ADMITTED_AT_THE_EDGE)
+    def test_validate_answers_true_at_every_boundary_value_too(self, config_cls, field, value):
+        """The edge values are where a round trip would break if it were going to."""
+        assert config_cls(**{field: value}).validate() is True
+
+    @pytest.mark.parametrize(
+        ("config_cls", "field", "value"),
+        REFUSED_VALUES + ADMITTED_AT_THE_EDGE,
+    )
+    def test_no_instance_can_exist_that_raises_from_validate(self, config_cls, field, value):
+        """The contract, stated as the only thing that must hold.
+
+        For any value at all: either the configuration is refused when it is
+        written, or it exists and ``validate()`` answers. There is no third
+        outcome where an instance sits in memory and raises when a node asks it
+        whether it is valid -- which is what carrying the bound *only* on the
+        annotation produced, because a construction that skipped the constraint
+        left an instance ``parse(self.json())`` then refused.
+        """
+        try:
+            config = config_cls(**{field: value})
+        except ValueError:
+            return  # Refused at the door; no instance exists to misbehave.
+
+        assert config.validate() is True
+
+    @pytest.mark.parametrize("config_cls", CONFIG_CLASSES)
+    def test_a_configuration_survives_its_own_serialisation(self, config_cls):
+        """``parse(json())`` is what ``validate()`` runs; it must round-trip.
+
+        ``__post_init__`` runs again on the way back in, so a check that
+        rejected a value the encoder legitimately produces -- an ``int`` where a
+        ``float`` was written, say -- would show up as a config that cannot
+        survive being saved and reloaded.
+        """
+        config = config_cls(http_timeout_secs=10, max_retries=1)
+
+        assert config_cls.parse(config.json()) == config
+
+
+class TestRetryBudgetIsHonouredOrRefused:
+    """RN-2: the transport no longer rewrites the operator's retry count.
+
+    ``docs/configuration.md`` promised in both tables that a value below ``1``
+    was "clamped to ``1``", and ``GateioHttpClient.__init__`` did exactly that
+    with ``max(1, max_retries)``. That is now a refusal, in both places, because
+    the attempt loop reads the number as a count of attempts: at ``0`` the
+    request is never sent and the caller is handed ``TOO_MANY_REQUESTS`` about a
+    request that never left the process.
+
+    These tests count attempts against a mock transport rather than reading
+    ``client.max_retries``, so a clamp restored anywhere between the constructor
+    and the loop is caught by the number of requests actually made.
+    """
+
+    @pytest.mark.parametrize("max_retries", [1, 2, 5])
+    async def test_the_configured_count_is_the_number_of_attempts_made(self, max_retries):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(503, json={"label": "SERVER_ERROR", "message": "down"})
+
+        client = _transport_client(handler, max_retries=max_retries)
+
+        with pytest.raises(GateioError):
+            await client.request("GET", "/spot/tickers")
+
+        assert attempts == max_retries
+
+    @pytest.mark.parametrize("max_retries", [0, -1, -3])
+    def test_a_count_below_one_is_refused_rather_than_promoted(self, max_retries):
+        """The clamp's replacement.
+
+        Under ``max(1, max_retries)`` this constructor returned a client that
+        made one attempt; the operator's ``0`` became a ``1`` and nothing said
+        so.
+        """
+        with pytest.raises(ValueError, match="max_retries"):
+            GateioHttpClient(max_retries=max_retries)
+
+    async def test_the_config_default_reaches_the_transport_unchanged(self):
+        """Ties the two layers together: the default is legal and is not rewritten."""
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(503, json={"label": "SERVER_ERROR", "message": "down"})
+
+        client = _transport_client(handler, max_retries=GateioDataClientConfig().max_retries)
+
+        with pytest.raises(GateioError):
+            await client.request("GET", "/spot/tickers")
+
+        assert attempts == 3
+
+
+def _transport_client(handler, max_retries: int) -> GateioHttpClient:
+    """Build a client whose transport is a mock and whose backoff never sleeps."""
+    client = GateioHttpClient(max_retries=max_retries)
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=GATEIO_HTTP_MAINNET,
+    )
+    client._limiter = _SilentLimiter()  # type: ignore[assignment]
+
+    async def _no_delay(attempt: int) -> None:
+        return None
+
+    client._retry_delay = _no_delay  # type: ignore[assignment]
+    return client
+
+
+class _SilentLimiter:
+    """Pacing stub: the retry count is under test here, not the rate limiter."""
+
+    async def acquire(self) -> None:
+        return None
+
+    def on_rate_limited(self) -> None:
+        return None
+
+    def on_success(self) -> None:
+        return None
