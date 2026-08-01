@@ -7,7 +7,9 @@ are cleared for every test by an autouse fixture in ``conftest.py``.
 
 from __future__ import annotations
 
+import msgspec
 import pytest
+from nautilus_trader.common.config import ImportableConfig
 from nautilus_trader.common.secure import mask_api_key
 
 from nautilus_gateio.common.constants import (
@@ -382,3 +384,118 @@ class TestMaskCredential:
         masked = mask(secret)
         assert masked == "abcd...wxyz"
         assert secret not in masked
+
+
+DATA_CONFIG_PATH = "nautilus_gateio.config:GateioDataClientConfig"
+EXEC_CONFIG_PATH = "nautilus_gateio.config:GateioExecClientConfig"
+
+#: ``(path, field, value)`` triples a declarative configuration must not survive.
+#: Each value is nonsense the client would otherwise carry into production: a
+#: retry budget that permits no attempt, a timeout that expires before the
+#: request is written, a period counted backwards. ``0`` is absent for the two
+#: timers that document it as "disabled" -- see the test below that holds that
+#: spelling open.
+REFUSED_AT_THE_BOUNDARY = [
+    (DATA_CONFIG_PATH, "max_retries", 0),
+    (DATA_CONFIG_PATH, "max_retries", -3),
+    (DATA_CONFIG_PATH, "http_timeout_secs", 0.0),
+    (DATA_CONFIG_PATH, "http_timeout_secs", -20.0),
+    (DATA_CONFIG_PATH, "order_book_snapshot_limit", 0),
+    (DATA_CONFIG_PATH, "order_book_snapshot_limit", -100),
+    (DATA_CONFIG_PATH, "order_book_update_interval_ms", 0),
+    (DATA_CONFIG_PATH, "order_book_update_interval_ms", -100),
+    (DATA_CONFIG_PATH, "update_instruments_interval_mins", -60),
+    (EXEC_CONFIG_PATH, "max_retries", 0),
+    (EXEC_CONFIG_PATH, "max_retries", -3),
+    (EXEC_CONFIG_PATH, "http_timeout_secs", 0.0),
+    (EXEC_CONFIG_PATH, "http_timeout_secs", -20.0),
+    (EXEC_CONFIG_PATH, "account_polling_interval_secs", -30.0),
+]
+
+
+class TestDeclarativeConfigIsRefusedAtTheBoundary:
+    """RN-3: numeric fields carry the platform's constrained types.
+
+    A declarative configuration — the form documented in the README and in
+    ``docs/configuration.md`` — never reaches the struct constructor. It arrives
+    as a ``dict`` and ``ImportableConfig.create()`` *decodes* it, which is the
+    one place a ``msgspec`` constraint is enforced. With bare ``int`` and
+    ``float`` annotations every value below was accepted silently and the damage
+    landed somewhere else entirely: ``max_retries=0`` was clamped up to one
+    attempt by the HTTP client, so a deployment that asked for no retries got
+    them anyway and nothing said so; ``http_timeout_secs=0`` produced a client
+    whose every request expired; a zero reload interval armed a timer with no
+    period. None of those name the field that caused them.
+    """
+
+    @pytest.mark.parametrize(("path", "field", "value"), REFUSED_AT_THE_BOUNDARY)
+    def test_a_nonsensical_value_is_refused_and_the_field_is_named(
+        self,
+        path: str,
+        field: str,
+        value: float,
+    ) -> None:
+        importable = ImportableConfig(path=path, config={field: value})
+
+        with pytest.raises(msgspec.ValidationError) as excinfo:
+            importable.create()
+
+        assert field in str(excinfo.value)
+
+    def test_a_sensible_declarative_configuration_still_decodes(self) -> None:
+        """The constraints must not cost the documented path its usable values."""
+        config = ImportableConfig(
+            path=DATA_CONFIG_PATH,
+            config={
+                "max_retries": 5,
+                "http_timeout_secs": 10,
+                "order_book_snapshot_limit": 20,
+                "order_book_update_interval_ms": 20,
+                "update_instruments_interval_mins": None,
+            },
+        ).create()
+
+        assert config.max_retries == 5
+        assert config.http_timeout_secs == 10.0
+        assert config.order_book_snapshot_limit == 20
+        assert config.order_book_update_interval_ms == 20
+        assert config.update_instruments_interval_mins is None
+
+    @pytest.mark.parametrize(
+        ("path", "field"),
+        [
+            (DATA_CONFIG_PATH, "update_instruments_interval_mins"),
+            (EXEC_CONFIG_PATH, "account_polling_interval_secs"),
+        ],
+    )
+    def test_zero_still_disables_the_timers_that_document_it(
+        self,
+        path: str,
+        field: str,
+    ) -> None:
+        """``0`` is a documented spelling here, so the constraint admits it.
+
+        Both clients read these two fields as "start no task at all" when they
+        are falsy. A positive-only constraint would have refused a configuration
+        that is valid today, which is why these two are non-negative.
+        """
+        config = ImportableConfig(path=path, config={field: 0}).create()
+
+        assert getattr(config, field) == 0
+
+    def test_the_venue_specific_sets_are_still_checked_separately(self) -> None:
+        """A constrained type states a range; Gate.io publishes a set.
+
+        ``37`` ms and ``73`` levels are positive, so they pass the decode and
+        must still be refused by the explicit checks — which is why those two
+        validators are kept.
+        """
+        config = ImportableConfig(
+            path=DATA_CONFIG_PATH,
+            config={"order_book_update_interval_ms": 37, "order_book_snapshot_limit": 73},
+        ).create()
+
+        with pytest.raises(ValueError, match="order_book_update_interval_ms"):
+            validate_book_interval_ms(config.order_book_update_interval_ms)
+        with pytest.raises(ValueError, match="order_book_snapshot_limit"):
+            validate_snapshot_limit(config.order_book_snapshot_limit)
