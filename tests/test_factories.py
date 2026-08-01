@@ -31,6 +31,7 @@ from nautilus_gateio.common.constants import (
     GATEIO_VENUE,
 )
 from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
+from nautilus_gateio.common.errors import GateioServerError
 from nautilus_gateio.config import GateioDataClientConfig, GateioExecClientConfig
 from nautilus_gateio.data import GateioDataClient
 from nautilus_gateio.execution import GateioExecutionClient
@@ -518,3 +519,94 @@ class TestSpotAccountModeAgainstProducts:
 
         lines = log_capture.wait_for("has no effect without")
         assert any(f"spot_account_mode={mode.value}" in line for line in lines), lines
+
+
+class TestConnectSynchronisesTheVenueClock:
+    """``sync_time`` had no caller inside the package, only the examples.
+
+    The submission deadline (``x-gate-exptime``) is withheld until the venue
+    clock offset is known, so with nothing calling it a default deployment never
+    sent one: an order held up in the network stayed acceptable indefinitely and
+    could execute against a price it was never meant to see. The signature
+    timestamp rides on the same offset. The reference adapter reads the venue
+    clock while connecting for the same reason (binance/execution.py:350-355).
+    """
+
+    @staticmethod
+    def _stub_venue_calls(client, seen: list[str]) -> None:
+        """Replace everything ``_connect`` does at the venue with a recorder."""
+
+        def _record(name: str):
+            async def _inner(*args, **kwargs):
+                seen.append(name)
+                return None
+
+            return _inner
+
+        client._instrument_provider.initialize = _record("instruments")
+        client._load_user_id = _record("user_id")
+        client._assert_one_way_position_mode = _record("position_mode")
+        client._update_account_state = _record("account_state")
+        client._await_account_registered = _record("account_registered")
+        client._connect_private_websocket = _record("websocket")
+
+    def test_the_clock_is_read_before_any_other_venue_call(
+        self,
+        node_components,
+        block_network,
+    ):
+        _, _, _, loop = node_components
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(account_polling_interval_secs=0.0),
+        )
+        seen: list[str] = []
+        self._stub_venue_calls(client, seen)
+
+        transport = client._http_client
+
+        async def fake_sync_time() -> int:
+            seen.append("clock")
+            transport._time_offset_ms = 250
+            transport._clock_synced = True
+            return 250
+
+        transport.sync_time = fake_sync_time
+
+        loop.run_until_complete(client._connect())
+
+        assert seen[0] == "clock", seen
+        assert transport.clock_synced is True
+        assert transport._expiry_ms() is not None, "the submission deadline is still withheld"
+
+    def test_a_clock_reading_that_fails_does_not_stop_the_client(
+        self,
+        node_components,
+        block_network,
+        log_capture,
+    ):
+        """Fail open: the deadline is a protection, not a precondition."""
+        _, _, _, loop = node_components
+        log_capture.mark()
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(account_polling_interval_secs=0.0),
+        )
+        seen: list[str] = []
+        self._stub_venue_calls(client, seen)
+
+        transport = client._http_client
+
+        async def failing_sync_time() -> int:
+            raise GateioServerError(500, "SERVER_ERROR", "server error")
+
+        transport.sync_time = failing_sync_time
+
+        loop.run_until_complete(client._connect())
+
+        assert "account_registered" in seen, "the client did not finish connecting"
+        assert transport.clock_synced is False
+        assert transport._expiry_ms() is None
+
+        lines = log_capture.wait_for("Cannot read the Gate.io server time")
+        assert any("Cannot read the Gate.io server time" in line for line in lines), lines

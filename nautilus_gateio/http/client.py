@@ -50,12 +50,15 @@ closed inside the retry window would not be deduplicated, so a replay built on
 ``text`` alone is not provably safe. The execution layer should instead resolve
 an ambiguous submission by querying the order by its client id.
 
-Optionally the client attaches Gate.io's ``x-gate-exptime`` header (a submission
-deadline in milliseconds) to order-mutating requests. That does not make a
-replay safe, but it bounds how late a request delayed in flight may still be
-accepted, which bounds how long the ambiguity can last. The header is emitted
-only once :meth:`GateioHttpClient.sync_time` has measured the venue clock
-offset, because an unsynchronised clock would otherwise expire valid requests.
+The client attaches Gate.io's ``x-gate-exptime`` header (a submission deadline in
+milliseconds) to order-mutating requests. That does not make a replay safe, but
+it bounds how late a request delayed in flight may still be accepted, which
+bounds how long the ambiguity can last. The header is emitted only once
+:meth:`GateioHttpClient.sync_time` has measured the venue clock offset, because
+an unsynchronised clock would otherwise expire valid requests. The execution
+client makes that measurement when it connects, so the deadline is in force for
+the whole session; a client used on its own must call :meth:`sync_time` itself,
+or set ``order_expiry_ms=0`` and accept unbounded submissions knowingly.
 """
 
 from __future__ import annotations
@@ -103,6 +106,12 @@ UNPROCESSED_LABELS: Final[frozenset[str]] = frozenset(
 
 #: Gate.io's submission-deadline header, in milliseconds since the epoch.
 EXPIRY_HEADER: Final[str] = "x-gate-exptime"
+
+#: Offset between this host's clock and the venue's, in milliseconds, beyond
+#: which a caller of :meth:`GateioHttpClient.sync_time` should tell the operator.
+#: The offset corrects what this client sends; it cannot correct the timestamps
+#: the platform records, which are read from the local clock.
+CLOCK_DRIFT_WARNING_MS: Final[int] = 5_000
 
 #: Default submission deadline applied to order-mutating requests, in
 #: milliseconds. Generous enough to absorb ordinary latency while still bounding
@@ -199,7 +208,8 @@ class GateioHttpClient:
     order_expiry_ms : int
         Submission deadline attached to order-mutating requests via
         ``x-gate-exptime``. Applied only after :meth:`sync_time` has measured
-        the venue clock offset; set to ``0`` to disable the header entirely.
+        the venue clock offset, which the execution client does on connect; set
+        to ``0`` to disable the header entirely.
     """
 
     def __init__(
@@ -311,6 +321,13 @@ class GateioHttpClient:
         ``INVALID_SIGNATURE`` errors; the offset is applied to every subsequent
         signed request. It also enables the ``x-gate-exptime`` submission
         deadline, which is withheld until the offset is known.
+
+        The measurement is a single reading, so the network round trip inflates
+        it by roughly the one-way delay — immaterial against a deadline measured
+        in seconds, and it is not a substitute for a synchronised host clock:
+        the platform timestamps its own events from the local clock, which this
+        offset does not touch. Beyond :data:`CLOCK_DRIFT_WARNING_MS` the caller
+        is expected to say so.
         """
         payload = await self.request("GET", "/spot/time")
         server_ms = int(payload["server_time"])

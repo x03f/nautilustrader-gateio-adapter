@@ -208,7 +208,12 @@ from nautilus_gateio.common.symbols import (
     parse_option_symbol,
 )
 from nautilus_gateio.config import GateioExecClientConfig, validate_products
-from nautilus_gateio.http.client import GateioHttpClient, GateioRequestAmbiguousError
+from nautilus_gateio.http.client import (
+    CLOCK_DRIFT_WARNING_MS,
+    EXPIRY_HEADER,
+    GateioHttpClient,
+    GateioRequestAmbiguousError,
+)
 from nautilus_gateio.http.futures import GateioFuturesHttpAPI
 from nautilus_gateio.http.margin import GateioMarginHttpAPI, require_wallet
 from nautilus_gateio.http.options import GateioOptionsHttpAPI
@@ -1092,6 +1097,36 @@ class GateioExecutionClient(LiveExecutionClient):
     # -- lifecycle ---------------------------------------------------------
 
     async def _connect(self) -> None:
+        # Measure the venue clock before anything is signed. Two things depend on
+        # it: the timestamp carried by every signed request, which the venue
+        # rejects as `INVALID_SIGNATURE` when it drifts, and the `x-gate-exptime`
+        # submission deadline, which the transport withholds until the offset is
+        # known (http/client.py, `Retry safety`). Without this call the deadline
+        # is never sent, so an order delayed in flight can still be accepted long
+        # after its price is stale. The reference adapter reads the venue clock
+        # on connect for the same reason (binance/execution.py:350-355).
+        try:
+            offset_ms = await self._http_client.sync_time()
+        except Exception as e:  # noqa: BLE001 - a clock reading must not stop the client
+            # Fail open, not closed: the deadline header simply stays off, which
+            # is exactly how the client ran before, so a venue that will not
+            # answer `/spot/time` costs a protection rather than the session.
+            self._log.warning(
+                f"Cannot read the Gate.io server time ({e}); submission deadlines "
+                f"({EXPIRY_HEADER}) stay off and signed requests use the local clock",
+            )
+        else:
+            self._log.info(f"Gate.io clock offset {offset_ms} ms", LogColor.BLUE)
+            if abs(offset_ms) > CLOCK_DRIFT_WARNING_MS:
+                # The offset corrects what this adapter sends, but not what the
+                # platform records: every Nautilus event timestamp comes from the
+                # local clock, so a node this far out mistimes its own history.
+                self._log.warning(
+                    f"This host's clock differs from Gate.io by {offset_ms} ms; requests are "
+                    f"corrected, but Nautilus event timestamps are taken from the local clock "
+                    f"and will carry that error",
+                )
+
         await self._instrument_provider.initialize()
         self._cache_instruments()
 

@@ -734,6 +734,34 @@ async def test_sync_time_offset_is_applied_to_the_signed_timestamp():
     assert abs(signed - (time.time() + offset_ms / 1000)) < 5
 
 
+async def test_a_venue_that_will_not_state_its_time_leaves_the_client_usable():
+    """The execution client reads the clock on connect and must survive failing.
+
+    The deadline is a protection, not a precondition: when ``/spot/time`` will
+    not answer, the header stays off — which is how every request behaved before
+    the clock was read at all — and orders still go out. Nothing here may leave
+    the client believing it knows the venue clock.
+    """
+    orders: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/spot/time"):
+            return httpx.Response(500, json={"label": "SERVER_ERROR", "message": "unavailable"})
+        orders.append(request.headers)
+        return httpx.Response(200, json=ACCEPTED_ORDER)
+
+    client = make_client(handler, api_key="k", api_secret="s")
+    with pytest.raises(GateioServerError):
+        await client.sync_time()
+
+    assert client.clock_synced is False
+    assert client._expiry_ms() is None
+    assert client._time_offset_ms == 0, "an unread clock must not shift the signed timestamp"
+
+    await client.post("/spot/orders", body=ORDER_BODY, expiring=True)
+    assert EXPIRY_HEADER not in orders[-1]
+
+
 # -- transport ownership and shutdown ---------------------------------------
 
 
