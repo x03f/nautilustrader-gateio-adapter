@@ -339,9 +339,22 @@ class GateioHttpClient:
         if self._closed:
             return
         self._closed = True
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._drained.wait(), DEFAULT_FUTURE_CANCELLATION_TIMEOUT)
-        await self._client.aclose()
+        try:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._drained.wait(), DEFAULT_FUTURE_CANCELLATION_TIMEOUT)
+        finally:
+            # The drain introduced an await between latching `_closed` and
+            # closing the pool, and `_closed` is what makes every later call a
+            # no-op. A cancellation landing in that window would therefore leave
+            # a pool that reports itself closed and that nothing in the process
+            # can ever close again — and the window is reached on the platform's
+            # own path, because `TradingNode.dispose()` cancels whatever the
+            # disconnect budget did not finish. `contextlib.suppress(TimeoutError)`
+            # does not catch `CancelledError`, so the close has to be in a
+            # `finally`; shielded, because a task being torn down can be
+            # cancelled again while it is running its own cleanup, and the pool
+            # must be released either way.
+            await asyncio.shield(self._client.aclose())
 
     @property
     def is_closed(self) -> bool:

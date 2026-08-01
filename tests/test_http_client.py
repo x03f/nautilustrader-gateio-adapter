@@ -1105,6 +1105,101 @@ async def test_the_gate_is_read_with_no_await_left_before_the_send():
     assert len(log) == 1, "the request was sent although the gate shut while headers were built"
 
 
+async def test_the_drain_waits_for_every_request_on_the_wire_not_just_the_first():
+    """A stopping node has several requests out at once; that is the normal case.
+
+    The drain is a counter, not a flag, and the difference only shows with more
+    than one request in flight: a node winding down sweeps open orders per
+    product. If the wait ended at the first answer, the pool would be torn down
+    under the rest — which is the very thing the drain exists to prevent, so the
+    counted region has to be pinned rather than assumed.
+    """
+    release_first: asyncio.Event = asyncio.Event()
+    release_rest: asyncio.Event = asyncio.Event()
+    client: GateioHttpClient
+
+    #: Whether the pool was already closed when each answer came back. Anything
+    #: but ``False`` everywhere means the drain let go too early.
+    pool_closed_at_answer: list[bool] = []
+
+    class _AnswersInTwoWaves(httpx.AsyncBaseTransport):
+        seen = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            mine = _AnswersInTwoWaves.seen
+            _AnswersInTwoWaves.seen += 1
+            await (release_first if mine == 0 else release_rest).wait()
+            pool_closed_at_answer.append(client._client.is_closed)
+            return httpx.Response(200, json={})
+
+    client = GateioHttpClient().acquire()
+    client._client = httpx.AsyncClient(base_url=GATEIO_HTTP_MAINNET, transport=_AnswersInTwoWaves())
+
+    in_flight = [
+        asyncio.create_task(client.request("GET", f"/spot/tickers?i={i}")) for i in range(3)
+    ]
+    for _ in range(100):
+        if client._inflight == 3:
+            break
+        await asyncio.sleep(0.01)
+    assert client._inflight == 3, f"the probe never got three requests on the wire: {client._inflight}"
+
+    teardown = asyncio.create_task(client.close())
+    await asyncio.sleep(0.01)
+    release_first.set()  # One answer lands; two are still out.
+    await asyncio.sleep(0.05)
+    release_rest.set()
+    await asyncio.wait_for(teardown, timeout=3.0)
+    await asyncio.gather(*in_flight, return_exceptions=True)
+
+    assert len(pool_closed_at_answer) == 3, "the probe lost an answer"
+    assert not any(pool_closed_at_answer), (
+        "the drain released the socket pool while requests were still on the wire: "
+        f"pool-closed-at-answer = {pool_closed_at_answer}"
+    )
+
+
+async def test_a_cancelled_teardown_still_closes_the_socket_pool():
+    """The drain must not become a window in which the pool is lost forever.
+
+    ``close()`` latches ``_closed`` and only then waits for the requests already
+    on the wire, and ``_closed`` is what makes every later ``close()`` a no-op.
+    A cancellation landing inside that wait would therefore leave a pool that
+    reports itself closed and that nothing in the process can ever close again —
+    an open connection to the venue, held until the process dies.
+
+    The window is on the platform's own path, not an exotic one:
+    ``LiveExecutionClient.disconnect()`` schedules the teardown with a bare
+    ``loop.create_task``, nothing bounds it, and ``TradingNode.dispose()``
+    cancels whatever the disconnect budget did not finish.
+    """
+
+    class _NeverAnswers(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(3600)
+            raise AssertionError("unreachable")
+
+    client = GateioHttpClient().acquire()
+    client._client = httpx.AsyncClient(base_url=GATEIO_HTTP_MAINNET, transport=_NeverAnswers())
+
+    in_flight = asyncio.create_task(client.request("GET", "/spot/tickers"))
+    await asyncio.sleep(0)  # let it reach the wire and register as undrained
+
+    teardown = asyncio.create_task(client.close())
+    await asyncio.sleep(0)  # let it reach the drain
+    teardown.cancel()
+    await asyncio.gather(teardown, return_exceptions=True)
+    await asyncio.sleep(0)  # let the shielded close finish
+
+    assert client._client.is_closed, (
+        "the teardown reported the transport closed but never closed the socket pool, "
+        "and the idempotence guard means no later call can"
+    )
+
+    in_flight.cancel()
+    await asyncio.gather(in_flight, return_exceptions=True)
+
+
 async def test_stop_accepting_is_idempotent_and_sticky():
     """The verb behaves as NautilusTrader's own ``cancel_all_requests()`` does."""
     client = make_client(lambda r: httpx.Response(200, json={}))

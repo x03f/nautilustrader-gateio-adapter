@@ -1872,6 +1872,47 @@ async def test_a_refused_snapshot_does_not_re_arm_itself_during_teardown() -> No
     assert armed == [], "a retry task was armed after the transport stopped accepting"
 
 
+async def test_the_instrument_reload_survives_a_venue_error_and_keeps_reloading() -> None:
+    """The other half of the exit above, and the one with damage behind it.
+
+    Leaving the loop is right for ``CLIENT_CLOSED`` and wrong for anything else:
+    a single transient 500 from a listing reload would otherwise stop the reload
+    for the life of the node, and instruments would silently go stale — no
+    expiries, no new listings, no status changes — while the node keeps trading
+    on what it last saw. ``main`` could not get this wrong because it had no
+    early exit at all; the exit is new, so the discrimination has to be pinned.
+    """
+    client, spy = _data_client_with_a_wire_spy()
+
+    turns = 0
+
+    async def _initialize(reload: bool = False) -> None:
+        nonlocal turns
+        turns += 1
+        await spy.transport.get("/spot/currency_pairs")
+        if turns == 1:
+            raise data_module.GateioError(500, "SERVER_ERROR", "the venue had a bad moment")
+
+    client._instrument_provider.initialize = _initialize  # type: ignore[method-assign]
+    client._send_all_instruments_to_data_engine = lambda: None  # type: ignore[method-assign]
+
+    task = client.create_task(client._update_instruments(0.05 / 60), log_msg="update_instruments")
+    client._update_instruments_task = task
+    try:
+        for _ in range(200):
+            if turns >= 3:
+                break
+            await asyncio.sleep(0.01)
+
+        assert turns >= 3, (
+            f"the reload stopped after a venue error instead of surviving it: {turns} turn(s)"
+        )
+        assert not task.done(), "a transient venue error ended the reload loop"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_the_instrument_reload_leaves_its_loop_when_the_gate_shuts() -> None:
     """The reload reaches the venue through the *shared* provider.
 
