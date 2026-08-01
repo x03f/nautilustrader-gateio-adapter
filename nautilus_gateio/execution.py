@@ -1138,12 +1138,43 @@ class GateioExecutionClient(LiveExecutionClient):
             )
 
     async def _assert_one_way_position_mode(self) -> None:
-        """Refuse to run against a futures account in hedge (dual) position mode.
+        """Refuse to run unless the venue states the account is one-way (netted).
 
         Nautilus nets positions per instrument, so a venue holding a separate
         long and short leg for the same contract cannot be reconciled. The
         remedy is a venue-side setting the operator must change deliberately;
         this client never changes it.
+
+        The gate is on the venue's *answer*, not on the absence of a hedge
+        spelling. "The mode could not be read" is not "the mode is one-way", and
+        treating the two alike starts the node against an account whose position
+        model may not be the one this client implements. Gate.io's answers split
+        three ways, exactly as the reconciliation path splits them (see
+        :meth:`generate_position_status_reports`):
+
+        * **An answer.** ``position_mode`` states a mode. Only the one-way
+          answer starts the client; a hedge spelling, a mode this client has
+          never heard of, or a truthy legacy ``in_dual_mode`` is refused, naming
+          the value the venue gave.
+        * **A statement of absence.** ``USER_NOT_FOUND``: Gate.io creates a
+          futures wallet on the first transfer into it and says this until then.
+          A wallet that does not exist holds no position, hedged or otherwise,
+          so this product's check is skipped — and the loop goes on, because
+          every other product has its own wallet and its own mode.
+        * **A refusal.** ``FORBIDDEN``, ``INVALID_UNIFIED_ACCOUNT``,
+          ``UNIFIED_ACCOUNT_NOT_ACTIVATED``
+          (:class:`WalletQueryRefusedError`): the venue rejected the question
+          and said nothing about the account, which may hold hedged legs of any
+          size. The start is refused. None of the three is a passing condition —
+          each names a standing property of the key or of the account, and
+          :func:`should_retry` is false for all of them.
+
+        Anything :func:`should_retry` would take as transient — a 5xx, a 429, a
+        timed-out request — is deliberately left to propagate unchanged. It also
+        stops the start, because it too leaves the mode unread, but it is not
+        turned into the refusal above: an error a supervisor can retry has to
+        stay retryable, and an operator must not be sent to switch off a hedge
+        mode that was never reported because Gate.io was briefly unreachable.
         """
         for product in self._products:
             if not product.is_perpetual:
@@ -1154,18 +1185,57 @@ class GateioExecutionClient(LiveExecutionClient):
                     api.accounts(),
                     f"the {product.value} futures wallet",
                 )
+            except WalletQueryRefusedError as e:
+                raise RuntimeError(
+                    f"Gate.io would not answer for the {product.value} futures wallet, so this "
+                    f"client cannot establish the account's position mode: {e}. It trades "
+                    f"one-way (netted) positions only and does not read an unanswered question "
+                    f"as a one-way answer: the account may be in hedge (dual) position mode, "
+                    f"holding a separate long and short leg per contract, which this client "
+                    f"cannot represent. Grant the API key the permission this wallet needs (or "
+                    f"drop {product.value} from `products`), then restart.",
+                ) from e
             except WalletNotProvisionedError as e:
+                # A wallet Gate.io has not created yet holds no position, so
+                # there is nothing to hedge. `continue`, not `return` or
+                # `break`: the products configured behind this one have their
+                # own wallets and their own modes, and one unprovisioned wallet
+                # must not clear them. This clause must stay *below* the refusal
+                # clause above, which is a subclass of it.
                 self._log.warning(f"Skipping position mode check for {product.value}: {e}")
                 continue
 
-            mode = str(account.get("position_mode") or "single").lower()
-            if account.get("in_dual_mode") or mode != "single":
+            stated = account.get("position_mode") if isinstance(account, dict) else None
+            legacy_dual = account.get("in_dual_mode") if isinstance(account, dict) else None
+            # Only a non-empty string is a statement of the mode. `None`, `""`,
+            # `0` and `False` are the shapes a partially provisioned wallet and
+            # a proxy that drops unknown fields produce, and the previous
+            # `or "single"` read every one of them as one-way.
+            mode = stated.lower() if isinstance(stated, str) else ""
+
+            if legacy_dual or (mode.strip() and mode != "single"):
                 raise RuntimeError(
                     f"Gate.io {product.value} account is in '{mode}' position mode "
                     f"(hedge/dual). This client trades one-way (netted) positions only. "
                     f"Close all positions and pending orders, switch the account back to "
                     f"one-way mode in the Gate.io interface or via POST "
                     f"/futures/{product.settle}/dual_mode?dual_mode=false, then restart.",
+                )
+            if not mode.strip():
+                answer = (
+                    f"position_mode={stated!r}"
+                    if isinstance(account, dict)
+                    else f"a {type(account).__name__} where an object was expected"
+                )
+                raise RuntimeError(
+                    f"Gate.io stated no position mode for the {product.value} futures wallet "
+                    f"(GET /futures/{product.settle}/accounts answered {answer}), so this client "
+                    f"cannot establish the account's position mode. It trades one-way (netted) "
+                    f"positions only and does not read a missing answer as a one-way answer: "
+                    f"the account may be in hedge (dual) position mode, holding a separate long "
+                    f"and short leg per contract, which this client cannot represent. Confirm "
+                    f"the mode over GET /futures/{product.settle}/accounts and that the API key "
+                    f"can read this account's futures wallet, then restart.",
                 )
 
     async def _connect_private_websocket(self, product: GateioProductType) -> None:

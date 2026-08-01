@@ -29,10 +29,12 @@ the documented spellings, so rewriting the check as a whitelist left all of it
 green while ``position_mode: "dual_side"`` connected and opened private streams
 against a hedge account. `TestTheRefusalIsFailClosed` is what actually holds it.
 
-The last class documents what happens when the venue's answer does not settle
-the question at all — including two cases that are neither a refusal nor a
-diagnosable error, one of which is a genuine fail-open gap; see the module notes
-on them there.
+The last class covers the answers that do not settle the question at all. Those
+used to divide into "refused" and "started anyway", and the second group was the
+larger one: a `FORBIDDEN` wallet and a `position_mode` of `null`, `""`, `0` or
+`False` all started the client in full. They now refuse, and what separates them
+from a transient failure — which must stay retryable rather than become a
+standing refusal — is pinned there too.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from nautilus_gateio.common.errors import (
     GateioServerError,
     WalletNotProvisionedError,
     WalletQueryRefusedError,
+    should_retry,
 )
 from tests.test_execution_orders import ExecHarness
 
@@ -637,16 +640,31 @@ class TestOneWayAccountStarts:
 
 
 class TestTheModeCannotBeDetermined:
-    """What the current code *does* when the answer is missing or malformed.
+    """An answer that does not establish the mode stops the start, bar one.
 
-    These tests state observed behaviour, not endorsed behaviour. Two of the
-    three outcomes below let a start proceed without the position mode ever
-    having been established; that is recorded here so a change to it is a
-    deliberate change with a failing test, rather than an accident.
+    "The venue did not say" is not "the venue said one-way". Every case below
+    used to be judged on whether the *code* could carry on, and five of them
+    could: a `FORBIDDEN` wallet and a `position_mode` of `null`, `""`, `0` or
+    `False` each connected in full — `opened_streams == [PERP]`, one account
+    state published — against an account whose position mode had never been
+    read. `0` and `False` are not hypothetical shapes: they are what a JSON
+    boolean serialised into the field looks like, and the old
+    ``or "single"`` turned every one of them into the one-way answer.
+
+    The single exception is the wallet Gate.io reports as not created
+    (`USER_NOT_FOUND`), which is a statement about the account rather than a
+    failure to answer: a wallet that does not exist holds no legs to hedge. It
+    is the *only* skip, it skips one product rather than the rest of them, and
+    both halves of that are asserted below.
     """
 
     def test_an_unprovisioned_wallet_skips_the_check_and_starts(self):
-        """A wallet that does not exist holds no positions, so there is nothing to hedge."""
+        """A wallet that does not exist holds no positions, so there is nothing to hedge.
+
+        The whole connect runs, not just the gate: the skip has to leave a
+        working client behind, otherwise "skipped" and "refused" are the same
+        outcome reached by different routes.
+        """
         env = _perp_harness()
         try:
             env.perp.responses["accounts"] = GateioClientError(
@@ -655,70 +673,147 @@ class TestTheModeCannotBeDetermined:
                 "user not found",
             )
 
-            env.run(env.client._assert_one_way_position_mode())  # must not raise
+            _connect(env)
+
+            assert env.opened_streams == [GateioProductType.PERP]
         finally:
             env.close()
 
-    def test_a_refused_wallet_query_also_skips_the_check_and_starts(self, log_capture):
-        """A *refusal* is not an absence, and here the two are handled alike.
+    def test_an_unprovisioned_wallet_does_not_clear_the_products_behind_it(self):
+        """The skip is one product's, not the loop's.
 
-        `require_wallet` deliberately splits them —
-        `WalletQueryRefusedError` ("the venue rejected the question, so nothing
-        at all is known about the ledger") is raised for the account-mode and
-        permission labels and is a *subclass* of `WalletNotProvisionedError`
-        ("the wallet does not exist, so it holds nothing"). Catching the base
-        class here therefore catches both, and a `FORBIDDEN` on the futures
-        wallet lets the client start against an account whose position mode was
-        never established. The one thing the operator does get is the warning
-        line asserted below.
+        The USDT-margined wallet does not exist and the BTC-margined one is
+        hedged. Skipping the first must mean *continue*: a step that returned or
+        broke out of the loop would leave the hedged inverse wallet unread and
+        start the client against it, and neither shows up as an error anywhere —
+        the node simply runs, nets two venue legs into one position and
+        reconciles against an account that is not shaped like its model.
+
+        The unprovisioned wallet is deliberately first in `products`, because
+        that is the order in which the defect is reachable.
+        """
+        env = _perp_harness(products=(GateioProductType.PERP, GateioProductType.INVERSE))
+        try:
+            env.perp.responses["accounts"] = GateioClientError(
+                400,
+                "USER_NOT_FOUND",
+                "user not found",
+            )
+            env.inverse.responses["accounts"] = _futures_wallet(
+                currency="BTC",
+                position_mode="dual",
+            )
+
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert env.inverse.called("accounts"), (
+                "the wallet behind the unprovisioned one was never read; the skip "
+                "ended the check instead of skipping one product"
+            )
+            assert "INVERSE" in str(refusal)
+        finally:
+            env.close()
+
+    @pytest.mark.parametrize(
+        "label",
+        ["FORBIDDEN", "INVALID_UNIFIED_ACCOUNT", "UNIFIED_ACCOUNT_NOT_ACTIVATED"],
+    )
+    def test_a_refused_wallet_query_refuses_the_start(self, label: str):
+        """A refusal is not an absence, and it is not a one-way answer either.
+
+        `require_wallet` splits the two: `WalletQueryRefusedError` ("the venue
+        rejected the question, so nothing at all is known about the ledger") is
+        raised for the account-mode and permission labels and is a *subclass* of
+        `WalletNotProvisionedError` ("the wallet does not exist, so it holds
+        nothing"). Catching only the base class here caught both, and each of
+        these three labels started the client in full against an account whose
+        position mode was never established — which is what this test measures,
+        rather than the exception.
+
+        None of the three is transient. Each names a standing property of the
+        API key or of the account, `should_retry` is false for all of them, and
+        the account behind them may hold hedged legs of any size.
         """
         env = _perp_harness()
         try:
-            env.perp.responses["accounts"] = GateioClientError(403, "FORBIDDEN", "forbidden")
+            env.perp.responses["accounts"] = GateioClientError(403, label, "refused")
             assert issubclass(WalletQueryRefusedError, WalletNotProvisionedError)
 
-            log_capture.mark()
-            env.run(env.client._assert_one_way_position_mode())  # must not raise
-            lines = log_capture.wait_for("Skipping position mode check")
+            refusal = _start_and_capture_refusal(env)
 
-            assert any("Skipping position mode check for PERP" in line for line in lines)
+            _assert_nothing_was_started(env, refusal)
+            assert label in str(refusal), "the operator is not told why the venue refused"
+            assert "position mode" in str(refusal)
         finally:
             env.close()
 
-    def test_an_empty_account_object_is_read_as_one_way(self):
-        """An answer carrying neither field starts the client as if it were one-way.
+    def test_a_retryable_failure_is_not_restated_as_a_position_mode_refusal(self):
+        """The boundary: a blip stops the start, but as the venue's own error.
 
-        `str(None or "single").lower()` is `"single"`, so a response that says
-        nothing about the position mode is indistinguishable here from one that
-        says one-way. Documented, not endorsed.
+        A 5xx also leaves the mode unread, so it too stops the start — that is
+        asserted in `TestTheRefusalIsFailClosed`. What must *not* happen is the
+        tidy-looking generalisation of this commit: folding every unread mode
+        into one `RuntimeError`. `should_retry` is the project's own reading of
+        which failures pass on their own, and it answers True here and False for
+        every label above; a supervisor that reads it off the exception would be
+        told a transient outage is a standing account misconfiguration, and the
+        operator would be sent to switch off a hedge mode the venue never
+        reported.
+        """
+        env = _perp_harness()
+        try:
+            blip = GateioServerError(500, "SERVER_ERROR", "internal error")
+            env.perp.responses["accounts"] = blip
+
+            raised: BaseException | None = None
+            try:
+                _connect(env)
+            except BaseException as e:  # noqa: BLE001 - the type is the assertion
+                raised = e
+
+            assert raised is blip, (
+                f"a retryable venue failure reached the caller as {raised!r}, not as itself"
+            )
+            assert should_retry(raised), "the failure lost its retryable reading"
+            assert env.opened_streams == []
+        finally:
+            env.close()
+
+    def test_an_empty_account_object_refuses_the_start(self):
+        """An answer carrying neither field establishes nothing, so nothing starts.
+
+        `str(None or "single").lower()` was `"single"`, so a response that said
+        nothing about the position mode was indistinguishable from one that said
+        one-way, and this connected.
         """
         env = _perp_harness()
         try:
             env.perp.responses["accounts"] = {}
 
-            env.run(env.client._assert_one_way_position_mode())  # must not raise
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert "position_mode=None" in str(refusal), (
+                "the operator is not told what the wallet actually answered"
+            )
+            assert "/futures/usdt/accounts" in str(refusal)  # where to look
         finally:
             env.close()
 
     @pytest.mark.parametrize("blank", [None, "", 0, False])
-    def test_a_blank_position_mode_is_read_as_one_way_too(self, blank: Any):
-        """The one place the check is **not** fail-closed, stated so it is visible.
+    def test_a_blank_position_mode_refuses_the_start(self, blank: Any):
+        """A stated-but-empty mode is an unread mode.
 
-        Everywhere else in this module an answer the client cannot read as
-        one-way stops the start. Here it does not: the ``or "single"`` in
-        `_assert_one_way_position_mode` turns "the venue said nothing about the
-        position mode" into "the venue said one-way", and a wallet that answers
-        ``position_mode: null`` — which is what a partially provisioned futures
-        account and a proxy that drops unknown fields both produce — starts a
-        client that never established the mode at all. The legacy flag is left
-        false here because it is absent in exactly the same situations.
+        ``position_mode: null`` is what a partially provisioned futures account
+        and a proxy that drops unknown fields both produce; `0` and `False` are
+        what the field looks like if it ever arrives as a JSON boolean, which is
+        how the neighbouring `in_dual_mode` is served today. All four used to
+        start the client through the `or "single"` fallback.
 
-        This test records the hole; it does not endorse it. Closing it means
-        refusing on a blank answer, which is a behaviour change in
-        `nautilus_gateio/execution.py` and belongs in a commit with a CHANGELOG
-        entry. When that lands, **delete this test** — do not weaken it into
-        accepting either outcome, because a test that passes both ways is how
-        the property got lost the first time.
+        The legacy flag is pinned false on purpose: it is absent in exactly the
+        situations that blank this field, and leaving it out would let a check
+        that refuses on the legacy flag alone pass for the wrong reason.
         """
         env = _perp_harness()
         try:
@@ -727,24 +822,36 @@ class TestTheModeCannotBeDetermined:
                 in_dual_mode=False,
             )
 
-            env.run(env.client._assert_one_way_position_mode())  # must not raise
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert env.perp.called("accounts"), (
+                "the start was refused without the wallet ever being read"
+            )
+            assert repr(blank) in str(refusal), (
+                "the operator is not told which value the venue reported"
+            )
         finally:
             env.close()
 
-    def test_a_response_that_is_not_an_object_aborts_the_start_undiagnosably(self):
-        """A non-object answer fails the start with `AttributeError`, not a message.
+    def test_a_response_that_is_not_an_object_refuses_the_start_with_a_message(self):
+        """A non-object answer refuses like the rest, and says what arrived.
 
-        Aborting is the safe direction — nothing starts against an unknown
-        position mode — but the operator gets `'list' object has no attribute
-        'get'` out of `_connect` rather than a sentence naming the wallet and the
-        endpoint, which is what every other unreadable-wallet path in this client
-        produces.
+        Aborting was already the safe direction here, but through
+        `'list' object has no attribute 'get'` out of `_connect` rather than a
+        sentence naming the wallet and the endpoint. Both halves are asserted,
+        and the first one is structural: `_start_and_capture_refusal` swallows
+        only `RuntimeError`, so an `AttributeError` from the parse escapes it and
+        fails this test rather than being read as the refusal.
         """
         env = _perp_harness()
         try:
             env.perp.responses["accounts"] = []  # a list where the venue returns an object
 
-            with pytest.raises(AttributeError):
-                env.run(env.client._assert_one_way_position_mode())
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert "list" in str(refusal), "the operator is not told what the venue sent"
+            assert "PERP futures wallet" in str(refusal)
         finally:
             env.close()
