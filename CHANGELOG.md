@@ -404,6 +404,30 @@ and **Changed**.
 
 ### Documentation
 
+- **`docs/spec-coverage.md` records every one of NautilusTrader's numbered
+  adapter test cases, and a test keeps the record from going stale.** The guide
+  asks an acceptance record to name, per case, either the test that closes it or
+  a venue or capability reason for skipping it. That map existed only outside
+  this repository, where nothing could check it and nothing did: of thirteen of
+  its citations that were re-read against the test bodies, six named a test that
+  asserted something other than the case's own pass criteria, and twenty-five
+  cases it marked open were in fact closed. The registry is now in the
+  repository, every status on it was checked by opening the test rather than by
+  reading its name, and it is graded on the same
+  [evidence ladder](docs/validation.md#the-evidence-ladder) as the rest of the
+  documentation instead of a scale of its own — so a case the venue has never
+  seen cannot read like one it has. Of the 95 cases in the current revision of
+  the specification (the previous revision had 90; `TC-E74`–`TC-E78` are new,
+  and `TC-E07`, `TC-E08`, `TC-E09` are three identifiers that appear in no
+  revision at all and inflated an earlier denominator to 93), 14 are skipped on
+  a stated venue fact, 11 are named as open gaps, and none reads
+  *mainnet-confirmed*. `tests/test_spec_coverage.py` fails when a test the
+  registry cites no longer exists under that name, when a case row goes missing
+  or is invented, when a row claims a rung without naming a test, or when the
+  page stops being linked from `docs/testing.md` and `docs/validation.md` —
+  which makes renaming a test a change that has to update the registry in the
+  same commit.
+
 - **`docs/releasing.md` defers the PyPI upload until a name exists to upload
   under.** The former distribution name used the NautilusTrader trademark, and a
   PyPI name is never released once claimed, so that upload was not a step a later

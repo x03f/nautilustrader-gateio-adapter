@@ -86,6 +86,25 @@ time one was attempted the venue was already reporting that position flat.
 | `MARGIN` — `spot_account_mode=UNIFIED`                      | as spot; the streams do not depend on the ledger | **implemented**; `_collect_unified_balances` is **offline-harness** | Nothing on the order path. Requires a unified account on the venue. The harness does pin the aggregation rule — the unified ledger replaces the per-wallet balances instead of being summed with them — and the constructor's refusal of `UNIFIED` without `SPOT` is **unit-tested** |
 | `MARGIN` — any configuration including a derivative product | see the product table                            | **mainnet-confirmed**, for the USDT perpetual and option runs       | The client reported a `MARGIN` account to the platform in every derivative run, and the venue took the perpetual orders and the option orders recorded below                                                                                                                         |
 
+### Specification cases: supported and skipped
+
+The tables above grade capabilities. NautilusTrader's adapter guide asks a
+second question of an acceptance record — for each of its numbered test cases
+(`TC-E*` for execution, `TC-D*` for data), which are supported and which are
+skipped, with a venue or capability reason for every skip. That answer is one
+row per case in [spec-coverage.md](spec-coverage.md), and it is graded on the
+same [evidence ladder](#the-evidence-ladder) as this page, so a case that has
+never been near Gate.io cannot read as one that has.
+
+Of the 95 cases in the current revision of the specification, 14 are skipped on
+a venue or capability fact — no GTD or DAY time in force, no identifiable
+attached bracket leg, no historical quote endpoint, no chain subscription, no
+adapter-specific parameters read — and 11 are open gaps the registry names
+individually. **No case on that page reads *mainnet-confirmed*.** What mainnet
+has actually seen is the run table below, and the two pages are not
+interchangeable: the registry says what the offline suite asserts, this section
+says what the venue did.
+
 ### Mainnet validation results
 
 Every row is a recorded run against Gate.io mainnet, on the smallest size the

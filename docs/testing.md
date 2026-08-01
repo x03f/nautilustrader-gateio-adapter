@@ -37,6 +37,18 @@ Requirements: Python >= 3.12, < 3.15, and the `nautilus_trader` range pinned in
 | Configuration               | Defaults (including the mainnet default), URL derivation, product/environment validation, credential resolution order                                                                                           |
 | Documentation and packaging | The documented configuration defaults match the code, documented imports resolve, no removed-feature vocabulary survives in the docs, and CI verifies the built wheel                                           |
 
+That table is arranged by area. The other way to ask the question — which of
+NautilusTrader's numbered adapter test cases (`TC-E*` for execution, `TC-D*` for
+data) this suite closes, and which are skipped for a venue reason — is answered
+case by case in [spec-coverage.md](spec-coverage.md). Every row there names
+either the test that closes the case or the venue fact that removes it.
+
+`tests/test_spec_coverage.py` is what keeps that page from drifting: it fails
+when a test the registry cites no longer exists, when a case row goes missing or
+is invented, or when a row states neither evidence nor a reason. **Renaming or
+removing a test therefore means updating `docs/spec-coverage.md` in the same
+commit** — that is the purpose of the check, not a side effect of it.
+
 ## Integration tests
 
 The suite is offline in full: no network, no credentials. The `integration`
