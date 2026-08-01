@@ -110,7 +110,6 @@ from decimal import Decimal
 from functools import partial
 from typing import Any, Final
 
-from nautilus_trader.accounting.factory import AccountFactory
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor, LogLevel
@@ -920,14 +919,6 @@ class GateioExecutionClient(LiveExecutionClient):
 
         cash_account = set(products) == {GateioProductType.SPOT} and not spot_mode.is_margin
         account_type = AccountType.CASH if cash_account else AccountType.MARGIN
-
-        if spot_mode.is_margin:
-            # Spot margin ledgers settle borrowed balances, which a cash account
-            # otherwise refuses to hold as a negative balance.
-            try:
-                AccountFactory.register_cash_borrowing(GATEIO)
-            except KeyError:
-                pass  # Already registered by another client instance
 
         super().__init__(
             loop=loop,
