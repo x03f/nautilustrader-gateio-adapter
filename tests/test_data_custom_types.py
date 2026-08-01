@@ -28,6 +28,7 @@ from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import DataEngineConfig
 from nautilus_trader.core.data import Data
+from nautilus_trader.core.nautilus_pyo3 import GreeksConvention
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.data.messages import (
@@ -628,6 +629,29 @@ async def test_a_platform_greeks_subscription_now_delivers_on_gateio() -> None:
     assert len(received) == 1, "no OptionGreeks reached the subscribing actor"
     assert received[0].instrument_id == OPTION_ID
     assert received[0].delta == 0.5512
+
+
+def test_the_convention_is_left_for_the_platform_because_gate_io_states_none(
+    harness: Harness,
+) -> None:
+    """The one published field the venue did not supply.
+
+    Gate.io documents no numeraire for its greeks, so the client passes no
+    ``convention`` and the platform's own default stands. Naming one here would
+    publish a claim about Gate.io that Gate.io never made — and a strategy
+    joining this book with a venue that *does* state its convention (OKX
+    publishes both) would join on a label we invented. The docstring, the page
+    and the changelog all make a point of this; nothing pinned it.
+    """
+    harness.client._ticker_subs[OPTION_ID] = {"greeks"}
+
+    harness.client._handle_ws_message(GateioProductType.OPT, options_ticker_message())
+
+    (published,) = greeks(harness)
+    assert published.convention == GreeksConvention.BLACK_SCHOLES, (
+        "the client stated a numeraire convention of its own; Gate.io states none, "
+        "so the value must be the platform's default rather than an adapter claim"
+    )
 
 
 def test_each_venue_number_lands_on_the_field_that_names_it(harness: Harness) -> None:

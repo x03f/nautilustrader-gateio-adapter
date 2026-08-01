@@ -4314,6 +4314,7 @@ class GateioExecutionClient(LiveExecutionClient):
                     venue_order_id.value,
                     raw_symbol,
                     body,
+                    account=self.spot_account,
                 )
             else:
                 body = {}

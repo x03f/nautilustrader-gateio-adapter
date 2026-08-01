@@ -366,6 +366,7 @@ class GateioSpotHttpAPI:
         order_id: str,
         pair: str,
         body: dict[str, Any],
+        account: str | None = None,
     ) -> dict[str, Any]:
         """``PATCH /spot/orders/{order_id}`` — amend price and/or quantity.
 
@@ -380,6 +381,13 @@ class GateioSpotHttpAPI:
         ambiguous failure must be resolved with :meth:`get_order`.
         """
         params: dict[str, Any] = {"currency_pair": pair}
+        if account is not None:
+            # The ledger has to be named here as it is on every other spot
+            # command. Gate.io documents the default set for this endpoint as
+            # "spot, unified account and isolated margin account" — a
+            # cross-margin order is not in it, so an amendment that omits the
+            # parameter does not address the order the client is holding.
+            params["account"] = account
         return await self._client.patch(
             f"/spot/orders/{order_id}", body=body, params=params, expiring=True
         )

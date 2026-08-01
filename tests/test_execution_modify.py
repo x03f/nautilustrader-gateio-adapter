@@ -47,7 +47,7 @@ from nautilus_trader.model.events import (
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Price, Quantity
 
-from gateio_nt.common.enums import GateioProductType
+from gateio_nt.common.enums import GateioProductType, GateioSpotAccountMode
 from gateio_nt.common.errors import UnsupportedOrderError
 
 try:  # pytest inserts the tests directory on the path; support both layouts
@@ -159,6 +159,52 @@ def _perp_frame(order: Any, price: str, contracts: int) -> dict[str, Any]:
 
 
 # -- TC-E30 / TC-E31: an amend that succeeds ---------------------------------
+
+
+class TestTheAmendNamesItsLedger:
+    """An amendment has to address the ledger the order actually lives on.
+
+    Every other spot command names it — submit puts it in the body, cancel,
+    cancel-all and batch cancel put it in the query, and so do the report
+    queries. The amend did not, and Gate.io documents the default set for
+    ``PATCH /spot/orders/{id}`` as "spot, unified account and isolated margin
+    account": a cross-margin order is not in it, so an amendment that omits the
+    parameter does not address the order the client is holding.
+    """
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [
+            (GateioSpotAccountMode.SPOT, "spot"),
+            (GateioSpotAccountMode.MARGIN, "margin"),
+            (GateioSpotAccountMode.CROSS_MARGIN, "cross_margin"),
+        ],
+        ids=["spot", "isolated-margin", "cross-margin"],
+    )
+    def test_the_spot_amend_states_the_configured_ledger(self, mode, expected: str):
+        env = ExecHarness(spot_account_mode=mode)
+        try:
+            order = env.accepted(
+                env.order_factory.limit(
+                    SPOT_BTC_USDT, OrderSide.BUY, SPOT_QTY, Price.from_str("60000.00")
+                ),
+                "1001",
+            )
+            _pending_update(env, order)
+            env.spot.responses["amend_order"] = _spot_frame(
+                order, price="59000.00", amount="0.010000", left="0.010000"
+            )
+
+            _modify(env, order, price=Price.from_str("59000.00"))
+
+            call = env.spot.calls_named("amend_order")[0]
+            assert call.kwargs.get("account") == expected, (
+                "the amendment went out without naming the ledger the order is on; "
+                f"the client is configured for {expected!r} and Gate.io resolves an "
+                "unqualified amend against its own default set"
+            )
+        finally:
+            env.close()
 
 
 class TestSuccessfulAmend:
