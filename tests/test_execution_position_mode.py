@@ -19,9 +19,20 @@ two-legged account against a one-legged model.
 So the assertions here are about the damage, not about the shape of the check:
 a hedge account must leave the client with **no private stream open and no
 account state published**, and the message must carry enough for an operator to
-act. The last class documents what happens when the venue's answer does not
-settle the question at all — including one case that is not a refusal and not a
-diagnosable error either; see the module notes on it there.
+act.
+
+The refusal is also *fail-closed*, and that is a separate claim needing its own
+tests: the client refuses everything it cannot read as one-way, rather than
+matching the answer against a list of hedge spellings it happens to know. The
+first version of this module asserted that property in prose and tested only
+the documented spellings, so rewriting the check as a whitelist left all of it
+green while ``position_mode: "dual_side"`` connected and opened private streams
+against a hedge account. `TestTheRefusalIsFailClosed` is what actually holds it.
+
+The last class documents what happens when the venue's answer does not settle
+the question at all — including two cases that are neither a refusal nor a
+diagnosable error, one of which is a genuine fail-open gap; see the module notes
+on them there.
 """
 
 from __future__ import annotations
@@ -33,6 +44,7 @@ import pytest
 from nautilus_gateio.common.enums import GateioProductType
 from nautilus_gateio.common.errors import (
     GateioClientError,
+    GateioServerError,
     WalletNotProvisionedError,
     WalletQueryRefusedError,
 )
@@ -90,6 +102,39 @@ def _perp_harness(
 def _connect(env: ExecHarness) -> None:
     env.run(env.client._connect())
     env.run(env.client._disconnect())  # cancels the account poll task
+
+
+def _start_and_capture_refusal(env: ExecHarness) -> BaseException | None:
+    """Drive the real connect sequence and return the refusal, if any.
+
+    The refusal is *returned* rather than expected, so that a client which no
+    longer refuses is judged on what it went on to do — the stream it opened and
+    the account it published — instead of only on a missing exception.
+    """
+    try:
+        _connect(env)
+    except RuntimeError as e:
+        return e
+    return None
+
+
+def _assert_nothing_was_started(env: ExecHarness, refusal: BaseException | None) -> None:
+    """The damage assertion: a hedged account leaves the client inert.
+
+    This is the state the refutation of the first version of this module
+    measured on a surviving mutant — connect completed and the private streams
+    were open against a two-legged account — so it is the state every
+    fail-closed case below asserts, not the wording of an exception.
+    """
+    assert env.opened_streams == [], (
+        "a private stream was opened against an account whose position mode was "
+        "not established as one-way; this client cannot represent two venue legs "
+        "as one netted position"
+    )
+    assert env.account_states == [], (
+        "an account this client cannot trade was published to the platform"
+    )
+    assert refusal is not None, "connect completed against an account that is not one-way"
 
 
 # -- a hedge-mode account is refused, on every product that has one -----------
@@ -267,6 +312,267 @@ class TestHedgeModeAccountIsRefused:
             env.close()
 
 
+# -- the refusal is fail-closed, not a list of known hedge spellings ----------
+
+
+#: Position-mode answers this client has no basis for calling one-way.
+#:
+#: None of these appear in Gate.io's documented ``single`` / ``dual`` /
+#: ``dual_plus`` set, and that is the point: the venue's own vocabulary has
+#: already grown once (``dual_plus`` postdates ``dual``), spellings differ
+#: between the futures and the unified endpoints, and a mode this client has
+#: never heard of is a mode whose netting behaviour it cannot vouch for. The
+#: first five are hedge in plain words; the rest are near-misses and shape
+#: accidents — a separator swapped, a case, stray whitespace, a suffixed
+#: variant, a mode invented after this file was written.
+_MODES_THAT_ARE_NOT_ONE_WAY = [
+    "dual_side",  # the exact value that traded a hedge account under a whitelist
+    "double_side",
+    "hedge",
+    "both",
+    "two_way",
+    "dual-mode",
+    "DUAL_SIDE",
+    " dual ",
+    "dual_plus_v2",
+    "portfolio_margin_hedge",
+]
+
+
+class TestTheRefusalIsFailClosed:
+    """Only the venue's one-way answer starts the client; everything else stops it.
+
+    The first version of this module asserted that it pinned this property and
+    did not: its parametrisation listed ``dual``, ``dual_plus`` and two casings
+    of them, so replacing ``mode != "single"`` with the whitelist
+    ``mode in ("dual", "dual_plus")`` passed every test while
+    ``position_mode: "dual_side"`` connected and opened private streams against
+    a hedge account. A refusal built from a list of known bad values is a
+    refusal that is silently wrong about every value the venue adds next, and
+    the direction of that error is the unrecoverable one: the client keeps
+    trading, nets two venue legs into one platform position and reconciles
+    against a model of the account that does not exist.
+
+    So these tests say nothing about *which* spellings mean hedge. They say the
+    check must treat an answer it cannot read as one-way exactly as it treats
+    hedge — and each one asserts the damage, driving the real connect sequence
+    and checking that no stream opened and no account was published.
+    """
+
+    @pytest.mark.parametrize("mode", _MODES_THAT_ARE_NOT_ONE_WAY)
+    def test_a_mode_that_is_not_the_one_way_answer_refuses_the_whole_start(self, mode: str):
+        """An unrecognised mode stops the start, with the legacy flag saying nothing.
+
+        ``in_dual_mode`` is pinned to ``False`` deliberately: it is the other
+        hedge signal, and leaving it out would let a check that reads only the
+        legacy boolean — or one that reads neither field and refuses on
+        something else entirely — pass this test for the wrong reason. The
+        `position_mode` field alone must carry the refusal.
+        """
+        env = _perp_harness()
+        try:
+            env.perp.responses["accounts"] = _futures_wallet(
+                position_mode=mode,
+                in_dual_mode=False,
+            )
+
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert env.perp.called("accounts"), (
+                "the start was refused without the position mode ever being read; "
+                "this test would then pass against a check that refuses everything"
+            )
+            assert mode.lower() in str(refusal), (
+                "the operator is not told which value the venue reported"
+            )
+        finally:
+            env.close()
+
+    @pytest.mark.parametrize("flag", [True, 1, "true", "dual"])
+    def test_any_truthy_legacy_flag_refuses_whatever_shape_it_arrives_in(self, flag: Any):
+        """The older field decides on truthiness, not on being exactly ``True``.
+
+        ``position_mode`` here says ``single``, so the legacy flag is the only
+        thing standing between the client and a hedge account. Gate.io serves
+        this field as a JSON boolean today, but a check written as
+        ``in_dual_mode is True`` would admit a hedge account the moment the
+        field arrives stringly typed — which is how the same account is
+        described elsewhere in the same API — and admitting it is the direction
+        that costs money. Truthiness is the fail-closed reading.
+        """
+        env = _perp_harness()
+        try:
+            env.perp.responses["accounts"] = _futures_wallet(
+                position_mode="single",
+                in_dual_mode=flag,
+            )
+
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert "hedge/dual" in str(refusal)
+        finally:
+            env.close()
+
+    @pytest.mark.parametrize(
+        ("product", "settle"),
+        [(GateioProductType.PERP, "usdt"), (GateioProductType.INVERSE, "btc")],
+    )
+    def test_each_perpetual_is_checked_on_its_own_wallet_and_no_other(
+        self,
+        product: GateioProductType,
+        settle: str,
+    ):
+        """The gate must reach both perpetual products, each through its own wallet.
+
+        Two failures hide behind one passing test otherwise: a check that runs
+        only for the USDT-margined product clears a hedged BTC-margined account
+        it never asked about, and a check that reads the mode off a hard-coded
+        USDT wallet clears the same account by asking the wrong endpoint. Both
+        end with the private stream open against a hedged account, so the
+        product's own namespace being the one queried is asserted here, not
+        inferred from the message.
+        """
+        env = _perp_harness(products=(product,))
+        stub = {GateioProductType.PERP: env.perp, GateioProductType.INVERSE: env.inverse}
+        try:
+            stub[product].responses["accounts"] = _futures_wallet(
+                position_mode="dual_side",
+                in_dual_mode=False,
+            )
+
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert stub[product].called("accounts"), (
+                f"the {product.value} wallet was never asked for its position mode"
+            )
+            for other, other_stub in stub.items():
+                if other is not product:
+                    assert not other_stub.called("accounts"), (
+                        f"the {other.value} wallet was read while checking {product.value}"
+                    )
+            assert product.value in str(refusal)
+            assert f"/futures/{settle}/dual_mode" in str(refusal)
+        finally:
+            env.close()
+
+    def test_a_product_with_no_hedge_mode_skips_its_turn_and_not_the_rest(self):
+        """Spot is exempt from the check; it does not exempt what comes after it.
+
+        Spot has no position mode, so the loop steps over it — and a step that
+        ends the loop instead of skipping one iteration leaves every product
+        configured behind spot unchecked. The client would then start against a
+        hedged perpetual wallet purely because of the order the operator listed
+        products in, which is why the hedged perpetual sits second here.
+        """
+        env = _perp_harness(products=(GateioProductType.SPOT, GateioProductType.PERP))
+        try:
+            env.perp.responses["accounts"] = _futures_wallet(
+                position_mode="dual_side",
+                in_dual_mode=False,
+            )
+
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert env.perp.called("accounts"), (
+                "the perpetual wallet behind the exempt spot product was never checked"
+            )
+            assert "PERP" in str(refusal)
+        finally:
+            env.close()
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            GateioServerError(500, "SERVER_ERROR", "internal error"),
+            TimeoutError("the wallet query timed out"),
+        ],
+        ids=["a-5xx", "a-timeout"],
+    )
+    def test_a_wallet_the_client_could_not_read_at_all_stops_the_start(
+        self,
+        failure: BaseException,
+    ):
+        """Only the two wallet-gating answers are allowed to skip the check.
+
+        `_assert_one_way_position_mode` steps over a wallet that does not exist
+        and one the venue refused to talk about, because those are statements
+        about the account rather than failures — and both are pinned in
+        `TestTheModeCannotBeDetermined` below. Nothing else is a statement about
+        anything. A 5xx or a timed-out request means the mode is simply unknown,
+        and widening that `except` to swallow it — the natural shape of a
+        "startup should be resilient" change — clears the check on every account
+        the venue happened to be slow about, hedged ones included.
+
+        The assertion is therefore that the start does not survive it: no stream
+        is opened, no account is published, and the error reaches the caller.
+
+        The wallet fails **once** and answers normally afterwards, which is what
+        a blip looks like and is the only version of this test that can fail.
+        A wallet that failed on every call would raise the same error again at
+        `_update_account_state` a moment later, so the start would abort either
+        way and a check that had silently skipped itself would still look
+        healthy here.
+        """
+        env = _perp_harness()
+        try:
+            attempts: list[int] = []
+
+            def _fails_once(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise failure
+                return _futures_wallet()
+
+            env.perp.responses["accounts"] = _fails_once
+
+            aborted: BaseException | None = None
+            try:
+                _connect(env)
+            except type(failure) as e:
+                aborted = e
+
+            assert env.opened_streams == [], (
+                "the private stream was opened after the position mode check was "
+                "skipped over an error that said nothing about the account"
+            )
+            assert env.account_states == []
+            assert aborted is not None, (
+                "a wallet the client could not read cleared the position mode check "
+                "and the start continued"
+            )
+        finally:
+            env.close()
+
+    def test_a_hedged_wallet_last_in_the_tuple_still_refuses(self):
+        """The loop must finish, not stop at the first product that looks fine.
+
+        The USDT-margined wallet answers one-way and the BTC-margined one does
+        not; a check that returns on the first clean answer starts a client
+        whose inverse leg is hedged. This is the unrecognised spelling on
+        purpose: the same case with a documented spelling is asserted above,
+        and one test should not need two defects to fail.
+        """
+        env = _perp_harness(products=(GateioProductType.PERP, GateioProductType.INVERSE))
+        try:
+            env.perp.responses["accounts"] = _futures_wallet()
+            env.inverse.responses["accounts"] = _futures_wallet(
+                currency="BTC",
+                position_mode="dual_side",
+                in_dual_mode=False,
+            )
+
+            refusal = _start_and_capture_refusal(env)
+
+            _assert_nothing_was_started(env, refusal)
+            assert "INVERSE" in str(refusal)
+        finally:
+            env.close()
+
+
 # -- a one-way account starts, and the products without a hedge mode are exempt
 
 
@@ -389,6 +695,37 @@ class TestTheModeCannotBeDetermined:
         env = _perp_harness()
         try:
             env.perp.responses["accounts"] = {}
+
+            env.run(env.client._assert_one_way_position_mode())  # must not raise
+        finally:
+            env.close()
+
+    @pytest.mark.parametrize("blank", [None, "", 0, False])
+    def test_a_blank_position_mode_is_read_as_one_way_too(self, blank: Any):
+        """The one place the check is **not** fail-closed, stated so it is visible.
+
+        Everywhere else in this module an answer the client cannot read as
+        one-way stops the start. Here it does not: the ``or "single"`` in
+        `_assert_one_way_position_mode` turns "the venue said nothing about the
+        position mode" into "the venue said one-way", and a wallet that answers
+        ``position_mode: null`` — which is what a partially provisioned futures
+        account and a proxy that drops unknown fields both produce — starts a
+        client that never established the mode at all. The legacy flag is left
+        false here because it is absent in exactly the same situations.
+
+        This test records the hole; it does not endorse it. Closing it means
+        refusing on a blank answer, which is a behaviour change in
+        `nautilus_gateio/execution.py` and belongs in a commit with a CHANGELOG
+        entry. When that lands, **delete this test** — do not weaken it into
+        accepting either outcome, because a test that passes both ways is how
+        the property got lost the first time.
+        """
+        env = _perp_harness()
+        try:
+            env.perp.responses["accounts"] = _futures_wallet(
+                position_mode=blank,
+                in_dual_mode=False,
+            )
 
             env.run(env.client._assert_one_way_position_mode())  # must not raise
         finally:
