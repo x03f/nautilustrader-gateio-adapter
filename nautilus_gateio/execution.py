@@ -892,8 +892,11 @@ class GateioExecutionClient(LiveExecutionClient):
     ------
     ValueError
         If the configured product set is empty or not served by the configured
-        environment. The configuration struct is frozen, so this validation
-        happens here rather than on the struct.
+        environment, or if ``spot_account_mode`` is ``UNIFIED`` while ``SPOT`` is
+        not among the products (the unified ledger is only ever read while
+        sweeping the spot wallet, so such a client can never state its account).
+        The configuration struct is frozen, so this validation happens here
+        rather than on the struct.
 
     Warnings
     --------
@@ -916,6 +919,25 @@ class GateioExecutionClient(LiveExecutionClient):
     ) -> None:
         products = validate_products(config.products, config.environment)
         spot_mode = config.spot_account_mode
+
+        # Cross-field validation the frozen config struct cannot express. A
+        # Unified Account reports one cross-product balance that subsumes every
+        # wallet, and this client reads it in exactly one place: while sweeping
+        # the spot wallet (`_collect_spot_balances`). Without SPOT among the
+        # products that sweep never happens, so `_update_account_state` finds no
+        # unified snapshot, refuses to publish a per-wallet sum it knows would be
+        # inflated, and the client then fails to start thirty seconds later
+        # inside `_await_account_registered` with an error naming the unified
+        # ledger rather than the configuration. Nothing works today that this
+        # rejects; it only replaces a delayed, misdirected failure with an
+        # immediate and accurate one.
+        if spot_mode is GateioSpotAccountMode.UNIFIED and GateioProductType.SPOT not in products:
+            raise ValueError(
+                "`spot_account_mode=UNIFIED` requires GateioProductType.SPOT among `products`: "
+                "the unified ledger is read only while sweeping the spot wallet, so this client "
+                "would never read a balance it could publish. Add SPOT, or configure the spot "
+                "account mode this key trades under.",
+            )
 
         cash_account = set(products) == {GateioProductType.SPOT} and not spot_mode.is_margin
         account_type = AccountType.CASH if cash_account else AccountType.MARGIN
@@ -940,6 +962,17 @@ class GateioExecutionClient(LiveExecutionClient):
         self._products: tuple[GateioProductType, ...] = products
         self._spot_mode = spot_mode
         self._account_type = account_type
+
+        if spot_mode.is_margin and GateioProductType.SPOT not in products:
+            # Every use of the mode is on a spot path: the `account` field of a
+            # spot order, and the margin ledger sweep. With no spot product
+            # enabled it selects nothing, so say so rather than let it read as
+            # margin trading being configured.
+            self._log.warning(
+                f"`spot_account_mode={spot_mode.value}` has no effect without "
+                f"GateioProductType.SPOT among the products; it selects the ledger spot orders "
+                f"trade against and this client places none",
+            )
 
         # REST namespaces
         self._http_client = http_client

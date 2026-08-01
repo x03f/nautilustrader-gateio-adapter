@@ -448,3 +448,73 @@ class TestCashBorrowingIsNeverRegistered:
             ),
         )
         assert client.account_type == AccountType.MARGIN
+
+
+class TestSpotAccountModeAgainstProducts:
+    """Cross-field validation the frozen config struct cannot do.
+
+    The unified ledger is read in one place only — the spot wallet sweep — so a
+    unified client without SPOT among its products reads no balance it is willing
+    to publish, never registers its account, and fails inside
+    ``_await_account_registered`` thirty seconds into connecting.
+    """
+
+    @pytest.mark.parametrize(
+        "products",
+        [
+            (GateioProductType.PERP,),
+            (GateioProductType.PERP, GateioProductType.FUT),
+            (GateioProductType.OPT,),
+        ],
+    )
+    def test_unified_without_spot_is_refused_at_construction(
+        self,
+        node_components,
+        block_network,
+        products,
+    ):
+        with pytest.raises(ValueError, match="requires GateioProductType.SPOT"):
+            build_exec_client(
+                node_components,
+                GateioExecClientConfig(
+                    products=products,
+                    spot_account_mode=GateioSpotAccountMode.UNIFIED,
+                ),
+            )
+
+    def test_unified_with_spot_is_accepted(self, node_components, block_network):
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(
+                products=(GateioProductType.SPOT, GateioProductType.PERP),
+                spot_account_mode=GateioSpotAccountMode.UNIFIED,
+            ),
+        )
+        assert client.account_type == AccountType.MARGIN
+
+    @pytest.mark.parametrize(
+        "mode",
+        [GateioSpotAccountMode.MARGIN, GateioSpotAccountMode.CROSS_MARGIN],
+    )
+    def test_an_inert_margin_mode_is_allowed_and_said_to_be_inert(
+        self,
+        node_components,
+        block_network,
+        log_capture,
+        mode,
+    ):
+        """The other margin modes select a spot ledger and nothing else.
+
+        Without SPOT they change no behaviour, so the client starts — and says
+        the setting is doing nothing rather than let it read as configured
+        margin trading.
+        """
+        log_capture.mark()
+        client = build_exec_client(
+            node_components,
+            GateioExecClientConfig(products=(GateioProductType.PERP,), spot_account_mode=mode),
+        )
+        assert client.account_type == AccountType.MARGIN
+
+        lines = log_capture.wait_for("has no effect without")
+        assert any(f"spot_account_mode={mode.value}" in line for line in lines), lines
