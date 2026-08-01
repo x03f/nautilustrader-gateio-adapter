@@ -100,9 +100,17 @@ a cancel-all is logged and dropped.
 Spot orders additionally name a ledger. `spot_account_mode` is sent as the
 `account` field on every spot order, so `SPOT`, `MARGIN` (isolated),
 `CROSS_MARGIN` and `UNIFIED` select which spot ledger trades. Any margin mode
-registers cash borrowing for the venue with NautilusTrader's account factory,
-because a margin ledger can hold a negative balance that a cash account would
-refuse.
+makes the Nautilus account `MARGIN` rather than `CASH`, and that is what lets it
+hold the negative balance a borrowed position produces — only a `CashAccount`
+refuses one. Nothing registers cash borrowing for the venue: that registration is
+read in one place, when the platform builds a `CashAccount`, which a margin mode
+guarantees this client is not.
+
+`UNIFIED` is refused unless `SPOT` is among the products, because the unified
+ledger is read only while sweeping the spot wallet; the constructor raises
+`ValueError` rather than let the client fail at start-up over a balance it can
+never publish. See
+[configuration.md](configuration.md#which-ledger-a-spot-order-names).
 
 Position mode is checked at connect, once per perpetual product (delivery
 futures and options have no hedge mode, and the check is skipped with a warning

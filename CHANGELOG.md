@@ -17,6 +17,27 @@ leaves a subscription the client reports as held for the rest of its life and
 never retries. Everything below is implemented and mock-tested — the offline
 suite drives it against recorded venue payload shapes. None of it has been run
 against Gate.io: the mainnet column stays empty for every row this round adds.
+It also refuses one configuration it used to accept, and changes what the
+execution client puts on the wire — both are below, under **Changed (breaking)**
+and **Changed**.
+
+### Changed (breaking)
+
+- **`spot_account_mode=UNIFIED` without `GateioProductType.SPOT` among
+  `products` now raises `ValueError`** from `GateioExecutionClient.__init__`,
+  before any network activity. A node whose configuration file pairs `UNIFIED`
+  with a derivative-only product set constructed fine before this and will not
+  construct after it. Nothing that worked is refused: the unified ledger is read
+  in exactly one place — while sweeping the spot wallet — so without spot the
+  client never obtained a balance it was willing to publish, and it failed some
+  thirty seconds into start-up inside `_await_account_registered`, with a message
+  about the unified ledger rather than about the configuration. The refusal
+  replaces a delayed and misdirected failure with an immediate and accurate one.
+  Add `SPOT` to `products`, or set the spot account mode this key actually trades
+  under. `MARGIN` and `CROSS_MARGIN` without spot are unaffected: they select
+  nothing, and are now logged as having no effect rather than refused.
+  `docs/configuration.md`, `docs/products.md` and `docs/execution.md` state the
+  rule and where it comes from.
 
 ### Added
 
@@ -92,6 +113,22 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
 
 ### Fixed
 
+- **A spot-margin execution client no longer registers cash borrowing for the
+  whole venue.** `AccountFactory.register_cash_borrowing(GATE_IO)` was called
+  whenever `spot_account_mode` named a margin ledger, to let the account hold the
+  negative balance a borrowed position produces. It never did that: the flag is
+  read in one place, the `CashAccount` branch of `AccountFactory.create_c`, and a
+  margin spot mode makes this client a `MARGIN` account, which holds negative
+  balances anyway. What the call could do was the reverse of its intent, because
+  the registration is process-global and permanent — every *cash* Gate.io account
+  created afterwards in the same process accepted negative balances, and
+  NautilusTrader's risk engine skips the free-balance check entirely for such an
+  account, so a plain spot node sharing a process with a margin one could place
+  orders its balance does not cover. The call is gone; nothing about the margin
+  account's own behaviour changes. `docs/execution.md` and `docs/products.md` no
+  longer describe the registration, and no longer carry the *mock-tested* status
+  it stood on.
+
 - **A published `GateioTicker` reached no subscriber.** The row was handed to
   `_handle_data` unwrapped, and `DataEngine` dispatches a venue-native type only
   through `CustomData`: anything else falls to `Cannot handle data: unrecognized
@@ -145,6 +182,23 @@ against Gate.io: the mainnet column stays empty for every row this round adds.
   the configured host resolves.
 
 ### Changed
+
+- **Orders now carry a submission deadline, which changes what Gate.io receives.**
+  The execution client reads the venue clock (`GET /spot/time`) as the first act
+  of connecting, which is the precondition the transport withholds the
+  `x-gate-exptime` header on. So in the default configuration every spot and
+  futures submit, batch submit, cancel, cancel-all and amend now leaves with a
+  deadline ten seconds ahead of the venue clock, and the venue rejects it if it
+  arrives later. Before this nothing in the package called `sync_time()`, so no
+  deployment ever sent one: an order held up in the network stayed acceptable
+  indefinitely and could execute against a price it was never meant to see.
+  Signed requests are timestamped against the same offset, which is the other
+  reason the reference adapter reads the venue clock while connecting. A clock
+  reading that fails is logged and the client connects anyway — the deadline is a
+  protection, not a precondition — and the options endpoints still carry no
+  deadline, because Gate.io documents none for them. The ten seconds are not
+  configurable from either client config. `docs/configuration.md` and
+  `docs/architecture.md` follow.
 
 - **The branch no longer reports the released version.** `pyproject.toml` and
   `nautilus_gateio.__version__` carry `0.2.0a2.dev0`: a

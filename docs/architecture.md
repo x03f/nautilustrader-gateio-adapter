@@ -158,15 +158,23 @@ clock offset, and the retry policy. The namespace classes
 `GateioOptionsHttpAPI`, `GateioWalletHttpAPI`) each take that client and return
 decoded payloads unchanged.
 
-The clock offset is opt-in and worth knowing about, because two features hang off
-it. Signatures embed a timestamp, so a drifting local clock produces
-`INVALID_SIGNATURE`; and Gate.io's optional `x-gate-exptime` submission deadline
-bounds how late a request delayed in flight may still be accepted. Calling
-`sync_time()` measures the offset against the venue and enables both. Neither
-client calls it during connect, so an unsynchronized transport signs with the
-local clock and sends no deadline header — the deadline is deliberately withheld
-rather than computed from a clock that has not been checked, since an
-unsynchronized clock would expire valid requests.
+The clock offset is worth knowing about, because two features hang off it.
+Signatures embed a timestamp, so a drifting local clock produces
+`INVALID_SIGNATURE`; and Gate.io's `x-gate-exptime` submission deadline bounds
+how late a request delayed in flight may still be accepted. Calling `sync_time()`
+measures the offset against the venue and enables both, and the deadline is
+deliberately withheld until it has been measured rather than computed from a
+clock that has not been checked, since an unsynchronized clock would expire valid
+requests.
+
+The execution client makes that call as the first act of `_connect`, before
+anything is signed, so a node running one signs against the venue clock and
+carries a deadline on every spot and futures order it sends. A reading that fails
+is logged and the client connects anyway: the deadline is a protection, not a
+precondition. The data client never calls it — the transport is shared and
+reference counted, so a data client that sits beside an execution client inherits
+the offset once the execution client has connected, while a data-only node signs
+with the local clock and sends no deadline.
 
 Perpetual and delivery futures share one namespace class, because Gate.io serves
 them from paths that differ only in two segments. The `/futures/{settle}` versus

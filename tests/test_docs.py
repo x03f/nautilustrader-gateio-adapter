@@ -17,7 +17,12 @@ Covered:
 * the feature matrix uses the platform's two glyphs and nothing else, and claims
   no mainnet run while none is recorded;
 * CI verifies the built wheel from outside the source tree, importing every
-  sub-package, and cleans stale artefacts before building.
+  sub-package, and cleans stale artefacts before building;
+* three behaviours a page could describe accurately in the tense the code has
+  left — the refused `spot_account_mode=UNIFIED` pairing, the submission deadline
+  the execution client now enables on connect, and the cash-borrowing
+  registration that is gone — are each pinned by running the code and reading the
+  prose against the result, in one test, so neither side can move alone.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import msgspec
@@ -37,6 +43,7 @@ from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConf
 
 from nautilus_gateio.common.enums import GateioProductType, GateioSpotAccountMode
 from nautilus_gateio.config import GateioDataClientConfig, GateioExecClientConfig
+from nautilus_gateio.http.client import EXPIRY_HEADER
 
 REPO = Path(__file__).resolve().parent.parent
 DOCS = REPO / "docs"
@@ -653,3 +660,376 @@ class TestReleaseArtefactHygiene:
             if "twine upload dist/*" in page.read_text(encoding="utf-8")
         ]
         assert not offenders, f"a bare `twine upload dist/*` is recommended in: {offenders}"
+
+
+# --------------------------------------------------------------------------
+# Documented behaviour is the landed behaviour (DOC-03)
+# --------------------------------------------------------------------------
+#
+# The guards above catch a page that names something the package no longer
+# exports. They cannot catch the harder drift, which is a page that describes a
+# behaviour accurately in the tense the code has left: the symbol still exists,
+# the sentence still parses, and it is a lie. Three behaviours changed under this
+# heading, and every page that described them kept the old description.
+#
+# Each test below establishes the fact by *running the code*, then reads the
+# shipped prose against it. Neither half is worth anything alone — a prose guard
+# alone pins the wording of a claim nobody has checked, and a behaviour test
+# alone is what let the documentation drift in the first place — so the two are
+# deliberately in one test: the page and the package can only pass together.
+
+
+def _sentences(page: Path) -> list[tuple[int, str]]:
+    """The page split into sentences, each with the line it starts on.
+
+    The sentence is the unit a claim is made in, and it has to be: a markdown
+    bullet list carries no blank lines, so a whole "before your first order"
+    section is one paragraph, and a guard reading paragraphs is satisfied by the
+    word "refuses" appearing four bullets away about something else. Splitting on
+    a period followed by whitespace leaves `AccountFactory.register_cash_borrowing`
+    and `0.1.0` intact, which is the only precision that matters here.
+    """
+    text = page.read_text(encoding="utf-8")
+    sentences: list[tuple[int, str]] = []
+    offset = 0
+    for piece in re.split(r"(?<=\.)\s", text):
+        sentences.append((text[:offset].count("\n") + 1, piece))
+        offset += len(piece) + 1
+    return sentences
+
+
+#: Pages that own the account-mode rules. A reader configuring a node reaches the
+#: combination through one of these four and nowhere else.
+LEDGER_PAGES = (README, DOCS / "configuration.md", DOCS / "execution.md", DOCS / "products.md")
+
+#: Pages that own the transport's clock and the submission deadline.
+DEADLINE_PAGES = (DOCS / "configuration.md", DOCS / "architecture.md")
+
+
+def _phrases(*phrases: str) -> re.Pattern[str]:
+    """One case-insensitive alternation over phrases, tolerant of line wrapping.
+
+    Every one of these patterns is read against prose that a formatter has already
+    hard-wrapped at 80 columns, so a phrase is as likely to straddle a newline as
+    not. A pattern that assumes single spaces silently stops guarding whichever
+    page the wrap fell badly on — which is how the architecture page kept its
+    false sentence while the configuration page lost its own.
+    """
+    joined = "|".join(phrase.replace(" ", r"\s+") for phrase in phrases)
+    return re.compile(f"({joined})", re.IGNORECASE)
+
+
+#: Prose that says a setting selects nothing and costs nothing.
+INERT_CLAIM = _phrases(
+    r"\binert\b",
+    r"has no effect",
+    r"only takes effect",
+    r"not take effect",
+    r"no spot order is ever sent",
+    r"only visible effect",
+)
+
+#: Prose that says the client will not build.
+REFUSAL_CLAIM = _phrases(
+    r"\brefus\w+",
+    r"\breject\w+",
+    r"raises? `?ValueError`?",
+    r"will not construct",
+)
+
+#: Falsified verbatim: the execution client does cross-check the two fields, and
+#: the validation table's Execution row no longer reads "product set only".
+#: Read line by line, because the table row is one line and the sentence is not.
+CROSS_CHECK_DENIALS = _phrases(
+    r"does not cross-?check",
+    r"product set only",
+    r"inert rather than wrong",
+)
+
+#: A sentence denying that any client in the package reads the venue clock. The
+#: subject is what makes it false, so the pattern requires both halves in one
+#: sentence: a page may still say the *data* client never calls it.
+NO_CLIENT_SYNCS = re.compile(
+    r"(neither\s+client|no\s+client|nothing\s+in\s+th(?:e|is)\s+package)"
+    r"[^.]*?(sync_time|clock\s+offset|exptime|deadline|that\s+call)",
+    re.IGNORECASE,
+)
+
+#: Prose tying the clock reading that enables the deadline to the execution
+#: client's connect. All three of subject, moment and topic have to be in one
+#: sentence: "the execution client opens one private connection per product" is
+#: about neither the clock nor the deadline, and a page saying only that would
+#: otherwise pass for having explained where the deadline comes from.
+CLOCK_TOPIC = r"(clock|sync_time|offset|deadline|exptime)"
+CLOCK_READ_ON_CONNECT = re.compile(
+    rf"execution\s+client[^.]*?(connect|_connect)[^.]*?{CLOCK_TOPIC}"
+    rf"|execution\s+client[^.]*?{CLOCK_TOPIC}[^.]*?(connect|_connect)",
+    re.IGNORECASE,
+)
+
+#: Words that deny the cash-borrowing registration happens.
+BORROWING_DENIAL = _phrases(
+    r"nothing registers",
+    r"never registers",
+    r"no longer registers",
+    r"is not registered",
+    r"does not register",
+    r"removed",
+    r"is gone",
+)
+
+
+@pytest.fixture
+def doc_node_components():
+    """Clock, message bus, cache and loop, as a ``TradingNode`` would provide."""
+    import asyncio
+
+    from nautilus_trader.cache.cache import Cache
+    from nautilus_trader.common.component import LiveClock, MessageBus
+    from nautilus_trader.model.identifiers import TraderId
+
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TraderId("TESTER-000"), clock=clock)
+    cache = Cache()
+    loop = asyncio.new_event_loop()
+    yield clock, msgbus, cache, loop
+    loop.close()
+
+
+def _build_exec_client(components, config: GateioExecClientConfig):
+    from nautilus_gateio.factories import GateioLiveExecClientFactory
+
+    clock, msgbus, cache, loop = components
+    return GateioLiveExecClientFactory.create(
+        loop=loop,
+        name="GATE_IO",
+        config=config,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+    )
+
+
+class TestDocumentedBehaviourIsTheLandedBehaviour:
+    """Prose that the code contradicts, pinned against the code that contradicts it."""
+
+    def test_the_refused_unified_configuration_is_not_described_as_harmless(
+        self,
+        doc_node_components,
+        block_network,
+    ) -> None:
+        # The fact, taken from the constructor rather than from a page.
+        with pytest.raises(ValueError, match="UNIFIED"):
+            _build_exec_client(
+                doc_node_components,
+                GateioExecClientConfig(
+                    products=(GateioProductType.PERP,),
+                    spot_account_mode=GateioSpotAccountMode.UNIFIED,
+                ),
+            )
+
+        offenders = []
+        for page in _doc_pages():
+            for start, sentence in _sentences(page):
+                if "UNIFIED" not in sentence:
+                    continue
+                if INERT_CLAIM.search(sentence) and not REFUSAL_CLAIM.search(sentence):
+                    offenders.append(
+                        f"{page.relative_to(REPO)}:{start} calls the mode inert without "
+                        f"saying it is refused without SPOT: {sentence.strip()[:120]!r}"
+                    )
+        assert not offenders, "; ".join(offenders)
+
+        silent = [
+            str(page.relative_to(REPO))
+            for page in LEDGER_PAGES
+            if not any(
+                "UNIFIED" in sentence and "SPOT" in sentence and REFUSAL_CLAIM.search(sentence)
+                for _, sentence in _sentences(page)
+            )
+        ]
+        assert not silent, (
+            "these pages document `spot_account_mode` but never state in one sentence that "
+            f"`UNIFIED` without `SPOT` is refused: {silent}"
+        )
+
+    def test_no_page_denies_the_cross_check_the_constructor_performs(
+        self,
+        doc_node_components,
+        block_network,
+    ) -> None:
+        # It is a *cross*-check on two fields, so pin all three corners. A refusal
+        # keyed to the product set alone refuses the first of these; one keyed to
+        # the mode alone refuses the second, which is the configuration every page
+        # here tells an operator to use.
+        _build_exec_client(
+            doc_node_components,
+            GateioExecClientConfig(
+                products=(GateioProductType.OPT,),
+                spot_account_mode=GateioSpotAccountMode.SPOT,
+            ),
+        )
+        _build_exec_client(
+            doc_node_components,
+            GateioExecClientConfig(
+                products=(GateioProductType.SPOT,),
+                spot_account_mode=GateioSpotAccountMode.UNIFIED,
+            ),
+        )
+        with pytest.raises(ValueError):
+            _build_exec_client(
+                doc_node_components,
+                GateioExecClientConfig(
+                    products=(GateioProductType.OPT,),
+                    spot_account_mode=GateioSpotAccountMode.UNIFIED,
+                ),
+            )
+
+        offenders = []
+        for page in _doc_pages():
+            text = page.read_text(encoding="utf-8")
+            for match in CROSS_CHECK_DENIALS.finditer(text):
+                line = text[: match.start()].count("\n") + 1
+                offenders.append(f"{page.relative_to(REPO)}:{line}: {match.group(0).strip()!r}")
+        assert not offenders, (
+            "the execution client cross-checks `spot_account_mode` against `products`, "
+            f"but these passages deny it: {offenders}"
+        )
+
+    def test_the_submission_deadline_is_documented_as_sent(
+        self,
+        doc_node_components,
+        block_network,
+    ) -> None:
+        # Connect a default execution client with every venue call stubbed out
+        # *except* the clock reading, which runs for real against a stubbed
+        # transport, and then ask the transport for the headers it would put on an
+        # order. Stubbing `sync_time` itself would only pin that `_connect` calls
+        # something by that name: the measurement, the flag it sets and the header
+        # it unlocks are three separate steps, and the deadline is only sent if
+        # all three happen.
+        _, _, _, loop = doc_node_components
+        client = _build_exec_client(
+            doc_node_components,
+            GateioExecClientConfig(account_polling_interval_secs=0.0),
+        )
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        client._instrument_provider.initialize = _noop
+        client._load_user_id = _noop
+        client._assert_one_way_position_mode = _noop
+        client._update_account_state = _noop
+        client._await_account_registered = _noop
+        client._connect_private_websocket = _noop
+
+        transport = client._http_client
+        asked: list[tuple[str, str]] = []
+
+        async def fake_request(method: str, path: str, *args, **kwargs):
+            asked.append((method, path))
+            return {"server_time": int(time.time() * 1000)}
+
+        transport.request = fake_request
+        loop.run_until_complete(client._connect())
+
+        assert ("GET", "/spot/time") in asked, (
+            f"connecting read no venue clock, so no order can carry a deadline: {asked}"
+        )
+        headers = transport._build_headers(
+            "POST",
+            "/api/v4/spot/orders",
+            "",
+            "",
+            signed=False,
+            expiring=True,
+        )
+        assert EXPIRY_HEADER in (headers or {}), (
+            "a default execution client puts no submission deadline on a spot order after "
+            "connecting; the pages below would then be right and this test wrong"
+        )
+
+        offenders = []
+        for page in _doc_pages():
+            text = page.read_text(encoding="utf-8")
+            for match in NO_CLIENT_SYNCS.finditer(text):
+                line = text[: match.start()].count("\n") + 1
+                offenders.append(f"{page.relative_to(REPO)}:{line}: {match.group(0).strip()!r}")
+        assert not offenders, (
+            "the execution client reads the venue clock on connect, so the deadline is sent "
+            f"in the default configuration, but these passages deny it: {offenders}"
+        )
+
+        silent = [
+            str(page.relative_to(REPO))
+            for page in DEADLINE_PAGES
+            if not CLOCK_READ_ON_CONNECT.search(page.read_text(encoding="utf-8"))
+        ]
+        assert not silent, (
+            "these pages document the `x-gate-exptime` deadline but never say the execution "
+            f"client measures the clock offset on connect, which is what enables it: {silent}"
+        )
+
+    def test_no_page_claims_cash_borrowing_is_registered(
+        self,
+        doc_node_components,
+        block_network,
+    ) -> None:
+        from nautilus_trader.accounting.accounts.cash import CashAccount
+        from nautilus_trader.accounting.error import AccountBalanceNegative
+        from nautilus_trader.accounting.factory import AccountFactory
+        from nautilus_trader.core.uuid import UUID4
+        from nautilus_trader.model.currencies import USDT
+        from nautilus_trader.model.enums import AccountType
+        from nautilus_trader.model.events import AccountState
+        from nautilus_trader.model.identifiers import AccountId
+        from nautilus_trader.model.objects import AccountBalance, Money
+
+        from nautilus_gateio.common.constants import GATEIO
+
+        try:
+            _build_exec_client(
+                doc_node_components,
+                GateioExecClientConfig(
+                    products=(GateioProductType.SPOT,),
+                    spot_account_mode=GateioSpotAccountMode.CROSS_MARGIN,
+                ),
+            )
+            funded = Money(1_000, USDT)
+            account = AccountFactory.create(
+                AccountState(
+                    account_id=AccountId(f"{GATEIO}-master"),
+                    account_type=AccountType.CASH,
+                    base_currency=None,
+                    reported=True,
+                    balances=[AccountBalance(funded, Money(0, USDT), funded)],
+                    margins=[],
+                    info={},
+                    event_id=UUID4(),
+                    ts_event=0,
+                    ts_init=0,
+                )
+            )
+            assert isinstance(account, CashAccount)
+            overdrawn = Money(-1, USDT)
+            with pytest.raises(AccountBalanceNegative):
+                account.update_balances([AccountBalance(overdrawn, Money(0, USDT), overdrawn)])
+        finally:
+            AccountFactory.deregister_cash_borrowing(GATEIO)
+
+        offenders = []
+        for page in _doc_pages():
+            for start, sentence in _sentences(page):
+                claim = re.search(
+                    r"register(s|ed)?\s+cash\s+borrowing|register_cash_borrowing",
+                    sentence,
+                )
+                if claim and not BORROWING_DENIAL.search(sentence):
+                    offenders.append(
+                        f"{page.relative_to(REPO)}:{start}: {sentence.strip()[:120]!r}"
+                    )
+        assert not offenders, (
+            "a margin-mode client registers no cash borrowing — a Gate.io cash account still "
+            f"refuses a negative balance — but these passages say it does: {offenders}"
+        )
