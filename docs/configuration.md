@@ -17,6 +17,15 @@ The two field tables below are complete for the fields the adapter adds. Fields
 inherited from the NautilusTrader base configs are covered separately under
 [Inherited fields](#inherited-fields).
 
+Where this page grades a behavior it uses one rung of the project's single
+evidence ladder — *implemented*, *unit-tested*, *offline-harness*,
+*mainnet-confirmed* — which is defined once, in
+[validation.md](validation.md#the-evidence-ladder). This page defines no scale of
+its own. A rung is a statement about the record in this repository, not about the
+exchange: only *mainnet-confirmed* means Gate.io has been seen doing the thing,
+and the runs that earn it are listed on that page. *Unsupported* is not a rung on
+the ladder: it says the capability does not exist here at all.
+
 ## The environment default is mainnet
 
 `GateioDataClientConfig` and `GateioExecClientConfig` both set
@@ -81,8 +90,63 @@ That check runs on the product set, not on the URLs, so it also applies when
 operator's decision — but the product/environment combination is still rejected
 first.
 
-Environment selection, URL resolution and this validation are *implemented and
-mock-tested* (`tests/test_config.py`, `tests/test_factories.py`).
+Environment selection, URL resolution and this validation are **unit-tested**
+(`tests/test_config.py`, `tests/test_factories.py`).
+
+### The endpoint addresses are named constants
+
+Every address the adapter can dial is a constant in
+`nautilus_gateio.common.constants`, so a tool that needs one can read it instead
+of copying a string that may move. `resolve_http_url()` and
+`resolve_ws_url(product)` pick from these tables; `base_url_http` and
+`base_url_ws` replace what they picked.
+
+| REST constant          | Value                            |
+|------------------------|----------------------------------|
+| `GATEIO_HTTP_MAINNET`  | `https://api.gateio.ws`          |
+| `GATEIO_HTTP_TESTNET`  | `https://api-testnet.gateapi.io` |
+| `GATEIO_API_PREFIX`    | `/api/v4`                        |
+
+`GATEIO_API_PREFIX` is not part of the base URL: the transport joins it to every
+endpoint path itself, and it is also the path the request signature is computed
+over. A `base_url_http` override therefore names a host, not a host plus prefix.
+
+Gate.io serves each product family from its own WebSocket host, and the public
+and private sockets of a product share one address:
+
+| WebSocket constant            | Product                          | Value                                        |
+|-------------------------------|----------------------------------|----------------------------------------------|
+| `GATEIO_WS_SPOT`              | spot                             | `wss://api.gateio.ws/ws/v4/`                 |
+| `GATEIO_WS_PERP_USDT`         | USDT perpetual (`PERP`)          | `wss://fx-ws.gateio.ws/v4/ws/usdt`           |
+| `GATEIO_WS_PERP_BTC`          | BTC-settled perpetual (`INVERSE`)| `wss://fx-ws.gateio.ws/v4/ws/btc`            |
+| `GATEIO_WS_DELIVERY_USDT`     | delivery futures (`FUT`)         | `wss://fx-ws.gateio.ws/v4/ws/delivery/usdt`  |
+| `GATEIO_WS_OPTIONS`           | options (`OPT`)                  | `wss://op-ws.gateio.live/v4/ws`              |
+| `GATEIO_WS_OPTIONS_USDT`      | options, settle-suffixed variant | `wss://op-ws.gateio.live/v4/ws/usdt`         |
+| `GATEIO_WS_OPTIONS_BTC`       | options, settle-suffixed variant | `wss://op-ws.gateio.live/v4/ws/btc`          |
+| `GATEIO_WS_SPOT_TESTNET`      | spot, testnet                    | `wss://ws-testnet.gate.com/v4/ws/spot`       |
+| `GATEIO_WS_PERP_USDT_TESTNET` | USDT perpetual, testnet          | `wss://fx-ws-testnet.gateio.ws/v4/ws/usdt`   |
+
+The options host is worth a note: the address published in parts of Gate.io's
+documentation, `op-ws.gateio.ws`, does not resolve, and the host this adapter
+uses is `op-ws.gateio.live`. The two settle-suffixed option variants are reachable
+only through `base_url_ws`; the default for `OPT` is `GATEIO_WS_OPTIONS`.
+
+Two module-level helpers sit on top of the table. `WS_URLS` maps a
+`GateioProductType` onto its mainnet address, and `ws_url(product, testnet=False)`
+adds the testnet substitution — raising `ValueError` for a product Gate.io
+publishes no testnet endpoint for, which is the same refusal
+[described above](#which-products-exist-on-the-testnet), reached one layer down.
+
+```python
+from nautilus_gateio.common.constants import WS_URLS, ws_url
+from nautilus_gateio import GATEIO_HTTP_MAINNET, GATEIO_HTTP_TESTNET, GateioProductType
+
+ws_url(GateioProductType.PERP, testnet=True)  # wss://fx-ws-testnet.gateio.ws/v4/ws/usdt
+```
+
+Four of these — `GATEIO_HTTP_MAINNET`, `GATEIO_HTTP_TESTNET`, `GATEIO_WS_SPOT`
+and `GATEIO_WS_OPTIONS` — are also re-exported from the package root. The rest
+are reached through `nautilus_gateio.common.constants`, as shown above.
 
 ## The venue string is `GATE_IO`
 
@@ -143,8 +207,7 @@ mainnet key is not valid there and the venue will reject the signature. Setting
 `GATE_TESTNET_API_KEY` / `GATE_TESTNET_API_SECRET` explicitly avoids the
 ambiguity.
 
-Credential resolution and masking are *implemented and mock-tested*
-(`tests/test_config.py`).
+Credential resolution and masking are **unit-tested** (`tests/test_config.py`).
 
 ## `GateioDataClientConfig`
 
@@ -199,7 +262,7 @@ Extends `nautilus_trader.live.config.LiveExecClientConfig`.
 | `base_url_http`                 | `str \| None`                   | `None`                       | Overrides the REST base URL derived from `environment`                                                                                             |
 | `base_url_ws`                   | `str \| None`                   | `None`                       | Overrides the private WebSocket URL for every configured product                                                                                   |
 | `spot_account_mode`             | `GateioSpotAccountMode`         | `GateioSpotAccountMode.SPOT` | Which ledger spot orders trade against: `SPOT`, `MARGIN` (isolated), `CROSS_MARGIN` or `UNIFIED`. See [Account model](#account-model)              |
-| `client_order_id_tag`           | `str`                           | `"ng"`                       | Short tag embedded in generated Gate.io `text` client order ids                                                                                    |
+| `client_order_id_tag`           | `str`                           | `"ng"`                       | Short tag embedded in generated Gate.io `text` client order ids. Not validated; keep it to twelve characters or fewer, for the reason under [client order ids](execution.md#client-order-ids) |
 | `account_polling_interval_secs` | `NonNegativeFloat`              | `30.0`                       | Interval of the REST account-state poll that backs up the private WebSocket balance stream. `0` disables the poll; a negative interval is refused  |
 | `max_retries`                   | `PositiveInt`                   | `3`                          | Total REST attempts for a request the transport may safely repeat. Must be at least `1`; below that the configuration is **refused**, not clamped  |
 | `http_timeout_secs`             | `PositiveFloat`                 | `20.0`                       | Per-request REST timeout. Must be above `0`                                                                                                        |
@@ -219,8 +282,7 @@ that the request was rejected before it was processed (HTTP 429, or a label
 meaning the same). Any other failure of a mutating request is raised as an
 ambiguous-request error telling the caller to reconcile rather than resubmit.
 Raising `max_retries` therefore does not increase the risk of a duplicate order.
-This classification is *implemented and mock-tested*
-(`tests/test_http_client.py`).
+This classification is **unit-tested** (`tests/test_http_client.py`).
 
 ## Numbers outside their range are refused, not repaired
 
@@ -301,9 +363,9 @@ lists thousands of option contracts. `options_underlyings` restricts the load
 A product whose wallet has never been provisioned is skipped with a warning
 rather than aborting start-up, because Gate.io creates the futures, delivery and
 options wallets on the first internal transfer into them, and reports
-`USER_NOT_FOUND` until then. For instrument loading this is *implemented and
-mock-tested* (`tests/test_providers.py`); the execution client applies the same
-rule when it reads that product's wallet.
+`USER_NOT_FOUND` until then. For instrument loading this is **unit-tested**
+(`tests/test_providers.py`); the execution client applies the same rule when it
+reads that product's wallet.
 
 ## Account model
 
@@ -329,7 +391,7 @@ The account type is not configured directly. It is derived:
 | any margin spot mode (`MARGIN`, `CROSS_MARGIN`, `UNIFIED`) | `MARGIN`               |
 | any derivative product configured, alone or with spot      | `MARGIN`               |
 
-That derivation is *implemented and mock-tested* (`tests/test_factories.py`).
+That derivation is **unit-tested** (`tests/test_factories.py`).
 
 ### Which ledger a spot order names
 
@@ -349,8 +411,15 @@ price-triggered spot order says `normal` where a regular order says `spot`, and
 the price-order schema has no cross-margin value at all. Rather than silently
 downgrade such an order to a different ledger, the client rejects it with an
 explicit reason. Regular spot orders and the plain-spot price-order encoding are
-*implemented and mock-tested*; the margin and unified encodings are
-*implemented, mainnet validation pending*.
+**mainnet-confirmed**: the recorded spot runs placed, amended and canceled orders
+on the default `spot` ledger and armed price-triggered orders on the buy side,
+which is the `normal` encoding.
+
+The other three values are **implemented**. The mode-to-string mapping is
+unit-tested (`tests/test_enums.py`) and the refusal of a cross-margin
+price-triggered order is unit-tested (`tests/test_execution_orders.py`), but no
+test in this repository asserts the `account` field of an outgoing order body for
+any mode, and no order on any margin ledger has reached the venue.
 
 Two boundaries are easy to trip over:
 
@@ -394,10 +463,10 @@ statement that names the currencies whose per-product wallets are echoes. A poll
 that cannot read it therefore publishes nothing rather than fall back to summing,
 because falling back is exactly the arithmetic that doubles the account.
 
-This is *implemented and mock-tested*, including the case of a wallet stream
-update arriving after the aggregate was built (`tests/test_execution_events.py`)
-and the case of the unified ledger failing mid-session
-(`tests/test_execution_accounting.py`).
+This is **unit-tested**, including the case of a wallet stream update arriving
+after the aggregate was built (`tests/test_execution_events.py`) and the case of
+the unified ledger failing mid-session (`tests/test_execution_accounting.py`).
+No unified account has been read from the venue.
 
 The adapter never changes the account's mode. `GET /unified/unified_mode` and
 `PUT /unified/unified_mode` exist in the REST namespace
@@ -432,11 +501,11 @@ selected borrows on the venue side while filling an order — that second case i
 a property of the Gate.io account's own settings, not of this adapter, and it
 has not been exercised here.
 
-Status, stated exactly: the borrow and repay calls are *implemented, mainnet
-validation pending*. The transport's refusal to replay a borrow after an
-ambiguous failure — the property that matters most, since a replayed borrow can
-draw the loan twice — is *implemented and mock-tested*
-(`tests/test_http_namespaces.py`).
+Status, stated exactly: the borrow and repay calls are **implemented** — the code
+path exists and has been read, and nothing has exercised it end to end. The
+transport's refusal to replay a borrow after an ambiguous failure — the property
+that matters most, since a replayed borrow can draw the loan twice — is
+**unit-tested**, on a 5xx and on a timeout (`tests/test_http_namespaces.py`).
 
 The unified-account path cannot be exercised at all below the venue-side
 thresholds Gate.io places on the account modes that permit borrowing: only
@@ -458,11 +527,19 @@ account in hedge (dual) position mode is detected at connect and refused with an
 explanatory error naming the venue-side change required; the adapter does not
 switch the setting itself.
 
-Hedge mode as such is *unsupported*. The refusal is *implemented, mainnet
-validation pending*, and — unlike most of the behavior on this page — it is not
-covered by a unit test, so treat the exact message and the delivery-futures and
-options exemption (neither has a hedge mode) as read from the source rather than
-demonstrated.
+Hedge mode as such is *unsupported*. The refusal is **unit-tested**
+(`tests/test_execution_position_mode.py`): every position mode that is not
+`single`, the legacy `in_dual_mode` boolean on its own, an answer that states no
+mode at all, one hedged wallet among several products, the exemption of the
+products that have no hedge mode, and the requirement that the refusal happen
+before any private stream is opened or any account state published. The message
+naming the venue-side remedy is asserted there too, rather than read from the
+source.
+
+What is not shown is the venue's half. No hedged account has ever been offered to
+this client: the perpetual runs in [validation.md](validation.md) started, which
+is only possible against a wallet that answered `position_mode: "single"`, so the
+one-way branch is the only one Gate.io has exercised.
 
 ## Validation helpers
 
@@ -529,9 +606,8 @@ configuring the adapter honestly:
   (`0` disables the header), but no configuration field reaches it and the
   factory always builds the transport with the default. If the clock reading
   fails, the client logs it and connects anyway with the deadline off. The
-  header logic itself is *implemented and mock-tested*
-  (`tests/test_http_client.py`), and the connect-time reading in
-  `tests/test_factories.py`.
+  header logic itself is **unit-tested** (`tests/test_http_client.py`), and so is
+  the connect-time reading (`tests/test_factories.py`).
 
   **Which calls carry it, and which do not.** Gate.io declares
   `x-gate-exptime` per endpoint rather than API-wide, so the coverage is the
@@ -670,7 +746,11 @@ config = TradingNodeConfig(
     data_clients={
         "GATE_IO": ImportableConfig(
             path="nautilus_gateio.config:GateioDataClientConfig",
-            config={"products": ["SPOT", "PERP"], "instrument_provider": {"load_all": True}},
+            config={
+                "environment": "testnet",  # state it on BOTH clients, see below
+                "products": ["SPOT", "PERP"],
+                "instrument_provider": {"load_all": True},
+            },
             factory=ImportableFactoryConfig(
                 path="nautilus_gateio.factories:GateioLiveDataClientFactory",
             ),
@@ -688,6 +768,16 @@ node = TradingNode(config=config)
 node.add_exec_client_factory(GATEIO, GateioLiveExecClientFactory)
 node.build()
 ```
+
+`environment` is stated on both entries above, and that is the point rather than
+a detail of the example. The two `ImportableConfig` blocks are two independent
+configurations decoded separately, so a field given in one says nothing about the
+other, and a field left out falls back to `"mainnet"` in that block alone. Leave
+it off the data entry and the node above prices its decisions on the live
+exchange while sending its orders to the sandbox — the exact split described
+under [The environment default is mainnet](#the-environment-default-is-mainnet),
+and the reason the [worked example](#worked-example) states it twice as well. The
+startup log carries one line per client; read both.
 
 The execution factory has to be registered in Python. Giving the exec entry a
 `factory=ImportableFactoryConfig(...)` makes `node.build()` raise

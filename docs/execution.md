@@ -47,18 +47,22 @@ payload shapes, so an event sequence the framework would reject fails a test
 rather than passing quietly. That proves the adapter is internally consistent;
 it does not prove Gate.io agrees with it.
 
-Capabilities on this page carry one of these labels:
+Where this page grades a capability it uses one rung of the project's single
+evidence ladder — *implemented*, *unit-tested*, *offline-harness*,
+*mainnet-confirmed* — which is defined once, in
+[validation.md](validation.md#the-evidence-ladder). This page defines no scale of
+its own.
 
-| Label                                   | Meaning                                                                                                                    |
-|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------|
-| implemented and mock-tested             | Implemented, and exercised by the offline execution tests                                                                  |
-| implemented, mainnet validation pending | Implemented, but not exercised by the execution tests — only the layer below it (an HTTP namespace or a parser) is covered |
-| experimental                            | Implemented; the behavior or the interface may still change                                                                |
-| unsupported                             | Not available. The client says so explicitly instead of approximating                                                      |
-| not applicable                          | The concept does not exist on that product, or not in this layer                                                           |
+Two words in the tables below are not rungs, because they say a capability does
+not exist rather than grading the evidence for one:
 
-Both labels are statements about the repository, not about the exchange: a row
-marked *implemented and mock-tested* is still unproven on the venue unless
+| Word           | Meaning                                                               |
+|----------------|-----------------------------------------------------------------------|
+| unsupported    | Not available. The client says so explicitly instead of approximating |
+| not applicable | The concept does not exist on that product, or not in this layer      |
+
+A rung is a statement about the repository, not about the exchange: a row marked
+*unit-tested* is still unproven on the venue unless
 [validation.md](validation.md) records a run for it. That page grades every
 product and account mode separately, and it is the only place where a live
 result counts.
@@ -82,7 +86,7 @@ routed through it.
 | Hedge (dual) position mode | unsupported — the client starts only against an account the venue states is one-way; hedge mode, and any answer that does not establish the mode, are refused at connect with an explanatory error                                                                                                       |
 | Balances                   | Aggregated per currency across the wallets of the enabled products                                                                                                                                                                                                                                       |
 | Margins                    | Scoped the way the venue holds the collateral: a cross-margined position (Gate.io `leverage="0"`) is reported account-wide, keyed by its settlement currency; an isolated position is reported per instrument. The options wallet reports one account-wide figure. Published only for a `MARGIN` account |
-| `Strategy.query_account()` | Re-reads every enabled product's wallet over REST and publishes a fresh `AccountState`. Implemented and mock-tested                                                                                                                                                                                      |
+| `Strategy.query_account()` | Re-reads every enabled product's wallet over REST and publishes a fresh `AccountState`. Unit-tested (`tests/test_execution_query_account.py`)                                                                                                                                                             |
 
 `query_account` never answers from the last state it published. When a wallet
 could not be read, the client logs an error naming the products whose figures in
@@ -230,6 +234,42 @@ network call, with the reason on the `OrderDenied` event.
 Time in force: GTC, IOC and FOK, plus post-only through `poc`. Post-only is
 Gate.io's `poc` time in force — a maker-only order that *rests* — so it composes
 with GTC and is refused, not substituted, when it is combined with IOC or FOK.
+
+The venue's own vocabulary is four values, and they are what the wire carries:
+`time_in_force` on the spot endpoints, `tif` on futures, delivery and options.
+`GateioTimeInForce` is that vocabulary as an enum, exported from the package
+root, so a caller reading or building a Gate.io payload does not have to spell
+the strings:
+
+| `GateioTimeInForce` | Wire value | What a Nautilus order asks for                                     |
+|---------------------|------------|--------------------------------------------------------------------|
+| `GTC`               | `gtc`      | `TimeInForce.GTC`                                                  |
+| `IOC`               | `ioc`      | `TimeInForce.IOC`; also what a market order becomes                 |
+| `FOK`               | `fok`      | `TimeInForce.FOK`                                                  |
+| `POC`               | `poc`      | GTC with `post_only=True` — "pending or cancelled", maker-only, rests |
+
+```python
+from nautilus_gateio import GateioTimeInForce
+from nautilus_gateio.common.enums import time_in_force_from_gateio, time_in_force_to_gateio
+```
+
+`time_in_force_to_gateio(time_in_force, post_only=False)` is the mapping used for
+every order that can rest, and the refusals in
+[the table below](#nothing-is-silently-altered) are that function raising
+`ValueError`: the enum has four members, so there is nowhere to put GTD, DAY,
+AT_THE_OPEN or AT_THE_CLOSE, and nowhere to put post-only combined with an
+immediate time in force. A market order does not go through it — an order that
+cannot rest is decided by the client itself, which folds GTC and DAY into `ioc`
+because neither describes anything on such an order, and refuses the rest.
+
+`time_in_force_from_gateio` reads the field back off a venue payload, and the
+round trip is deliberately lossy in one direction: `poc` comes back as
+`TimeInForce.GTC`, because the platform models post-only as a separate flag and
+this function returns only the time in force. A value it does not recognize also
+reads as GTC. Both functions are **unit-tested** (`tests/test_enums.py`),
+including the `poc` read-back, the unknown-value fallback, and the round trip
+through GTC, IOC and FOK.
+
 Flags honored: `reduce_only` (derivatives only), `display_qty` (iceberg, regular
 orders only, and never zero — see below), `quote_quantity` (spot market buy
 only). Sizes on futures, delivery and options are **contract counts**, sent as a
@@ -263,8 +303,8 @@ One translation is worth singling out because it is not literal:
 
 ### Order lists
 
-`submit_order_list` is implemented and mock-tested, and it does two different
-things depending on what the list carries.
+`submit_order_list` is **unit-tested** (`tests/test_execution_order_lists.py`),
+and it does two different things depending on what the list carries.
 
 **A list with no contingency** is submitted in full. Orders are grouped by
 product, and a group goes out as one batch request where Gate.io has one and the
@@ -370,8 +410,8 @@ the venue has no equivalent:
 
 | Case                                                         | Result                                                                                            | Status                      |
 |--------------------------------------------------------------|---------------------------------------------------------------------------------------------------|-----------------------------|
-| Spot                                                         | `PATCH /spot/orders/{id}` with the new amount and/or price                                        | implemented and mock-tested |
-| Perpetual, inverse                                           | `PUT /futures/{settle}/orders/{id}` with the signed size and/or price                             | implemented and mock-tested |
+| Spot                                                         | `PATCH /spot/orders/{id}` with the new amount and/or price                                        | mainnet-confirmed           |
+| Perpetual, inverse                                           | `PUT /futures/{settle}/orders/{id}` with the signed size and/or price                             | unit-tested                 |
 | Delivery                                                     | rejected — the venue cannot amend delivery orders                                                 | unsupported                 |
 | Options                                                      | rejected — the venue cannot amend options orders                                                  | unsupported                 |
 | An armed price-triggered order                               | rejected — cancel and resubmit                                                                    | unsupported                 |
@@ -381,6 +421,12 @@ the venue has no equivalent:
 
 A fired conditional order is amendable like any other order on the products that
 support amendment: the amend addresses the fired id, not the armed one.
+
+The spot row is *mainnet-confirmed* because a recorded run amended a resting spot
+order and the venue acknowledged it; the futures row is offline evidence only —
+no amendment has been sent to the venue on any contract product, and no order at
+all has been sent on an inverse perpetual. The refusals are decided in this
+client, so nothing in the venue's behavior is claimed for them.
 
 ### Cancellation
 
@@ -721,17 +767,22 @@ trigger itself — that field is how a trigger which fired while this client was
 down is recovered, and repeating one the order already applied would be dropped
 by the state machine.
 
-Status: implemented and mock-tested, including the restart-across-the-transition
-path (`TestRestartAcrossTheTriggerTransition` in
-`tests/test_execution_triggers.py`) and the fired-order report
-(`TestFiredConditionalOrderReports` in `tests/test_execution_reports.py`).
-Mainnet validation pending.
+Status: **unit-tested**, including the restart-across-the-transition path
+(`TestRestartAcrossTheTriggerTransition` in `tests/test_execution_triggers.py`)
+and the fired-order report (`TestFiredConditionalOrderReports` in
+`tests/test_execution_reports.py`). The venue has armed, canceled and re-armed
+conditional orders on the USDT perpetual (recorded in
+[validation.md](validation.md)), but no recorded run has let one fire, so the
+transition described here — the id the venue creates when a trigger fires — has
+never been seen from Gate.io.
 
 ## The fill-before-order race
 
 Gate.io publishes `*.orders` and `*.usertrades` on **independent channels with
-no ordering between them**. In practice the first message that mentions a fired
-conditional order is frequently its fill. A client that assumes the order message
+no ordering between them**. Nothing in the venue's protocol says the order
+message about a fired conditional order arrives before the fill that belongs to
+it, and the client is written for the case where it does not. A client that
+assumes the order message
 comes first will emit that fill against the armed id, `Order.apply` will refuse
 it, the execution engine will swallow the resulting exception into a log line,
 and the fill is simply gone — the position then disagrees with the venue with no
@@ -797,13 +848,16 @@ client instead, at ERROR, naming the trade id, quantity, price and commission, s
 the position can be squared. This is a real gap, not a handled case: the venue
 traded, and NautilusTrader cannot be told about it on this version.
 
-Status: implemented and mock-tested. The regression suite is
+Status: **unit-tested**. The regression suite is
 `TestFillBeforeOrderUpdate` in `tests/test_execution_events.py`, which covers a
 fill before any order message, several fills before it, a late order message
 (idempotent), a duplicate fill after the rebase, a reconnect between the fill and
 the order message, and a restart between them; `TestFillOnClosedOrder` covers the
 late fill on a canceled and on an expired order and holds the fillable-terminal
-status set against the platform's own state machine. Mainnet validation pending.
+status set against the platform's own state machine. The race itself is a
+property of the venue's two channels, and no run recorded in
+[validation.md](validation.md) reports on the order the two arrived in, so
+nothing on this page is credited to Gate.io.
 
 ## Balances, positions and funding
 
@@ -859,9 +913,15 @@ account poll. Funding *rates* are market data, not execution — see
 [market-data.md](market-data.md).
 
 Status: balance aggregation across spot, margin, unified and futures wallets is
-implemented and mock-tested; the options balance and options report paths are
-implemented, mainnet validation pending, and are not covered by the execution
-test suite.
+**unit-tested** (`tests/test_execution_accounting.py`), and the spot account
+state is *mainnet-confirmed* — the recorded spot runs republished it from the
+venue's own balances as fills arrived. The options balance and options report
+paths are **implemented**: no test in this repository covers them. What
+[validation.md](validation.md) does record for options is narrower than the code
+path — that the client reported a `MARGIN` account to the platform in the
+derivative runs, and that the venue took three orders on one contract — so read
+the options wallet read as exercised at the venue and its arithmetic as
+unchecked.
 
 ## Reconciliation and restart
 
@@ -1206,14 +1266,76 @@ with `t-`, hold at most 28 further characters and use only `[0-9A-Za-z_.-]`.
 * An id that fits is embedded verbatim, so the mapping is recoverable from the
   venue alone after a restart.
 * An id that does not fit is replaced by a generated id
-  (`t-<tag>-<counter>`, tag from `client_order_id_tag`) and the pair is kept in
-  an in-memory alias table. After a restart that alias is gone, and such an order
-  is reported as an unknown (external) order rather than decoded into an id
-  Nautilus never issued.
+  (`t-<tag>-<timestamp><counter>`, tag from `client_order_id_tag`) and the pair is
+  kept in an in-memory alias table. After a restart that alias is gone, and such
+  an order is reported as an unknown (external) order rather than decoded into an
+  id Nautilus never issued.
 
 Keeping client order ids within the venue's limit is therefore worth doing: it is
 the difference between a restart that re-identifies its own resting orders and
-one that adopts them as somebody else's.
+one that adopts them as somebody else's. And it is not automatic. NautilusTrader
+generates `O-<date>-<time>-<trader tag>-<strategy tag>-<count>`, where the count
+rises for the life of the generator, so the id gets longer as the session goes
+on. Measured against the installed 1.230.0 with three-character trader and
+strategy tags: order 1 is `O-19700101-000000-001-001-1`, 27 characters, and fits;
+order 99 is 28 and still fits; **order 100 is 29 characters and does not**, and
+neither does anything after it. Longer trader or strategy tags shorten that
+runway, and `use_uuid_client_order_ids=True` (36 characters) never fits at all.
+Past that point every order goes to the venue under a generated alias that lives
+only in this process's memory — the restart property above, quietly switching
+itself off. `use_hyphens_in_client_order_ids=False` on the strategy config is the
+way to stay inside the limit: the same id is 22 characters, leaving room for a
+seven-digit count.
+
+### `generate_client_order_id` and `sanitize_client_order_id`
+
+Both are exported from the package root, out of
+`nautilus_gateio.common.signing`, and both are **unit-tested**
+(`tests/test_signing.py`).
+
+```python
+from nautilus_gateio import generate_client_order_id, sanitize_client_order_id
+```
+
+`generate_client_order_id(tag="ng")` builds the replacement id described above:
+`t-<tag>-<nanosecond timestamp><counter>`, where the timestamp is the low twelve
+digits of the process clock and the counter is three digits, so up to a thousand
+ids minted in the same nanosecond still differ. It is the function the execution
+client calls with `client_order_id_tag` when a Nautilus id does not fit the
+field.
+
+`sanitize_client_order_id(value)` is the coercion underneath it, and it is worth
+reading closely because **it never refuses anything**. Given a value Gate.io
+would reject, it returns one the venue accepts, silently:
+
+| Given                            | Returned                         | What happened                                          |
+|----------------------------------|----------------------------------|--------------------------------------------------------|
+| `"t-abc123"`                     | `"t-abc123"`                     | already valid, untouched                               |
+| `"abc123"`                       | `"t-abc123"`                     | the `t-` prefix was added                              |
+| `"my order#1"`                   | `"t-myorder1"`                   | disallowed characters are **deleted**, not replaced    |
+| `"t-" + "A" * 40`                | `"t-" + "A" * 28`                | the body is cut to 28 characters, from the right       |
+| `"!!!"`                          | `"t-"`                           | nothing survived the charset filter; the prefix is all that is left |
+| `"t-t-abc"`                      | `"t-t-abc"`                      | the prefix is not doubled                              |
+
+Two consequences follow, and neither produces an error anywhere:
+
+* **Distinct inputs can collapse into one id.** `"t-a b c"` and `"t-a/b:c"` both
+  become `"t-abc"`, and any two ids agreeing on their first 28 valid characters
+  become the same string.
+* **A long `client_order_id_tag` eats the uniqueness out of a generated id.** The
+  tag sits in front of the digits and the truncation cuts from the back, so a tag
+  of twelve characters or fewer leaves the timestamp and counter intact, while a
+  longer one starts removing them. Minting 2000 ids in a loop on this build gave
+  2000 distinct values for a 13-character tag, 602 for a 19-character tag, and a
+  single repeated value for a 28-character tag. The field is not validated, and
+  nothing warns.
+
+That matters because the `text` field is what identifies an order to the venue
+and what a restart re-reads it by. The execution client itself does not route
+your ids through this function — it embeds an id that fits verbatim and generates
+a fresh one otherwise — so the exposure is through `client_order_id_tag` and
+through calling `sanitize_client_order_id` yourself. If you call it, compare the
+result with what you passed in.
 
 ## Transfers
 
@@ -1234,11 +1356,11 @@ routes every internal transfer through the spot wallet, so moving between two
 derivative wallets takes two calls. A derivative wallet is created by the first
 transfer into it. Account state is refreshed after a successful transfer.
 
-Status: implemented, mainnet validation pending. The wallet endpoint underneath
-is mock-tested — body construction, rejection of non-internal wallets, the
-`settle` requirement, and the guarantee that a transfer is never replayed after a
-timeout or a 5xx — but the execution-client wrapper is not covered by the
-execution tests.
+Status: **implemented**. No transfer has been sent to Gate.io, and no test
+exercises the execution-client wrapper. The wallet endpoint underneath it is
+**unit-tested** (`tests/test_http_namespaces.py`) — body construction, rejection
+of non-internal wallets, the `settle` requirement, and the guarantee that a
+transfer is never replayed after a timeout or a 5xx.
 
 ## Operational notes
 

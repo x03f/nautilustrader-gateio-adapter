@@ -27,38 +27,67 @@ This is an alpha release of an external, community-maintained adapter, written i
 pure Python against NautilusTrader 1.230.0. **Live validation of market data
 covers the spot streams and requests, the instrument load on every configured
 product, and the ticker-derived streams on the USDT perpetual — and stops
-there.** The statuses below mean:
+there.**
 
-* *implemented and mock-tested* — the path is exercised by the offline test suite
-  against payload shapes that mirror what Gate.io sends, with no socket opened and
-  no credentials read;
-* *implemented, mainnet validation pending* — the code path exists and was read
-  and reviewed, but the offline suite does not cover it end to end;
-* *unsupported* — not implemented.
+The **Evidence** column below carries one rung of the project's single evidence
+ladder, defined once in
+[validation.md](validation.md#the-evidence-ladder). This page defines no scale of
+its own, and it grades the *offline* record there: *implemented* means the code
+path exists and has been read, *unit-tested* means the offline suite asserts the
+behavior against recorded venue payload shapes, with no socket opened and no
+credentials read. *Unsupported* is not a rung — it says the capability does not
+exist here.
 
-The **mainnet** column is a separate axis: it names the products for which a
-recorded live run exists, with the run itself written down in
-[validation.md](validation.md). A dash means the venue has never been observed
-to serve this path through the adapter.
+The **Mainnet** column is the other half of the same ladder: it names the products
+for which a recorded live run exists, which promotes that row to
+*mainnet-confirmed* for those products and for no others. The runs themselves are
+written down in [validation.md](validation.md). A dash means the venue has never
+been observed to serve this path through the adapter.
 
-| Capability                                                           | Status                                                         | Mainnet                                                |
+| Capability                                                           | Evidence                                                       | Mainnet                                                |
 |----------------------------------------------------------------------|----------------------------------------------------------------|--------------------------------------------------------|
-| Instrument loading through the provider                              | implemented and mock-tested                                    | spot, perpetual, delivery, options                     |
-| Instrument reload task inside the data client                        | implemented, mainnet validation pending                        | —                                                      |
-| Trade ticks                                                          | implemented and mock-tested                                    | spot                                                   |
-| Quote ticks from `book_ticker`                                       | implemented and mock-tested                                    | spot                                                   |
-| Order book deltas, sequence validation and gap resync                | implemented and mock-tested                                    | spot (deltas, interval snapshots and the managed book) |
-| Order book snapshot on request                                       | implemented and mock-tested                                    | spot                                                   |
-| Bars from the candlestick streams                                    | implemented and mock-tested                                    | spot                                                   |
-| Historical bars and trades over REST                                 | implemented; the offline suite covers the HTTP layer only      | spot                                                   |
-| Mark price, index price, funding rate                                | implemented and mock-tested                                    | USDT perpetual                                         |
-| Historical funding rates over REST                                   | implemented; the offline suite covers the HTTP layer only      | USDT perpetual                                         |
-| Book resynchronization after a reconnect                             | implemented, mainnet validation pending                        | —                                                      |
-| `OrderBookDepth10` from the periodic `*.order_book` snapshot channel | implemented and mock-tested                                    | —                                                      |
-| Instrument status, polled from the instrument listings               | implemented and mock-tested                                    | —                                                      |
-| Instrument close for delivery futures and options                    | implemented and mock-tested                                    | —                                                      |
-| `GateioTicker` custom data (the venue's whole ticker row)            | implemented and mock-tested                                    | —                                                      |
+| Instrument loading through the provider                              | unit-tested                                                    | spot, perpetual, delivery, options                     |
+| Instrument reload task inside the data client                        | unit-tested (see note)                                         | —                                                      |
+| Trade ticks                                                          | unit-tested                                                    | spot                                                   |
+| Quote ticks from `book_ticker`                                       | unit-tested                                                    | spot                                                   |
+| Order book deltas, sequence validation and gap resync                | unit-tested                                                    | spot (deltas, interval snapshots and the managed book) |
+| Order book snapshot on request                                       | unit-tested                                                    | spot                                                   |
+| Bars from the candlestick streams                                    | unit-tested                                                    | spot                                                   |
+| Historical bars over REST                                            | unit-tested (see note)                                         | spot                                                   |
+| Historical trades over REST                                          | implemented                                                    | spot                                                   |
+| Mark price, index price, funding rate                                | unit-tested                                                    | USDT perpetual                                         |
+| Historical funding rates over REST                                   | unit-tested                                                    | USDT perpetual                                         |
+| Book resynchronization after a reconnect                             | unit-tested (see note)                                         | —                                                      |
+| `OrderBookDepth10` from the periodic `*.order_book` snapshot channel | unit-tested                                                    | —                                                      |
+| Instrument status, polled from the instrument listings               | unit-tested                                                    | —                                                      |
+| Instrument close for delivery futures and options                    | unit-tested                                                    | —                                                      |
+| `GateioTicker` custom data (the venue's whole ticker row)            | unit-tested                                                    | —                                                      |
 | Historical quotes                                                    | unsupported; Gate.io publishes no quote history on any product | not applicable                                         |
+
+Four rows need their boundary stated rather than a word:
+
+* **Historical trades** are the one request hook with no test of its own. The
+  REST call underneath is unit-tested in `tests/test_http_namespaces.py`; the
+  client-side half — the window filter, the parse and the response — has been
+  read and not exercised. A recorded spot run did receive rows from it.
+* **Historical bars** are unit-tested where it matters most and not everywhere:
+  the suite drives `_request_bars` with the paging layer stubbed, and asserts
+  that a candle the platform rejects is counted rather than fatal, that the
+  response still goes out with the rest, and that the surviving bars are stamped
+  on their close (`tests/test_data_client.py`). The pagination underneath,
+  `_fetch_candles`, has no test of its own; the endpoint's parameter mapping is
+  covered in `tests/test_http_namespaces.py`, and the dropping of a bucket that
+  has not closed yet is read from the source.
+* **The instrument reload task** is unit-tested for the properties that keep a
+  long-running node alive — the loop survives a venue error and keeps going, and
+  it leaves quietly when the transport closes — and not for the reload itself: no
+  test asserts that a changed definition reaches the data engine.
+* **Book resynchronization after a reconnect** is unit-tested at the handler: the
+  suite calls `_handle_ws_reconnect` and asserts that a snapshot request for each
+  subscribed book leaves for the venue, and that none leaves once the node has
+  begun stopping. What no offline test does is drop a real socket and drive the
+  whole cycle; the subscription replay on the other side of it is covered
+  separately, on the WebSocket client (`tests/test_websocket_client.py`).
 
 Nothing here is described as stable. A dash means no recorded run credits that
 path to the venue: the instrument reload timer and the post-reconnect book
@@ -597,6 +626,37 @@ different topic from the one the rows are published on.
   import, so it can be persisted to a catalog or sent over an external message
   bus. If a node uses an external message bus and should not publish it, name it
   in `MessageBusConfig.types_filter`.
+
+### `TICKER_FIELDS`
+
+The 27 venue field names the type carries are also exported as a tuple, in
+declaration order, so a consumer can iterate the row instead of hard-coding a
+list that the venue may extend:
+
+```python
+from nautilus_gateio import TICKER_FIELDS, GateioTicker
+
+
+def on_data(self, data) -> None:
+    if isinstance(data, GateioTicker):
+        row = {name: getattr(data, name) for name in TICKER_FIELDS}
+        self.log.info(f"{data.instrument_id}: {row}")
+```
+
+The tuple is the definition, not a copy of one: `GateioTicker.from_payload` reads
+exactly these keys out of the venue row, and the type's fields are exactly these
+plus `instrument_id`, `ts_event` and `ts_init`. Which product populates which is
+grouped in the tuple's own source (`nautilus_gateio/types.py`) and follows the
+channel: `last`, `change_percentage`, `high_24h` and `low_24h` come from every
+product; `highest_bid`, `lowest_ask`, `base_volume` and `quote_volume` from
+`spot.tickers` alone; the `volume_24h*` family, `total_size` and
+`quanto_base_rate` from the contract products; `funding_rate_indicative` from
+perpetuals; `basis_rate`, `basis_value` and `settle_price` from delivery futures;
+and the implied volatilities, the greeks and `position_size` from
+`options.contract_tickers`. Every other field of a row is the empty string, which
+is the same value a field the venue omitted takes — the type cannot distinguish
+the two, because the platform's Arrow schema builder for custom data has no
+optional field.
 
 ## Instrument status and instrument close
 
