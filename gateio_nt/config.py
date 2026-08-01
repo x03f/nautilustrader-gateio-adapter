@@ -154,7 +154,13 @@ def validate_products(
     # same call the built-in OKX client makes for its product set
     # (installed adapters/okx/data.py:123, `PyCondition.not_empty(
     # config.instrument_types, "config.instrument_types")`).
-    PyCondition.not_empty(products, "products")
+    # `ex_type` here for the same reason it appears below: `not_empty` checks
+    # for `None` first and raises `TypeError` for it by default, and a caller
+    # following `docs/configuration.md` wraps one `except ValueError` around
+    # this helper. A configuration struct accepts `products=None` — nothing on
+    # the struct rejects it — so that path is reachable from the public surface,
+    # and letting it escape as `TypeError` would break the documented recipe.
+    PyCondition.not_empty(products, "products", ex_type=ValueError)
     seen: list[GateioProductType] = []
     for product in products:
         # `PyCondition.type` defaults to `TypeError`; `ex_type` is the

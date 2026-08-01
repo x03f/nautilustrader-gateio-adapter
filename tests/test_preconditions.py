@@ -126,10 +126,20 @@ class TestThePlatformContractThisCodeRelieson:
 
 
 class TestConfigurationHelpers:
-    def test_an_empty_product_set_is_refused(self) -> None:
-        """Damage: a client that subscribes to nothing and reports no failure."""
+    @pytest.mark.parametrize("value", [(), None], ids=["empty", "none"])
+    def test_a_product_set_that_names_nothing_is_refused_as_a_value_error(self, value) -> None:
+        """Damage: a client that subscribes to nothing and reports no failure.
+
+        ``None`` belongs here with the empty tuple, and as a ``ValueError``.
+        A configuration struct accepts ``products=None`` — nothing on the struct
+        rejects it — so the path is reachable from the public surface, and
+        ``docs/configuration.md`` tells a caller to wrap one ``except
+        ValueError`` around this helper. ``PyCondition.not_empty`` checks for
+        ``None`` first and raises ``TypeError`` for it unless told otherwise, so
+        this test fails if that ``ex_type`` is dropped.
+        """
         with pytest.raises(ValueError):
-            validate_products((), MAINNET)
+            validate_products(value, MAINNET)
 
     def test_a_non_product_member_is_refused_as_a_value_error(self) -> None:
         """Damage without the check: ``"spot"`` reaches the product dispatch.
@@ -186,9 +196,19 @@ class TestSymbologyHelpers:
         with pytest.raises(TypeError):
             gateio_to_instrument_id(GateioProductType.SPOT, None)  # type: ignore[arg-type]
 
-    @pytest.mark.parametrize("value", ["", ".GATE_IO", "-PERP.GATE_IO"])
+    @pytest.mark.parametrize(
+        "value",
+        ["", ".GATE_IO", "-PERP.GATE_IO", " .GATE_IO", "   .GATE_IO", "\t.GATE_IO"],
+    )
     def test_an_instrument_id_with_no_venue_symbol_is_refused(self, value: str) -> None:
-        """Damage: a request path built around an empty contract name."""
+        """Damage: a request path built around an empty contract name.
+
+        Blank is the half an emptiness check misses, and it is the half that
+        travels: ``if not symbol`` admits ``" "``, and a whitespace contract name
+        then reaches the REST path and the subscription payload looking like a
+        symbol. The spot branch is listed here as well as the ``-PERP`` one
+        because reverting either to the emptiness check has to fail.
+        """
         with pytest.raises(ValueError):
             instrument_id_to_gateio(value)
 
