@@ -15,16 +15,21 @@ follow that.
 explains why, and — more importantly — what that decision does *not* excuse.
 
 **The release is alpha.** The behavior described here is implemented and
-covered by the unit suite against recorded and simulated venue payloads.
+covered by the offline suite against recorded and simulated venue payloads.
 Live-venue validation covers the market-data paths, spot execution, a series of
 orders on one USDT perpetual including a position read back from the venue by a
 node that did not open it, and three orders on one option contract; no inverse
 or delivery order and no margin spot ledger has been exercised against Gate.io.
 See [validation.md](validation.md).
-Where this page classifies a capability it uses exactly one of: *implemented and
-mock-tested*, *implemented, mainnet validation pending*, *experimental*,
-*unsupported*, *not applicable*. Nothing here is described as stable or
-production ready, because nothing has earned either word yet.
+
+This page defines no status vocabulary of its own. Where it grades how well a
+claim is evidenced it names a rung of the
+[evidence ladder](validation.md#the-evidence-ladder) — *implemented*,
+*unit-tested*, *offline-harness*, *mainnet-confirmed* — and that page is where
+the grade is defended. *Unsupported* and *not applicable* are not points on that
+scale: they say what the adapter or the venue does not have at all, which is a
+question about capability rather than about evidence. Nothing here is described
+as stable or production ready, because nothing has earned either word yet.
 
 ## Package layout
 
@@ -496,8 +501,13 @@ reports: one fill must not produce two competing views of the same position. All
 four report generators (`generate_order_status_report`,
 `generate_order_status_reports`, `generate_fill_reports`,
 `generate_position_status_reports`) are implemented against REST, so a restart
-with resting orders and open positions is a supported path — implemented and
-mock-tested, mainnet validation pending.
+with resting orders and open positions is a supported path. That path is at
+*offline-harness* on the [evidence ladder](validation.md#the-evidence-ladder):
+`generate_mass_status` and the generators under it are driven through the
+platform's own cache and order state machine against a stubbed venue. Against
+Gate.io itself, only the position half is confirmed — a fresh node read an open
+perpetual position back; no run has restarted a node onto its own resting
+orders.
 
 ## Design decisions
 

@@ -39,8 +39,39 @@ selected with `spot_account_mode` and expressed as `GateioSpotAccountMode`. See
 This is alpha software. The statuses below describe how well a claim is grounded
 in the repository — not how well it has survived contact with real money.
 
-Live exercise is graded separately, and only on one page:
-[validation status](validation.md). In short: the spot market-data paths are
+**The vocabulary is not this page's.** It is the
+[evidence ladder](validation.md#the-evidence-ladder), which is defined once, on
+the validation page, and used everywhere. Its rungs, lowest first, are
+*implemented* (the code path exists and was read, and nothing asserts it),
+*unit-tested* (the offline suite asserts the behavior against stubbed or
+recorded venue payloads), *offline-harness* (the behavior was driven as a
+sequence of platform events through the execution harness) and
+*mainnet-confirmed* (a recorded run against Gate.io did it).
+
+A status cell here shows the rung a claim has earned **offline**. The top rung
+is deliberately absent from these tables: whether the venue has ever seen a path
+is graded per recorded run rather than per capability, so it is stated in
+[validation status](validation.md) and nowhere else. A row below saying
+*unit-tested* is making no claim whatsoever about the venue; a spot row carrying
+it may nonetheless be *mainnet-confirmed* on that page.
+
+One product is a standing exception, and it is stated once here rather than in
+every row. The offline execution tests build orders on a spot pair, a USDT
+perpetual, a delivery contract and an option — there is no inverse instrument
+among them. **Wherever an order table below says *unit-tested* across a row of
+products, the `INVERSE` column of that row is *implemented***: it shares the
+code with the USDT perpetual, and sharing code is not evidence.
+
+Three further cell values are not rungs at all. They answer what exists rather
+than what has been checked:
+
+| Cell            | Meaning                                                                                  |
+|-----------------|------------------------------------------------------------------------------------------|
+| Unsupported     | The adapter refuses it, or no code exists for it                                         |
+| Not applicable  | Gate.io does not have the concept for this product                                       |
+| Not implemented | Gate.io publishes the endpoint and this adapter does not call it — a gap here, not there |
+
+In short, what the venue has actually seen: the spot market-data paths are
 confirmed on mainnet, as are the instrument load on every configured product and
 the ticker-derived streams on the USDT perpetual; on the execution side, **spot,
 one USDT perpetual and one option contract** — on the perpetual both position
@@ -49,27 +80,7 @@ and re-armed without ever firing, and a position read back from the venue by a
 node that did not open it; on the option a resting limit buy, an aggressive one
 that filled, and a covered limit sell. No order has been sent to Gate.io for an
 inverse perpetual or a delivery contract, and no margin, cross-margin or unified
-spot ledger has carried one. A row below saying *implemented and mock-tested* is
-making no claim whatsoever about the venue.
-
-| Status                                  | Meaning here                                                                                                                             |
-|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
-| Implemented and mock-tested             | The behavior is asserted by the test suite against stubbed venue responses or recorded payload shapes                                    |
-| Implemented, mainnet validation pending | The code path exists and was read, but no test asserts this specific behavior                                                            |
-| Experimental                            | Reachable through the lower-level HTTP or WebSocket classes, deliberately not wired into the NautilusTrader data or execution interfaces |
-| Unsupported                             | The adapter refuses it, or no code exists for it                                                                                         |
-| Not applicable                          | Gate.io does not have the concept for this product                                                                                       |
-
-*Implemented and mock-tested* is a statement about the adapter agreeing with its
-authors, never about Gate.io agreeing with the adapter. Only a live round trip
-settles that, and the ones on record are listed, product by product, in
-[validation status](validation.md).
-
-The second label carries its historical name and is graded on the same axis as
-the first: *implemented, mainnet validation pending* means no test asserts the
-behavior, not that the venue has been asked and has not answered. A spot row
-carrying it may still appear as mainnet-confirmed on the validation page, which
-is the only page that grades live evidence.
+spot ledger has carried one.
 
 ## Products at a glance
 
@@ -81,9 +92,9 @@ is the only page that grades live evidence.
 | Delivery future     | `FUT`               | `CryptoFuture`                        | `/delivery/usdt`                             | `wss://fx-ws.gateio.ws/v4/ws/delivery/usdt` | -       |
 | Option              | `OPT`               | `CryptoOption`                        | `/options`                                   | `wss://op-ws.gateio.live/v4/ws`             | -       |
 
-Product support as a whole is *implemented and mock-tested*: the instrument
-parsers, the per-product REST routing and the per-product order book tables all
-have tests. Nothing beyond that is implied.
+Product support as a whole is *unit-tested*: the instrument parsers, the
+per-product REST routing and the per-product order book tables all have tests.
+Nothing beyond that is implied.
 
 Configuring a product Gate.io does not serve on the testnet together with
 `environment="testnet"` raises `ValueError` from the client constructor, before
@@ -111,7 +122,7 @@ intended.
 
 Because every derivative has `size_precision = 0`, a fractional contract
 quantity cannot be expressed. The adapter rejects it rather than truncating it,
-on submission and on amendment alike (*implemented and mock-tested*).
+on submission and on amendment alike (*unit-tested*).
 
 ### Price grids and tick schemes
 
@@ -122,7 +133,7 @@ of ten: the `BNB_USDT` perpetual and the `ETH_USDT_20260925` and
 `ETH_USDT_20261225` delivery contracts quote two decimals but tick in `0.05`.
 
 Every instrument the adapter builds therefore carries a `tick_scheme_name`
-(*implemented and mock-tested*):
+(*unit-tested*):
 
 | Grid                             | Scheme                                                                                                                |
 |----------------------------------|-----------------------------------------------------------------------------------------------------------------------|
@@ -182,16 +193,16 @@ reading.
 
 | Nautilus order type                                | Spot                                                                                                       | Perpetual / Inverse                                   | Delivery                           | Options                    | Status                      |
 |----------------------------------------------------|------------------------------------------------------------------------------------------------------------|-------------------------------------------------------|------------------------------------|----------------------------|-----------------------------|
-| `MARKET`                                           | native `type=market` for a sell or a quote-denominated buy; an aggressive limit for a base-denominated buy | `price="0"` with `tif=ioc`/`fok`                      | as perpetual                       | `price="0"` with `tif=ioc` | Implemented and mock-tested |
-| `LIMIT`                                            | `type=limit`                                                                                               | `price` + `tif`                                       | as perpetual                       | `price` + `tif`            | Implemented and mock-tested |
-| `STOP_MARKET`                                      | `POST /spot/price_orders`                                                                                  | `POST /futures/{settle}/price_orders`                 | `POST /delivery/usdt/price_orders` | -                          | Implemented and mock-tested |
-| `STOP_LIMIT`                                       | as above                                                                                                   | as above                                              | as above                           | -                          | Implemented and mock-tested |
-| `MARKET_IF_TOUCHED`                                | as above                                                                                                   | as above                                              | as above                           | -                          | Implemented and mock-tested |
-| `LIMIT_IF_TOUCHED`                                 | as above                                                                                                   | as above                                              | as above                           | -                          | Implemented and mock-tested |
+| `MARKET`                                           | native `type=market` for a sell or a quote-denominated buy; an aggressive limit for a base-denominated buy | `price="0"` with `tif=ioc`/`fok`                      | as perpetual                       | `price="0"` with `tif=ioc` | Unit-tested                 |
+| `LIMIT`                                            | `type=limit`                                                                                               | `price` + `tif`                                       | as perpetual                       | `price` + `tif`            | Unit-tested                 |
+| `STOP_MARKET`                                      | `POST /spot/price_orders`                                                                                  | `POST /futures/{settle}/price_orders`                 | `POST /delivery/usdt/price_orders` | -                          | Unit-tested                 |
+| `STOP_LIMIT`                                       | as above                                                                                                   | as above                                              | as above                           | -                          | Unit-tested                 |
+| `MARKET_IF_TOUCHED`                                | as above                                                                                                   | as above                                              | as above                           | -                          | Unit-tested                 |
+| `LIMIT_IF_TOUCHED`                                 | as above                                                                                                   | as above                                              | as above                           | -                          | Unit-tested                 |
 | `MARKET_TO_LIMIT`                                  | -                                                                                                          | -                                                     | -                                  | -                          | Unsupported                 |
 | `TRAILING_STOP_MARKET`                             | -                                                                                                          | -                                                     | -                                  | -                          | Not implemented — see below |
 | `TRAILING_STOP_LIMIT`                              | -                                                                                                          | -                                                     | -                                  | -                          | Not implemented — see below |
-| Order lists, no contingency                        | batched through `POST /spot/batch_orders`                                                                  | batched through `POST /futures/{settle}/batch_orders` | submitted one at a time            | submitted one at a time    | Implemented and mock-tested |
+| Order lists, no contingency                        | batched through `POST /spot/batch_orders`                                                                  | batched through `POST /futures/{settle}/batch_orders` | submitted one at a time            | submitted one at a time    | Unit-tested                 |
 | Order lists with a contingency (bracket, OCO, OTO) | -                                                                                                          | -                                                     | -                                  | -                          | Unsupported — see below     |
 
 A hyphen above means the order is denied on this side. "Denied" and "rejected"
@@ -332,8 +343,10 @@ are never compared: an order's completion is decided in quote units
 quote-denominated buy carries a bound in base units while it works and is closed
 with `OrderCanceled` on the venue's own `filled_amount` when Gate.io finishes
 it, so it ends `CANCELED` rather than `FILLED` — see
-[execution](execution.md#fills) for why the platform allows no other close
-(*implemented and mock-tested*).
+[execution](execution.md#fills) for why the platform allows no other close. The
+whole sequence — the working bound, each fill, and the close on the venue's own
+total — is driven through the execution harness, so this one is
+*offline-harness*.
 
 ## Time in force by product
 
@@ -342,8 +355,7 @@ no representation, and the adapter raises rather than downgrading — a downgrad
 silently changes the execution guarantee the strategy asked for.
 
 **Limit orders.** The accepted mappings are asserted from real request bodies
-and the refusals from the mapping function, so this table is *implemented and
-mock-tested*.
+and the refusals from the mapping function, so this table is *unit-tested*.
 
 | `TimeInForce`                        | Spot   | Perpetual / Inverse / Delivery | Options                                |
 |--------------------------------------|--------|--------------------------------|----------------------------------------|
@@ -369,8 +381,8 @@ with `due_post_only=True`, both when the venue answers with a post-only error
 label and when a later order message carries `finish_as=poc`.
 
 **Market orders.** One mapping serves every product. The `FOK` row and the
-`AT_THE_OPEN` / `AT_THE_CLOSE` refusal are *implemented and mock-tested*; the
-rest is *implemented, mainnet validation pending*.
+`AT_THE_OPEN` / `AT_THE_CLOSE` refusal are *unit-tested*; the rest is
+*implemented*.
 
 | `TimeInForce`                 | Spot                                                                     | Perpetual / Inverse / Delivery | Options  |
 |-------------------------------|--------------------------------------------------------------------------|--------------------------------|----------|
@@ -391,8 +403,7 @@ through the same mapping as the other three products.
 on a price-triggered order the Nautilus time in force describes how long the
 *trigger* stays armed, while Gate.io expresses that with `trigger.expiration`
 and lets the *fired* order carry its own `gtc` or `ioc`. The `GTC` rows and the
-`FOK` refusal are *implemented and mock-tested*; the `GTD` expiration mapping is
-*implemented, mainnet validation pending*.
+`FOK` refusal are *unit-tested*; the `GTD` expiration mapping is *implemented*.
 
 | `TimeInForce`                               | Effect                                                                                                      |
 |---------------------------------------------|-------------------------------------------------------------------------------------------------------------|
@@ -403,18 +414,18 @@ and lets the *fired* order carry its own `gtc` or `ioc`. The `GTC` rows and the
 
 ## Execution instructions by product
 
-| Instruction                              | Spot                                                            | Perpetual / Inverse                                                       | Delivery                    | Options                     | Status                                                                                                                                          |
-|------------------------------------------|-----------------------------------------------------------------|---------------------------------------------------------------------------|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
-| `post_only` (regular orders)             | `poc`; denied with IOC or FOK                                   | as spot                                                                   | as spot                     | as spot                     | Implemented and mock-tested (the mapping and the refusal); implemented, mainnet validation pending (the request bodies)                         |
-| `post_only` (conditional orders)         | denied                                                          | denied                                                                    | denied                      | Not applicable              | Implemented and mock-tested                                                                                                                     |
-| `reduce_only` (regular orders)           | denied — spot has no such flag                                  | `reduce_only=true`                                                        | `reduce_only=true`          | `reduce_only=true`          | Implemented and mock-tested (the spot refusal); implemented, mainnet validation pending (the request bodies)                                    |
-| `reduce_only` (conditional orders)       | denied                                                          | `initial.reduce_only=true`                                                | as perpetual                | Not applicable              | Implemented and mock-tested                                                                                                                     |
-| `display_qty` / iceberg (regular orders) | `iceberg` (decimal string)                                      | `iceberg` (whole contracts)                                               | `iceberg` (whole contracts) | `iceberg` (whole contracts) | Implemented and mock-tested (the refusals); implemented, mainnet validation pending (the request bodies)                                        |
-| `display_qty=0` (fully hidden)           | -                                                               | -                                                                         | -                           | -                           | Implemented and mock-tested                                                                                                                     |
-| `display_qty` (conditional orders)       | denied                                                          | denied                                                                    | denied                      | Not applicable              | Implemented and mock-tested                                                                                                                     |
-| `quote_quantity`                         | market buy only; denied on a market sell and on any limit order | denied                                                                    | denied                      | denied                      | Implemented and mock-tested                                                                                                                     |
-| Trigger reference price                  | `LAST_PRICE`/`DEFAULT` only; anything else denied               | `LAST_PRICE`/`DEFAULT`, `MARK_PRICE`, `INDEX_PRICE`; anything else denied | as perpetual                | Not applicable              | Implemented and mock-tested (the accepted types and both refusals); implemented, mainnet validation pending (the mark and index request bodies) |
-| Hedge (dual) position mode               | Not applicable                                                  | refused at connect, as is any answer that does not establish the mode     | Not applicable              | Not applicable              | Unsupported                                                                                                                                     |
+| Instruction                              | Spot                                                            | Perpetual / Inverse                                                       | Delivery                    | Options                     | Status                                                                                              |
+|------------------------------------------|-----------------------------------------------------------------|---------------------------------------------------------------------------|-----------------------------|-----------------------------|-----------------------------------------------------------------------------------------------------|
+| `post_only` (regular orders)             | `poc`; denied with IOC or FOK                                   | as spot                                                                   | as spot                     | as spot                     | Unit-tested (the mapping and the refusal); implemented (the request bodies)                         |
+| `post_only` (conditional orders)         | denied                                                          | denied                                                                    | denied                      | Not applicable              | Unit-tested                                                                                         |
+| `reduce_only` (regular orders)           | denied — spot has no such flag                                  | `reduce_only=true`                                                        | `reduce_only=true`          | `reduce_only=true`          | Unit-tested (the spot refusal); implemented (the request bodies)                                    |
+| `reduce_only` (conditional orders)       | denied                                                          | `initial.reduce_only=true`                                                | as perpetual                | Not applicable              | Unit-tested                                                                                         |
+| `display_qty` / iceberg (regular orders) | `iceberg` (decimal string)                                      | `iceberg` (whole contracts)                                               | `iceberg` (whole contracts) | `iceberg` (whole contracts) | Unit-tested (the refusals); implemented (the request bodies)                                        |
+| `display_qty=0` (fully hidden)           | -                                                               | -                                                                         | -                           | -                           | Unit-tested                                                                                         |
+| `display_qty` (conditional orders)       | denied                                                          | denied                                                                    | denied                      | Not applicable              | Unit-tested                                                                                         |
+| `quote_quantity`                         | market buy only; denied on a market sell and on any limit order | denied                                                                    | denied                      | denied                      | Unit-tested                                                                                         |
+| Trigger reference price                  | `LAST_PRICE`/`DEFAULT` only; anything else denied               | `LAST_PRICE`/`DEFAULT`, `MARK_PRICE`, `INDEX_PRICE`; anything else denied | as perpetual                | Not applicable              | Unit-tested (the accepted types and both refusals); implemented (the mark and index request bodies) |
+| Hedge (dual) position mode               | Not applicable                                                  | refused at connect, as is any answer that does not establish the mode     | Not applicable              | Not applicable              | Unsupported                                                                                         |
 
 Reduce-only is refused on spot rather than dropped: it is a derivatives concept,
 and an order that quietly lost it would mean something different from the one
@@ -436,46 +447,45 @@ is decided before a request reaches the venue — which is why a submission refu
 is `OrderDenied` and not `OrderRejected`: Gate.io was never asked. The status
 column says whether the suite also pins the behavior.
 
-| Situation                                                                                                                                            | Outcome                                                                                                                                                                                                                                                | Status                                                                                                        |
-|------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
-| `MARKET_TO_LIMIT`, `TRAILING_STOP_MARKET`, `TRAILING_STOP_LIMIT`                                                                                     | `OrderDenied`                                                                                                                                                                                                                                          | Implemented and mock-tested (`TRAILING_STOP_MARKET`); implemented, mainnet validation pending (the other two) |
-| An instrument whose product is not in the client's `products`                                                                                        | `OrderDenied`                                                                                                                                                                                                                                          | Implemented, mainnet validation pending                                                                       |
-| An instrument the provider and cache do not hold                                                                                                     | `OrderDenied`                                                                                                                                                                                                                                          | Implemented, mainnet validation pending                                                                       |
-| `FOK` on any options order, market or limit                                                                                                          | `OrderDenied` — Gate.io options accept `gtc`, `ioc`, `poc` only                                                                                                                                                                                        | Implemented and mock-tested                                                                                   |
-| `AT_THE_OPEN` / `AT_THE_CLOSE` on a market order, on every product including spot                                                                    | `OrderDenied` — Gate.io runs no sessions, and spot used to accept these as `ioc`                                                                                                                                                                       | Implemented and mock-tested                                                                                   |
-| `GTD`, `DAY`, `AT_THE_OPEN`, `AT_THE_CLOSE` on any limit order                                                                                       | `OrderDenied`                                                                                                                                                                                                                                          | Implemented and mock-tested                                                                                   |
-| `FOK` on a conditional order                                                                                                                         | `OrderDenied`                                                                                                                                                                                                                                          | Implemented and mock-tested                                                                                   |
-| `DAY`, `AT_THE_OPEN`, `AT_THE_CLOSE` on a conditional order                                                                                          | `OrderDenied`                                                                                                                                                                                                                                          | Implemented, mainnet validation pending                                                                       |
-| `post_only` combined with `IOC` or `FOK` on a limit order                                                                                            | `OrderDenied` — `poc` rests until canceled, so the immediacy cannot survive the substitution                                                                                                                                                           | Implemented and mock-tested                                                                                   |
-| `post_only` on a conditional order                                                                                                                   | `OrderDenied` — the fired order cannot carry `poc`                                                                                                                                                                                                     | Implemented and mock-tested                                                                                   |
-| `display_qty` on a conditional order                                                                                                                 | `OrderDenied` — the price-order endpoints have no iceberg field                                                                                                                                                                                        | Implemented and mock-tested                                                                                   |
-| `display_qty=0` on any regular order                                                                                                                 | `OrderDenied` — Nautilus means "fully hidden", Gate.io reads `iceberg=0` as "normal order" and does not support hiding the whole amount                                                                                                                | Implemented and mock-tested                                                                                   |
-| A fractional `display_qty` on any derivative                                                                                                         | `OrderDenied` — the iceberg quantity is a contract count, and truncating it would display the whole order                                                                                                                                              | Implemented and mock-tested                                                                                   |
-| A price or trigger price off the instrument's tick grid                                                                                              | `OrderDenied` on submit, `OrderModifyRejected` on amend — Gate.io accepts on-tick prices only                                                                                                                                                          | Implemented and mock-tested                                                                                   |
-| `reduce_only` on a conditional spot order                                                                                                            | `OrderDenied`                                                                                                                                                                                                                                          | Implemented and mock-tested                                                                                   |
-| `reduce_only` on a regular spot order                                                                                                                | `OrderDenied`                                                                                                                                                                                                                                          | Implemented and mock-tested                                                                                   |
-| Any conditional order on options                                                                                                                     | `OrderDenied` — Gate.io publishes no options price-order endpoint                                                                                                                                                                                      | Implemented and mock-tested                                                                                   |
-| A conditional spot order while `spot_account_mode=CROSS_MARGIN`                                                                                      | `OrderDenied` — the spot price-order endpoint has no cross-margin ledger, and routing it to another ledger would trade a different account                                                                                                             | Implemented and mock-tested                                                                                   |
-| A trigger type other than `DEFAULT`, `LAST_PRICE`, `MARK_PRICE`, `INDEX_PRICE` on a futures conditional order                                        | `OrderDenied`                                                                                                                                                                                                                                          | Implemented and mock-tested                                                                                   |
-| A trigger type other than `DEFAULT` or `LAST_PRICE` on a **spot** conditional order                                                                  | `OrderDenied` — the spot trigger object is `{price, rule, expiration}` with no price-type field, and spot has no mark or index price to name                                                                                                           | Implemented and mock-tested                                                                                   |
-| A conditional order whose trigger price contradicts its own order type — a `STOP_*` at or beyond the market, an `*_IF_TOUCHED` on the far side of it | `OrderDenied` — Gate.io takes only a comparison rule and requires it to agree with the last price, so the sole rule it would accept encodes the opposite conditional type                                                                              | Implemented and mock-tested                                                                                   |
-| A fractional contract quantity on any derivative                                                                                                     | `OrderDenied` on submit, `OrderModifyRejected` on amend                                                                                                                                                                                                | Implemented and mock-tested                                                                                   |
-| `quote_quantity=True` anywhere except a spot market buy                                                                                              | `OrderDenied`                                                                                                                                                                                                                                          | Implemented and mock-tested                                                                                   |
-| A conditional order whose `expire_time` has already passed                                                                                           | `OrderDenied`                                                                                                                                                                                                                                          | Implemented and mock-tested                                                                                   |
-| A base-denominated spot market buy with no quote, trade or ticker price                                                                              | `OrderDenied` — the order cannot be priced, so it cannot be built; resubmit with `quote_quantity=True` for Gate.io's native quote-denominated market buy                                                                                               | Implemented and mock-tested                                                                                   |
-| An amendment of a delivery or options order                                                                                                          | `OrderModifyRejected` — neither venue namespace has an amend endpoint                                                                                                                                                                                  | Implemented, mainnet validation pending                                                                       |
-| An amendment of an armed conditional order                                                                                                           | `OrderModifyRejected` — cancel and resubmit instead                                                                                                                                                                                                    | Implemented, mainnet validation pending                                                                       |
-| An amendment carrying a new trigger price                                                                                                            | `OrderModifyRejected`                                                                                                                                                                                                                                  | Implemented, mainnet validation pending                                                                       |
-| An amendment of a contract order that is not in the cache                                                                                            | `OrderModifyRejected` — the side determines the sign of `size`, and guessing it could flip a short into a long                                                                                                                                         | Implemented and mock-tested                                                                                   |
-| `DELETE /options/orders` without a `contract` or `underlying` scope                                                                                  | `ValueError` from the HTTP layer, before the request — Gate.io would otherwise cancel every resting option order in the account                                                                                                                        | Implemented and mock-tested                                                                                   |
-| `DELETE /spot/orders` without a pair, `DELETE /futures/{settle}/orders` without a contract                                                           | The scope is a required argument, so the call fails with `TypeError` and issues no request. Gate.io treats the spot `currency_pair` as optional and would cancel across every pair and ledger; the futures endpoint requires the contract at the venue | Implemented and mock-tested                                                                                   |
+| Situation                                                                                                                                            | Outcome                                                                                                                                                                                                                                                | Status                                                            |
+|------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------|
+| `MARKET_TO_LIMIT`, `TRAILING_STOP_MARKET`, `TRAILING_STOP_LIMIT`                                                                                     | `OrderDenied`                                                                                                                                                                                                                                          | Unit-tested (`TRAILING_STOP_MARKET`); implemented (the other two) |
+| An instrument whose product is not in the client's `products`                                                                                        | `OrderDenied`                                                                                                                                                                                                                                          | Implemented                                                       |
+| An instrument the provider and cache do not hold                                                                                                     | `OrderDenied`                                                                                                                                                                                                                                          | Implemented                                                       |
+| `FOK` on any options order, market or limit                                                                                                          | `OrderDenied` — Gate.io options accept `gtc`, `ioc`, `poc` only                                                                                                                                                                                        | Unit-tested                                                       |
+| `AT_THE_OPEN` / `AT_THE_CLOSE` on a market order, on every product including spot                                                                    | `OrderDenied` — Gate.io runs no sessions, and spot used to accept these as `ioc`                                                                                                                                                                       | Unit-tested                                                       |
+| `GTD`, `DAY`, `AT_THE_OPEN`, `AT_THE_CLOSE` on any limit order                                                                                       | `OrderDenied`                                                                                                                                                                                                                                          | Unit-tested                                                       |
+| `FOK` on a conditional order                                                                                                                         | `OrderDenied`                                                                                                                                                                                                                                          | Unit-tested                                                       |
+| `DAY`, `AT_THE_OPEN`, `AT_THE_CLOSE` on a conditional order                                                                                          | `OrderDenied`                                                                                                                                                                                                                                          | Implemented                                                       |
+| `post_only` combined with `IOC` or `FOK` on a limit order                                                                                            | `OrderDenied` — `poc` rests until canceled, so the immediacy cannot survive the substitution                                                                                                                                                           | Unit-tested                                                       |
+| `post_only` on a conditional order                                                                                                                   | `OrderDenied` — the fired order cannot carry `poc`                                                                                                                                                                                                     | Unit-tested                                                       |
+| `display_qty` on a conditional order                                                                                                                 | `OrderDenied` — the price-order endpoints have no iceberg field                                                                                                                                                                                        | Unit-tested                                                       |
+| `display_qty=0` on any regular order                                                                                                                 | `OrderDenied` — Nautilus means "fully hidden", Gate.io reads `iceberg=0` as "normal order" and does not support hiding the whole amount                                                                                                                | Unit-tested                                                       |
+| A fractional `display_qty` on any derivative                                                                                                         | `OrderDenied` — the iceberg quantity is a contract count, and truncating it would display the whole order                                                                                                                                              | Unit-tested                                                       |
+| A price or trigger price off the instrument's tick grid                                                                                              | `OrderDenied` on submit, `OrderModifyRejected` on amend — Gate.io accepts on-tick prices only                                                                                                                                                          | Unit-tested                                                       |
+| `reduce_only` on a conditional spot order                                                                                                            | `OrderDenied`                                                                                                                                                                                                                                          | Unit-tested                                                       |
+| `reduce_only` on a regular spot order                                                                                                                | `OrderDenied`                                                                                                                                                                                                                                          | Unit-tested                                                       |
+| Any conditional order on options                                                                                                                     | `OrderDenied` — Gate.io publishes no options price-order endpoint                                                                                                                                                                                      | Unit-tested                                                       |
+| A conditional spot order while `spot_account_mode=CROSS_MARGIN`                                                                                      | `OrderDenied` — the spot price-order endpoint has no cross-margin ledger, and routing it to another ledger would trade a different account                                                                                                             | Unit-tested                                                       |
+| A trigger type other than `DEFAULT`, `LAST_PRICE`, `MARK_PRICE`, `INDEX_PRICE` on a futures conditional order                                        | `OrderDenied`                                                                                                                                                                                                                                          | Unit-tested                                                       |
+| A trigger type other than `DEFAULT` or `LAST_PRICE` on a **spot** conditional order                                                                  | `OrderDenied` — the spot trigger object is `{price, rule, expiration}` with no price-type field, and spot has no mark or index price to name                                                                                                           | Unit-tested                                                       |
+| A conditional order whose trigger price contradicts its own order type — a `STOP_*` at or beyond the market, an `*_IF_TOUCHED` on the far side of it | `OrderDenied` — Gate.io takes only a comparison rule and requires it to agree with the last price, so the sole rule it would accept encodes the opposite conditional type                                                                              | Unit-tested                                                       |
+| A fractional contract quantity on any derivative                                                                                                     | `OrderDenied` on submit, `OrderModifyRejected` on amend                                                                                                                                                                                                | Unit-tested                                                       |
+| `quote_quantity=True` anywhere except a spot market buy                                                                                              | `OrderDenied`                                                                                                                                                                                                                                          | Unit-tested                                                       |
+| A conditional order whose `expire_time` has already passed                                                                                           | `OrderDenied`                                                                                                                                                                                                                                          | Unit-tested                                                       |
+| A base-denominated spot market buy with no quote, trade or ticker price                                                                              | `OrderDenied` — the order cannot be priced, so it cannot be built; resubmit with `quote_quantity=True` for Gate.io's native quote-denominated market buy                                                                                               | Unit-tested                                                       |
+| An amendment of a delivery or options order                                                                                                          | `OrderModifyRejected` — neither venue namespace has an amend endpoint                                                                                                                                                                                  | Implemented                                                       |
+| An amendment of an armed conditional order                                                                                                           | `OrderModifyRejected` — cancel and resubmit instead                                                                                                                                                                                                    | Implemented                                                       |
+| An amendment carrying a new trigger price                                                                                                            | `OrderModifyRejected`                                                                                                                                                                                                                                  | Implemented                                                       |
+| An amendment of a contract order that is not in the cache                                                                                            | `OrderModifyRejected` — the side determines the sign of `size`, and guessing it could flip a short into a long                                                                                                                                         | Unit-tested                                                       |
+| `DELETE /options/orders` without a `contract` or `underlying` scope                                                                                  | `ValueError` from the HTTP layer, before the request — Gate.io would otherwise cancel every resting option order in the account                                                                                                                        | Unit-tested                                                       |
+| `DELETE /spot/orders` without a pair, `DELETE /futures/{settle}/orders` without a contract                                                           | The scope is a required argument, so the call fails with `TypeError` and issues no request. Gate.io treats the spot `currency_pair` as optional and would cancel across every pair and ledger; the futures endpoint requires the contract at the venue | Unit-tested                                                       |
 
 ## Where the adapter substitutes rather than refuses
 
 One known case does not follow the rule above. It is listed because a page that
-only advertised the rule would be misleading. It is *implemented, mainnet
-validation pending*: it was established by reading and exercising the code, and
-no test currently pins it.
+only advertised the rule would be misleading. It is *implemented*: it was
+established by reading the code, and no test pins it.
 
 1. **Options cancel-all ignores the order side.** A side-scoped
    `CancelAllOrders` on an option contract cancels every resting order on that
@@ -494,17 +504,17 @@ trade.
 
 ## Amendment and cancellation
 
-| Operation                              | Spot                                                                                              | Perpetual / Inverse                         | Delivery        | Options                           | Status                                                                                                                                     |
-|----------------------------------------|---------------------------------------------------------------------------------------------------|---------------------------------------------|-----------------|-----------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
-| Amend price and/or quantity            | `PATCH /spot/orders/{id}`                                                                         | `PUT /futures/{settle}/orders/{id}`         | rejected        | rejected                          | Implemented and mock-tested (perpetual and inverse); implemented, mainnet validation pending (spot, and the delivery and options refusals) |
-| Amend an armed conditional order       | rejected                                                                                          | rejected                                    | rejected        | Not applicable                    | Implemented, mainnet validation pending                                                                                                    |
-| Cancel one order                       | `DELETE /spot/orders/{id}`                                                                        | `DELETE {base}/orders/{id}`                 | as perpetual    | `DELETE /options/orders/{id}`     | Implemented and mock-tested                                                                                                                |
-| Cancel one armed conditional order     | by its armed id                                                                                   | by its armed id                             | by its armed id | Not applicable                    | Implemented and mock-tested                                                                                                                |
-| Cancel all for one instrument          | pair-scoped, side honored                                                                         | contract-scoped, side mapped to `bid`/`ask` | as perpetual    | contract-scoped, **side ignored** | Implemented and mock-tested (spot, contracts); implemented, mainnet validation pending (options)                                           |
-| Bulk disarm of conditional orders      | bulk when unscoped, individually by id when a side is named                                       | same                                        | same            | Not applicable                    | Implemented and mock-tested                                                                                                                |
-| Batch cancel                           | `POST /spot/cancel_batch_orders`, 20 per request                                                  | falls back to sequential single cancels     | as perpetual    | as perpetual                      | Implemented, mainnet validation pending                                                                                                    |
-| Account-wide cancel-all                | Unsupported on every product: each namespace requires a scope                                     |                                             |                 |                                   | Unsupported                                                                                                                                |
-| Countdown cancel-all (dead-man switch) | REST method exists on spot, perpetual and options namespaces; the execution client never calls it |                                             |                 |                                   | Experimental                                                                                                                               |
+| Operation                              | Spot                                                                                                              | Perpetual / Inverse                         | Delivery        | Options                           | Status                                                                                               |
+|----------------------------------------|-------------------------------------------------------------------------------------------------------------------|---------------------------------------------|-----------------|-----------------------------------|------------------------------------------------------------------------------------------------------|
+| Amend price and/or quantity            | `PATCH /spot/orders/{id}`                                                                                         | `PUT /futures/{settle}/orders/{id}`         | rejected        | rejected                          | Unit-tested (the USDT perpetual); implemented (spot, inverse, and the delivery and options refusals) |
+| Amend an armed conditional order       | rejected                                                                                                          | rejected                                    | rejected        | Not applicable                    | Implemented                                                                                          |
+| Cancel one order                       | `DELETE /spot/orders/{id}`                                                                                        | `DELETE {base}/orders/{id}`                 | as perpetual    | `DELETE /options/orders/{id}`     | Unit-tested                                                                                          |
+| Cancel one armed conditional order     | by its armed id                                                                                                   | by its armed id                             | by its armed id | Not applicable                    | Unit-tested                                                                                          |
+| Cancel all for one instrument          | pair-scoped, side honored                                                                                         | contract-scoped, side mapped to `bid`/`ask` | as perpetual    | contract-scoped, **side ignored** | Unit-tested (spot, contracts); implemented (options)                                                 |
+| Bulk disarm of conditional orders      | bulk when unscoped, individually by id when a side is named                                                       | same                                        | same            | Not applicable                    | Unit-tested                                                                                          |
+| Batch cancel                           | `POST /spot/cancel_batch_orders`, 20 per request                                                                  | falls back to sequential single cancels     | as perpetual    | as perpetual                      | Implemented                                                                                          |
+| Account-wide cancel-all                | Unsupported on every product: each namespace requires a scope                                                     |                                             |                 |                                   | Unsupported                                                                                          |
+| Countdown cancel-all (dead-man switch) | `countdown_cancel_all` exists on the spot, futures and options namespaces; `GateioExecutionClient` never calls it |                                             |                 |                                   | Not wired into the execution client; the three namespace methods are unit-tested                     |
 
 A cancel command carries no side filter to the price-order endpoints, because
 neither of them accepts one: a bulk disarm would take out both sides of the book
@@ -526,32 +536,42 @@ knowing before relying on reconciliation: option fills can only be queried per
 underlying, so `options_underlyings` (or an open option order or position) has to
 supply one, and the futures and delivery fill endpoints accept no time range, so
 the window is walked backwards by row offset until a page reaches past its start.
-Both are *implemented, mainnet validation pending*; the conditional-order
-identity that reconciliation restores after a restart is *implemented and
-mock-tested*.
+Both are *implemented*. The conditional-order identity that reconciliation
+restores after a restart is *offline-harness*: the harness drops the in-memory
+trigger map, leaves the cached order behind and asserts that the client rebuilds
+the link from the venue's own listing.
 
 ## Market data by product
 
-| Data type                         | Spot | Perpetual | Inverse | Delivery | Options | Source                                                                                                                     | Status                                                                                                          |
-|-----------------------------------|------|-----------|---------|----------|---------|----------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
-| `TradeTick`                       | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.trades`.                                                                                                         | Implemented and mock-tested                                                                                     |
-| `QuoteTick` (real best bid/offer) | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.book_ticker`.                                                                                                    | Implemented and mock-tested                                                                                     |
-| `OrderBookDeltas` (`L2_MBP`)      | ✓    | ✓         | ✓       | ✓        | ✓       | REST snapshot + `<prefix>.order_book_update`.                                                                              | Implemented and mock-tested                                                                                     |
-| `OrderBookDepth10`                | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.order_book`, the venue's periodic snapshot channel.                                                              | Implemented and mock-tested                                                                                     |
-| Order book snapshot request       | ✓    | ✓         | ✓       | ✓        | ✓       | REST `order_book`, depth clamped per product.                                                                              | Implemented and mock-tested                                                                                     |
-| `Bar` (closed bars only)          | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.candlesticks`; options use `options.contract_candlesticks`.                                                      | Implemented and mock-tested                                                                                     |
-| Historical bars and trades        | ✓    | ✓         | ✓       | ✓        | ✓       | Paginated REST, 1000 rows per call.                                                                                        | Implemented, mainnet validation pending                                                                         |
-| `MarkPriceUpdate`                 | -    | ✓         | ✓       | ✓        | ✓       | `futures.tickers`; `options.contract_tickers` on options. Spot has no mark price.                                          | Implemented, mainnet validation pending                                                                         |
-| `IndexPriceUpdate`                | -    | ✓         | ✓       | ✓        | ✓       | `futures.tickers`; `options.contract_tickers` on options. Spot has no index price.                                         | Implemented, mainnet validation pending                                                                         |
-| `FundingRateUpdate`               | -    | ✓         | ✓       | -        | -       | `futures.tickers`. Only perpetual contracts fund.                                                                          | Implemented, mainnet validation pending                                                                         |
-| Historical `FundingRateUpdate`    | -    | ✓         | ✓       | -        | -       | REST `/futures/{settle}/funding_rate`. Only perpetual contracts fund.                                                      | Implemented, mainnet validation pending                                                                         |
-| Instrument updates                | ✓    | ✓         | ✓       | ✓        | ✓       | Periodic REST reload; Gate.io has no instrument channel.                                                                   | Implemented and mock-tested (loading and filtering); implemented, mainnet validation pending (the reload timer) |
-| `InstrumentStatus`                | ✓    | ✓         | ✓       | ✓        | ✓       | Polled instrument listings; Gate.io has no status channel.                                                                 | Implemented and mock-tested                                                                                     |
-| `InstrumentClose`                 | -    | -         | -       | ✓        | ✓       | REST settlement after expiry. The three continuous products never settle, and the subscription is refused with the reason. | Implemented and mock-tested                                                                                     |
-| `GateioTicker` (venue ticker row) | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.tickers`, published as adapter-specific custom data.                                                             | Implemented and mock-tested                                                                                     |
-| Historical `QuoteTick`            | -    | -         | -       | -        | -       | Gate.io publishes no quote history; the request is refused rather than answered from the current ticker row.               | Unsupported                                                                                                     |
-| Book types other than `L2_MBP`    | -    | -         | -       | -        | -       | Only `L2_MBP` is assembled; any other book type is refused.                                                                | Unsupported                                                                                                     |
-| Options underlying streams        | -    | -         | -       | -        | ✓       | `options.ul_*` through `GateioPublicWebSocket.client`, not routed into the data engine.                                    | Experimental                                                                                                    |
+| Data type                         | Spot | Perpetual | Inverse | Delivery | Options | Source                                                                                                                     | Status                                                                                                              |
+|-----------------------------------|------|-----------|---------|----------|---------|----------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
+| `TradeTick`                       | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.trades`.                                                                                                         | Unit-tested                                                                                                         |
+| `QuoteTick` (real best bid/offer) | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.book_ticker`.                                                                                                    | Unit-tested                                                                                                         |
+| `OrderBookDeltas` (`L2_MBP`)      | ✓    | ✓         | ✓       | ✓        | ✓       | REST snapshot + `<prefix>.order_book_update`.                                                                              | Unit-tested                                                                                                         |
+| `OrderBookDepth10`                | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.order_book`, the venue's periodic snapshot channel.                                                              | Unit-tested                                                                                                         |
+| Order book snapshot request       | ✓    | ✓         | ✓       | ✓        | ✓       | REST `order_book`, depth clamped per product.                                                                              | Unit-tested                                                                                                         |
+| `Bar` (closed bars only)          | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.candlesticks`; options use `options.contract_candlesticks`.                                                      | Unit-tested                                                                                                         |
+| Historical bars and trades        | ✓    | ✓         | ✓       | ✓        | ✓       | Paginated REST, 1000 rows per call.                                                                                        | Implemented                                                                                                         |
+| `MarkPriceUpdate`                 | -    | ✓         | ✓       | ✓        | ✓       | `futures.tickers`; `options.contract_tickers` on options. Spot has no mark price.                                          | Implemented                                                                                                         |
+| `IndexPriceUpdate`                | -    | ✓         | ✓       | ✓        | ✓       | `futures.tickers`; `options.contract_tickers` on options. Spot has no index price.                                         | Implemented                                                                                                         |
+| `FundingRateUpdate`               | -    | ✓         | ✓       | -        | -       | `futures.tickers`. Only perpetual contracts fund.                                                                          | Implemented                                                                                                         |
+| Historical `FundingRateUpdate`    | -    | ✓         | ✓       | -        | -       | REST `/futures/{settle}/funding_rate`. Only perpetual contracts fund.                                                      | Implemented                                                                                                         |
+| Instrument updates                | ✓    | ✓         | ✓       | ✓        | ✓       | Periodic REST reload; Gate.io has no instrument channel.                                                                   | Unit-tested (loading and filtering); implemented (the reload timer)                                                 |
+| `InstrumentStatus`                | ✓    | ✓         | ✓       | ✓        | ✓       | Polled instrument listings; Gate.io has no status channel.                                                                 | Unit-tested                                                                                                         |
+| `InstrumentClose`                 | -    | -         | -       | ✓        | ✓       | REST settlement after expiry. The three continuous products never settle, and the subscription is refused with the reason. | Unit-tested                                                                                                         |
+| `GateioTicker` (venue ticker row) | ✓    | ✓         | ✓       | ✓        | ✓       | `<prefix>.tickers`, published as adapter-specific custom data.                                                             | Unit-tested                                                                                                         |
+| Historical `QuoteTick`            | -    | -         | -       | -        | -       | Gate.io publishes no quote history; the request is refused rather than answered from the current ticker row.               | Unsupported                                                                                                         |
+| Book types other than `L2_MBP`    | -    | -         | -       | -        | -       | Only `L2_MBP` is assembled; any other book type is refused.                                                                | Unsupported                                                                                                         |
+| Options underlying streams        | -    | -         | -       | -        | ✓       | `options.ul_*` through `GateioPublicWebSocket.client`, not routed into the data engine.                                    | Not wired into the data client; the transport's generic `GateioWebSocketClient.subscribe` underneath is unit-tested |
+
+One qualification on that status column, because the row is graded once and the
+products are not equal. The offline data tests build a `GateioDataClient`
+configured for spot, the USDT perpetual and options, and drive subscriptions and
+payloads through it. For inverse perpetuals and delivery futures what the suite
+asserts is narrower — the instrument parsers, and the per-product channel names,
+depth limits and push intervals in `nautilus_gateio.websocket.public` — while
+the client's own subscription path is never run with those products. The
+[validation status](validation.md) page records the same split.
 
 An option's greeks and implied volatilities arrive with the ticker row and reach
 a strategy as `GateioTicker` fields, which are the venue's own strings. They are
@@ -593,11 +613,11 @@ different `account` field. Select the ledger with `spot_account_mode`.
 | `CROSS_MARGIN`          | `cross_margin`               | none — conditional orders are rejected | Cross margin, reported through the unified account |
 | `UNIFIED`               | `unified`                    | `unified`                              | Unified account                                    |
 
-Ledger selection is *implemented and mock-tested* for the plain spot ledger,
-whose regular and price-order bodies are both asserted, and for the wire
-vocabulary of all four modes. The margin ledgers' request bodies and cross
-margin's rejection of conditional orders are *implemented, mainnet validation
-pending*.
+Ledger selection is *unit-tested* for the plain spot ledger, whose regular and
+price-order bodies are both asserted, and for the wire vocabulary of all four
+modes. The margin ledgers' request bodies are *implemented* — no test reads the
+`account` field of an order body on any ledger but plain spot. Cross margin's
+refusal of a conditional order is *unit-tested*.
 
 The naming asymmetry in the third column is Gate.io's own and is preserved
 verbatim, because the venue validates it: a price-triggered order names the
@@ -606,25 +626,25 @@ plain spot ledger `normal` where a regular order says `spot`.
 `UNIFIED` additionally requires `SPOT` among the configured products: the unified
 ledger is read only while sweeping the spot wallet, so a client without spot
 could never publish a balance, and the execution client raises `ValueError` in
-its constructor instead of failing at start-up (*implemented and mock-tested*).
-`MARGIN` and `CROSS_MARGIN` without spot are inert and merely logged.
+its constructor instead of failing at start-up (*unit-tested*). `MARGIN` and
+`CROSS_MARGIN` without spot are inert and merely logged.
 
 Choosing any margin mode has two further consequences:
 
 * the Nautilus account becomes `AccountType.MARGIN` instead of `CASH`, which is
   what lets borrowed (negative) balances be held — only a `CashAccount` refuses
-  one (*implemented and mock-tested*). Nothing registers cash borrowing for the
-  venue: `AccountFactory.register_cash_borrowing` sets a process-global flag the
+  one (*unit-tested*). Nothing registers cash borrowing for the venue:
+  `AccountFactory.register_cash_borrowing` sets a process-global flag the
   platform reads in one place, when it builds a `CashAccount`, which a margin
   mode guarantees this client is not;
 * balances are read from that ledger's own endpoints — `/margin/accounts`,
   `/margin/cross/accounts` or `/unified/accounts` — with borrowed principal and
   accrued interest subtracted from the total, instead of only `/spot/accounts`
-  (*implemented, mainnet validation pending*).
+  (*implemented*).
 
 The account type also changes with the product set, and that mapping is
-*implemented and mock-tested*: a client is a `CASH` account only when spot is
-the sole product *and* the plain spot ledger is selected. Any derivative, or any
+*unit-tested*: a client is a `CASH` account only when spot is the sole product
+*and* the plain spot ledger is selected. Any derivative, or any
 margin ledger, makes it a `MARGIN` account. A unified account additionally
 replaces the per-wallet balances in the aggregate rather than adding to them,
 because the venue's unified ledger already subsumes them.
@@ -651,9 +671,8 @@ into `WalletNotProvisionedError` with an actionable message and skips that
 product during an instrument load, a balance sweep or a reconciliation query,
 instead of failing to start. A client configured for four products on an account
 that has only ever funded spot therefore still starts, and says which wallets it
-skipped. The error mapping and the instrument-load skip are *implemented and
-mock-tested*; the balance and reconciliation skips are *implemented, mainnet
-validation pending*.
+skipped. The error mapping and the instrument-load skip are *unit-tested*; the
+balance and reconciliation skips are *implemented*.
 
 ## Wallet segregation and transfers
 
@@ -673,8 +692,8 @@ before the request. Gate.io routes every internal transfer through the spot
 wallet, so moving between two derivative wallets takes two calls. `transfer()`
 cannot send funds outside the account: the accepted account names are the
 account's own trading wallets, and the request carries no address and no
-recipient (*implemented and mock-tested*). The execution client logs a warning at
-startup so the segregation is never a surprise.
+recipient (*unit-tested*). The execution client logs a warning at startup so the
+segregation is never a surprise.
 
 That is a property of this module, not a security boundary. What an API key may
 do is decided by the key's own permission set on Gate.io; a key used with this
